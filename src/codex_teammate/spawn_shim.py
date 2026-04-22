@@ -148,6 +148,15 @@ def main(argv: list[str] | None = None) -> int:
     parsed = _parse_args(full_argv[1:])
 
     if not parsed.saw_identity_flags:
+        # If --print is present but no positional prompt follows, this is a
+        # startup probe from Claude Code validating the binary. Exit cleanly
+        # so the probe succeeds without spawning a broken claude --print call.
+        rest = full_argv[1:]
+        has_print = "--print" in rest
+        has_prompt = any(not a.startswith("-") for a in rest)
+        if has_print and not has_prompt:
+            _log_dispatch("probe", None, None)
+            return 0
         binary = _require_binary(_resolve_native_claude(full_argv[0]), "claude")
         _log_dispatch("native", parsed.agent_name, binary)
         os.execv(binary, full_argv)

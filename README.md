@@ -51,27 +51,10 @@ uv run codex-teammate --help
 
 ## Run
 
-### TUI-visible launch (default)
+### Background launch (canonical)
 
-Point Claude Code's teammate-launch command at the shim, then start Claude
-normally:
-
-```bash
-export CLAUDE_CODE_TEAMMATE_COMMAND="$(command -v codex-teammate-spawn-shim)"
-# then start Claude normally and ask the leader to spawn codex-* teammates
-```
-
-The shim keeps Codex-backed teammates attached to Claude's normal teammate
-launch flow while letting non-`codex-*` names continue to launch via the
-native Claude teammate path.
-
-Optional shim overrides:
-
-- `CODEX_TEAMMATE_SHIM_MATCH` — regex used to decide which teammate names route to Codex (default: `^codex-`)
-- `CODEX_TEAMMATE_BINARY` — path/name for the adapter launcher (default resolution: `codex-teammate` on `PATH`)
-- `CODEX_TEAMMATE_NATIVE_CLAUDE` — path/name for the real Claude binary if `claude` on `PATH` resolves to the shim
-
-### Background launch (fallback)
+The adapter runs as a fully-detached background process. This is the
+only verified launch path — see the TUI note below.
 
 If you want to run the adapter as a detached background process instead, it
 must be **fully detached** from the launching shell — otherwise a SIGHUP
@@ -94,6 +77,31 @@ A bare `uv run codex-teammate &` is **not** sufficient — the shell's
 process group receives SIGHUP on exit and pulls the adapter down with it.
 This was observed live during M2 development and recorded as the
 `setsid nohup … & disown </dev/null` incantation above.
+
+### TUI visibility
+
+The external-launch adapter self-registers in `config.json` and receives
+inbox messages, but does **not** appear in the Claude Code TUI presence
+line (`@main @name`). The TUI renders from the leader's in-memory
+`AppState.tasks`, which is only populated by the leader's spawn flow —
+not by external self-registration.
+
+`codex-teammate-spawn-shim` (installed as a console script) is designed
+to intercept the `CLAUDE_CODE_TEAMMATE_COMMAND` hook and route
+`codex-*` names to this adapter rather than to the native Claude binary.
+That hook is invoked by Claude Code's **out-of-process external spawn
+path** (used in tmux/iTerm2 agent-teams mode). It is **not** invoked by
+the Agent tool's in-process sub-agent spawn, which is the default spawn
+mechanism in interactive Claude Code sessions.
+
+In practice: if you are using the Agent tool to create teammates (the
+common case), the shim is not the right surface. If you are using Claude
+Code in tmux/out-of-process agent-teams mode, set
+`CLAUDE_CODE_TEAMMATE_COMMAND` in `~/.claude/settings.json` or your
+shell and name your Codex teammates with a `codex-` prefix.
+
+See `docs/shim-restart-resilience.md` for the three deferred approaches
+to make the shim (or an alternative) work more broadly.
 
 Environment variables (equivalent to the CLI flags):
 
