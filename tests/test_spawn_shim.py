@@ -20,6 +20,7 @@ def _record_execv(monkeypatch):
 
 def test_codex_dispatch(monkeypatch, capsys):
     calls = _record_execv(monkeypatch)
+    monkeypatch.delenv("CODEX_TEAMMATE_BINARY", raising=False)
     monkeypatch.setattr(
         sys,
         "argv",
@@ -172,6 +173,7 @@ def test_env_override_native_claude_binary(monkeypatch):
 
 def test_plan_mode_flag_is_forwarded(monkeypatch):
     calls = _record_execv(monkeypatch)
+    monkeypatch.delenv("CODEX_TEAMMATE_BINARY", raising=False)
     monkeypatch.setattr(
         sys,
         "argv",
@@ -209,6 +211,7 @@ def test_plan_mode_flag_is_forwarded(monkeypatch):
 
 def test_unknown_flags_are_stripped_on_codex_route(monkeypatch):
     calls = _record_execv(monkeypatch)
+    monkeypatch.delenv("CODEX_TEAMMATE_BINARY", raising=False)
     monkeypatch.setattr(
         sys,
         "argv",

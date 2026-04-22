@@ -1,0 +1,17 @@
+{
+  "name": "codex-teammate",
+  "version": "0.1.0",
+  "description": "Claude Code plugin that wires codex-teammate into agent teams with zero-friction session setup.",
+  "author": {
+    "name": "friction-research"
+  },
+  "license": "MIT",
+  "keywords": [
+    "claude-code",
+    "plugin",
+    "codex",
+    "agent-teams"
+  ],
+  "skills": "./skills",
+  "hooks": "./hooks/hooks.json"
+}

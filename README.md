@@ -46,7 +46,16 @@ a feasibility prototype, the Python-only path is strictly simpler.
 
 ```bash
 uv sync
-uv run codex-teammate --help
+uv run codex-teammate install
+```
+
+That one-time install command writes the required Claude Code launcher env
+vars into `~/.claude/settings.json` for you, using absolute paths to the
+current `codex-teammate` and `codex-teammate-spawn-shim` console scripts.
+Undo it later with:
+
+```bash
+uv run codex-teammate uninstall
 ```
 
 ## Run
@@ -96,9 +105,15 @@ mechanism in interactive Claude Code sessions.
 
 In practice: if you are using the Agent tool to create teammates (the
 common case), the shim is not the right surface. If you are using Claude
-Code in tmux/out-of-process agent-teams mode, set
-`CLAUDE_CODE_TEAMMATE_COMMAND` in `~/.claude/settings.json` or your
-shell and name your Codex teammates with a `codex-` prefix.
+Code in tmux/out-of-process agent-teams mode, run
+`codex-teammate install` once and name your Codex teammates with a
+`codex-` prefix. The installer persists:
+
+- `CLAUDE_CODE_TEAMMATE_COMMAND=/absolute/path/to/codex-teammate-spawn-shim`
+- `CODEX_TEAMMATE_BINARY=/absolute/path/to/codex-teammate`
+
+This keeps the shim working even when Claude Code starts with a different
+`PATH` than the shell where you installed the package.
 
 See `docs/shim-restart-resilience.md` for the three deferred approaches
 to make the shim (or an alternative) work more broadly.

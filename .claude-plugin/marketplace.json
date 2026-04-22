@@ -1,0 +1,27 @@
+{
+  "name": "codex-teammate",
+  "owner": {
+    "name": "friction-research"
+  },
+  "metadata": {
+    "description": "Self-hosted marketplace for the codex-teammate Claude Code plugin.",
+    "version": "0.1.0"
+  },
+  "plugins": [
+    {
+      "name": "codex-teammate",
+      "source": "./",
+      "description": "Auto-configures Claude Code to route codex-* teammates through the codex-teammate spawn shim.",
+      "version": "0.1.0",
+      "author": {
+        "name": "friction-research"
+      },
+      "category": "developer-tools",
+      "tags": [
+        "codex",
+        "agent-teams",
+        "teammates"
+      ]
+    }
+  ]
+}

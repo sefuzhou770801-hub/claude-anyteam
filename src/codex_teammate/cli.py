@@ -1,23 +1,38 @@
 """Console entry point for the adapter.
 
-Installed as `codex-teammate` via pyproject.toml [project.scripts]. Parses
-CLI args, builds Settings, and runs the control loop.
+Installed as `codex-teammate` via pyproject.toml [project.scripts]. Supports
+running the adapter plus one-time install/uninstall helpers for Claude Code's
+persistent settings file.
 """
 
 from __future__ import annotations
 
 import argparse
 import sys
+from pathlib import Path
+from typing import TextIO
 
 from . import logger
 from .config import from_env
+from .installer import (
+    InstallError,
+    format_uninstall_message,
+    install as install_settings,
+    uninstall as uninstall_settings,
+)
 from .loop import run
 
 
-def _parse_args(argv: list[str] | None = None) -> argparse.Namespace:
+def _build_run_parser() -> argparse.ArgumentParser:
     p = argparse.ArgumentParser(
         prog="codex-teammate",
         description="OpenAI Codex CLI as a first-class teammate in Claude Code's agent-team protocol.",
+        epilog=(
+            "Management commands:\n"
+            "  codex-teammate install    Persist the Claude teammate shim in ~/.claude/settings.json\n"
+            "  codex-teammate uninstall  Remove the installed Claude teammate shim settings"
+        ),
+        formatter_class=argparse.RawDescriptionHelpFormatter,
     )
     p.add_argument("--team", help="Team name (overrides CODEX_TEAMMATE_TEAM)")
     p.add_argument("--name", help="Teammate name within the team (overrides CODEX_TEAMMATE_NAME)")
@@ -65,10 +80,119 @@ def _parse_args(argv: list[str] | None = None) -> argparse.Namespace:
             "when unset, Codex's per-model default applies."
         ),
     )
-    return p.parse_args(argv)
+    return p
+
+
+def _parse_args(argv: list[str] | None = None) -> argparse.Namespace:
+    return _build_run_parser().parse_args(argv)
+
+
+def _build_install_parser() -> argparse.ArgumentParser:
+    p = argparse.ArgumentParser(
+        prog="codex-teammate install",
+        description=(
+            "Persist the codex-teammate spawn shim in ~/.claude/settings.json so "
+            "Claude Code can launch it in future sessions."
+        ),
+    )
+    p.add_argument(
+        "--settings-path",
+        default=None,
+        help=argparse.SUPPRESS,
+    )
+    return p
+
+
+def _parse_install_args(argv: list[str] | None = None) -> argparse.Namespace:
+    return _build_install_parser().parse_args(argv)
+
+
+def _build_uninstall_parser() -> argparse.ArgumentParser:
+    p = argparse.ArgumentParser(
+        prog="codex-teammate uninstall",
+        description="Remove codex-teammate-managed entries from ~/.claude/settings.json.",
+    )
+    p.add_argument(
+        "--settings-path",
+        default=None,
+        help=argparse.SUPPRESS,
+    )
+    return p
+
+
+def _parse_uninstall_args(argv: list[str] | None = None) -> argparse.Namespace:
+    return _build_uninstall_parser().parse_args(argv)
+
+
+def _install_command(
+    *,
+    settings_path: Path | str | None = None,
+    current_executable: str | None = None,
+    out: TextIO | None = None,
+) -> int:
+    stream = out or sys.stdout
+    try:
+        result = install_settings(
+            settings_path=settings_path,
+            argv0=current_executable or sys.argv[0],
+        )
+    except InstallError as exc:
+        print(str(exc), file=sys.stderr)
+        return 2
+
+    stream.write(f"Updated {result.paths.settings_path}\n")
+    stream.write(
+        f"Set env.CLAUDE_CODE_TEAMMATE_COMMAND={result.paths.shim_path}\n"
+    )
+    stream.write(
+        f"Set env.CODEX_TEAMMATE_BINARY={result.paths.binary_path}\n"
+    )
+    stream.write("Restart Claude Code for the changes to take effect.\n")
+    return 0
+
+
+def _uninstall_command(
+    *,
+    settings_path: Path | str | None = None,
+    out: TextIO | None = None,
+) -> int:
+    stream = out or sys.stdout
+    try:
+        result = uninstall_settings(settings_path=settings_path)
+    except InstallError as exc:
+        print(str(exc), file=sys.stderr)
+        return 2
+
+    if result.removed:
+        stream.write(f"Updated {result.settings_path}\n")
+        stream.write(
+            "Removed env.CLAUDE_CODE_TEAMMATE_COMMAND, env.CODEX_TEAMMATE_BINARY\n"
+        )
+        stream.write("Restart Claude Code for the changes to take effect.\n")
+        return 0
+
+    print(format_uninstall_message(result), file=stream)
+    return 0
 
 
 def main(argv: list[str] | None = None) -> int:
+    argv = list(argv) if argv is not None else sys.argv[1:]
+
+    if argv:
+        command = argv[0]
+        if command == "install":
+            args = _parse_install_args(argv[1:])
+            kwargs: dict[str, object] = {}
+            if args.settings_path is not None:
+                kwargs["settings_path"] = args.settings_path
+            return _install_command(**kwargs)
+        if command == "uninstall":
+            args = _parse_uninstall_args(argv[1:])
+            kwargs: dict[str, object] = {}
+            if args.settings_path is not None:
+                kwargs["settings_path"] = args.settings_path
+            return _uninstall_command(**kwargs)
+
     args = _parse_args(argv)
 
     overrides: dict[str, object] = {}
