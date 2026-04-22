@@ -1,8 +1,9 @@
 """Live-filesystem integration tests for registration.
 
-These run against the real `~/.claude/teams/codex-teammate/` on this machine.
-They self-clean: each test adds a uniquely-named fixture, asserts state,
-then removes it. Existing team members (including `test-peer`) are not
+These target the real `~/.claude/teams/codex-teammate/` location when it
+exists, but bootstrap a minimal fixture team when it does not so the suite
+remains self-contained. Each test adds a uniquely-named fixture, asserts
+state, then removes it. Existing team members (including `test-peer`) are not
 touched.
 
 Run via:  uv run pytest -v tests/test_registration_live.py
@@ -12,6 +13,7 @@ from __future__ import annotations
 
 import json
 import os
+import shutil
 from pathlib import Path
 
 import pytest
@@ -25,6 +27,31 @@ from codex_teammate.registration import (
 )
 
 TEAM = "codex-teammate"
+
+
+def _seed_team_config() -> dict:
+    return {
+        "name": TEAM,
+        "leadAgentId": f"lead@{TEAM}",
+        "leadSessionId": "fixture-lead-session",
+        "createdAt": 0,
+        "members": [
+            {
+                "agentId": f"test-peer@{TEAM}",
+                "name": "test-peer",
+                "color": "magenta",
+                "joinedAt": 0,
+                "tmuxPaneId": "in-process",
+                "subscriptions": [],
+                "agentType": "claude-teammate",
+                "model": "claude-code",
+                "prompt": "Fixture peer for registration integration tests.",
+                "planModeRequired": False,
+                "cwd": str(Path.cwd().resolve()),
+                "backendType": "in-process",
+            }
+        ],
+    }
 
 
 def _fixture_name() -> str:
@@ -48,6 +75,37 @@ def _member_names(cfg_path: Path) -> list[str]:
     return [m.get("name") for m in cfg["members"] if isinstance(m, dict)]
 
 
+@pytest.fixture(scope="module", autouse=True)
+def ensure_fixture_team():
+    cfg_path = config_path(TEAM)
+    team_root = cfg_path.parent
+    inbox_root = team_root / "inboxes"
+    created_config = False
+    created_team_root = False
+
+    if not cfg_path.exists():
+        created_config = True
+        created_team_root = not team_root.exists()
+        inbox_root.mkdir(parents=True, exist_ok=True)
+        cfg_path.write_text(json.dumps(_seed_team_config(), indent=2) + "\n", encoding="utf-8")
+
+    yield
+
+    if created_team_root:
+        shutil.rmtree(team_root, ignore_errors=True)
+        return
+
+    if created_config and cfg_path.exists():
+        cfg_path.unlink()
+
+    lock_path = inbox_root / ".lock"
+    if created_config and lock_path.exists():
+        lock_path.unlink()
+
+    if created_config and inbox_root.exists() and not any(inbox_root.iterdir()):
+        inbox_root.rmdir()
+
+
 @pytest.fixture
 def fixture_name():
     name = _fixture_name()
@@ -63,7 +121,7 @@ def fixture_name():
 
 def test_register_adds_entry(fixture_name: str):
     cfg_path = config_path(TEAM)
-    assert cfg_path.exists(), "team config missing; prior M0 state expected"
+    assert cfg_path.exists(), "fixture setup should ensure a team config exists"
 
     before_names = _member_names(cfg_path)
     assert fixture_name not in before_names

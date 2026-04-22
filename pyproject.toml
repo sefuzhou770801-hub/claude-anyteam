@@ -33,6 +33,7 @@ dev = [
 
 [project.scripts]
 codex-teammate = "codex_teammate.cli:main"
+codex-teammate-spawn-shim = "codex_teammate.spawn_shim:main"
 codex-teammate-wrapper = "codex_teammate.wrapper_server:main"
 
 [tool.hatch.build.targets.wheel]

@@ -51,10 +51,33 @@ uv run codex-teammate --help
 
 ## Run
 
-The adapter must be **fully detached** from the launching shell — otherwise
-a SIGHUP when the shell exits will kill it mid-task and orphan the claimed
-task in `in_progress` state. Use `setsid nohup … & disown` with stdin
-redirected from `/dev/null`:
+### TUI-visible launch (default)
+
+Point Claude Code's teammate-launch command at the shim, then start Claude
+normally:
+
+```bash
+export CLAUDE_CODE_TEAMMATE_COMMAND="$(command -v codex-teammate-spawn-shim)"
+# then start Claude normally and ask the leader to spawn codex-* teammates
+```
+
+The shim keeps Codex-backed teammates attached to Claude's normal teammate
+launch flow while letting non-`codex-*` names continue to launch via the
+native Claude teammate path.
+
+Optional shim overrides:
+
+- `CODEX_TEAMMATE_SHIM_MATCH` — regex used to decide which teammate names route to Codex (default: `^codex-`)
+- `CODEX_TEAMMATE_BINARY` — path/name for the adapter launcher (default resolution: `codex-teammate` on `PATH`)
+- `CODEX_TEAMMATE_NATIVE_CLAUDE` — path/name for the real Claude binary if `claude` on `PATH` resolves to the shim
+
+### Background launch (fallback)
+
+If you want to run the adapter as a detached background process instead, it
+must be **fully detached** from the launching shell — otherwise a SIGHUP
+when the shell exits will kill it mid-task and orphan the claimed task in
+`in_progress` state. Use `setsid nohup … & disown` with stdin redirected
+from `/dev/null`:
 
 ```bash
 setsid nohup uv run codex-teammate \
