@@ -11,7 +11,5 @@
     "plugin",
     "codex",
     "agent-teams"
-  ],
-  "skills": "./skills",
-  "hooks": "./hooks/hooks.json"
+  ]
 }

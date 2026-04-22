@@ -27,6 +27,7 @@ def test_plugin_manifests_exist_and_are_well_formed() -> None:
 
     assert plugin["name"] == "codex-teammate"
     assert plugin["version"]
+    assert "hooks" not in plugin
     assert marketplace["name"] == "codex-teammate"
     assert marketplace["plugins"][0]["name"] == "codex-teammate"
     assert marketplace["plugins"][0]["source"] == "./"
@@ -75,11 +76,15 @@ def test_session_start_hook_skips_install_when_command_is_already_configured(tmp
     home = tmp_path / "home"
     settings_path = home / ".claude" / "settings.json"
     settings_path.parent.mkdir(parents=True, exist_ok=True)
+    configured_bin = tmp_path / "configured-bin"
+    shim = _make_executable(configured_bin / "codex-teammate-spawn-shim", "#!/bin/sh\nexit 0\n")
+    binary = _make_executable(configured_bin / "codex-teammate", "#!/bin/sh\nexit 0\n")
     settings_path.write_text(
         json.dumps(
             {
                 "env": {
-                    "CLAUDE_CODE_TEAMMATE_COMMAND": "/already/configured/codex-teammate-spawn-shim"
+                    "CLAUDE_CODE_TEAMMATE_COMMAND": str(shim),
+                    "CODEX_TEAMMATE_BINARY": str(binary),
                 }
             }
         ),
@@ -110,6 +115,87 @@ def test_session_start_hook_skips_install_when_command_is_already_configured(tmp
     assert not marker.exists()
 
 
+def test_session_start_hook_repairs_missing_binary_entry(tmp_path: Path) -> None:
+    home = tmp_path / "home"
+    settings_path = home / ".claude" / "settings.json"
+    settings_path.parent.mkdir(parents=True, exist_ok=True)
+    configured_bin = tmp_path / "configured-bin"
+    shim = _make_executable(configured_bin / "codex-teammate-spawn-shim", "#!/bin/sh\nexit 0\n")
+    settings_path.write_text(
+        json.dumps(
+            {
+                "env": {
+                    "CLAUDE_CODE_TEAMMATE_COMMAND": str(shim),
+                }
+            }
+        ),
+        encoding="utf-8",
+    )
+
+    fake_bin = tmp_path / "fake-bin"
+    marker = tmp_path / "install-called.txt"
+    _make_executable(
+        fake_bin / "codex-teammate",
+        f"#!/bin/sh\nprintf '%s\\n' \"$*\" > {marker!s}\n",
+    )
+
+    env = os.environ.copy()
+    env["HOME"] = str(home)
+    env["CLAUDE_PLUGIN_ROOT"] = str(REPO_ROOT)
+    env["PATH"] = f"{fake_bin}:{env['PATH']}"
+
+    completed = subprocess.run(
+        [str(HOOK_SCRIPT)],
+        check=False,
+        capture_output=True,
+        text=True,
+        env=env,
+    )
+
+    assert completed.returncode == 0
+    assert marker.read_text(encoding="utf-8").strip() == "install"
+
+
+def test_session_start_hook_repairs_missing_executable_paths(tmp_path: Path) -> None:
+    home = tmp_path / "home"
+    settings_path = home / ".claude" / "settings.json"
+    settings_path.parent.mkdir(parents=True, exist_ok=True)
+    settings_path.write_text(
+        json.dumps(
+            {
+                "env": {
+                    "CLAUDE_CODE_TEAMMATE_COMMAND": "/missing/codex-teammate-spawn-shim",
+                    "CODEX_TEAMMATE_BINARY": "/missing/codex-teammate",
+                }
+            }
+        ),
+        encoding="utf-8",
+    )
+
+    fake_bin = tmp_path / "fake-bin"
+    marker = tmp_path / "install-called.txt"
+    _make_executable(
+        fake_bin / "codex-teammate",
+        f"#!/bin/sh\nprintf '%s\\n' \"$*\" > {marker!s}\n",
+    )
+
+    env = os.environ.copy()
+    env["HOME"] = str(home)
+    env["CLAUDE_PLUGIN_ROOT"] = str(REPO_ROOT)
+    env["PATH"] = f"{fake_bin}:{env['PATH']}"
+
+    completed = subprocess.run(
+        [str(HOOK_SCRIPT)],
+        check=False,
+        capture_output=True,
+        text=True,
+        env=env,
+    )
+
+    assert completed.returncode == 0
+    assert marker.read_text(encoding="utf-8").strip() == "install"
+
+
 def test_session_start_hook_runs_install_once_when_missing(tmp_path: Path) -> None:
     home = tmp_path / "home"
     fake_bin = tmp_path / "fake-bin"
@@ -134,6 +220,7 @@ def test_session_start_hook_runs_install_once_when_missing(tmp_path: Path) -> No
 
     assert completed.returncode == 0
     assert marker.read_text(encoding="utf-8").strip() == "install"
+    assert completed.stdout == ""
 
 
 def test_session_start_hook_uses_grep_fallback_when_python3_is_missing(tmp_path: Path) -> None:

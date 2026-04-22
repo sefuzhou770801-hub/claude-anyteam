@@ -12,6 +12,7 @@ has_configured_command() {
   if command -v python3 >/dev/null 2>&1; then
     python3 - "$SETTINGS_PATH" <<'PY'
 import json
+import os
 import sys
 from pathlib import Path
 
@@ -28,20 +29,29 @@ env = data.get("env")
 if not isinstance(env, dict):
     raise SystemExit(1)
 
-value = env.get("CLAUDE_CODE_TEAMMATE_COMMAND", "")
-raise SystemExit(0 if isinstance(value, str) and value.strip() else 1)
+command = env.get("CLAUDE_CODE_TEAMMATE_COMMAND", "")
+binary = env.get("CODEX_TEAMMATE_BINARY", "")
+
+def valid_executable(value: object) -> bool:
+    if not isinstance(value, str) or not value.strip():
+        return False
+    candidate = Path(value)
+    return candidate.exists() and os.access(candidate, os.X_OK)
+
+raise SystemExit(0 if valid_executable(command) and valid_executable(binary) else 1)
 PY
     return $?
   fi
 
-  grep -Eq '"CLAUDE_CODE_TEAMMATE_COMMAND"[[:space:]]*:[[:space:]]*"[^[:space:]"][^"]*"' "$SETTINGS_PATH"
+  grep -Eq '"CLAUDE_CODE_TEAMMATE_COMMAND"[[:space:]]*:[[:space:]]*"[^[:space:]"][^"]*"' "$SETTINGS_PATH" \
+    && grep -Eq '"CODEX_TEAMMATE_BINARY"[[:space:]]*:[[:space:]]*"[^[:space:]"][^"]*"' "$SETTINGS_PATH"
 }
 
 if has_configured_command; then
   exit 0
 fi
 
-if "$PLUGIN_ROOT/bin/codex-teammate" install; then
+if "$PLUGIN_ROOT/bin/codex-teammate" install >/dev/null; then
   exit 0
 else
   status=$?
