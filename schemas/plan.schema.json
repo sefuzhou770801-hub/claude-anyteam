@@ -1,0 +1,40 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "title": "Codex teammate plan",
+  "type": "object",
+  "additionalProperties": false,
+  "required": ["steps", "risks"],
+  "properties": {
+    "steps": {
+      "type": "array",
+      "minItems": 1,
+      "description": "Ordered list of actionable implementation steps. Each step should be concrete enough that the lead can evaluate whether it addresses the task.",
+      "items": {
+        "type": "object",
+        "additionalProperties": false,
+        "required": ["summary"],
+        "properties": {
+          "summary": {
+            "type": "string",
+            "minLength": 1,
+            "description": "One-line description of the step."
+          },
+          "files_touched": {
+            "type": "array",
+            "items": { "type": "string" },
+            "description": "Expected files created or modified by this step (may be empty)."
+          }
+        }
+      }
+    },
+    "risks": {
+      "type": "array",
+      "description": "Known risks, unknowns, or places where Codex would need to make judgment calls. Empty array is acceptable if the task is mechanically straightforward.",
+      "items": { "type": "string" }
+    },
+    "estimated_time": {
+      "type": "string",
+      "description": "Rough wall-clock estimate (e.g., '5 minutes', '1 hour'). Optional."
+    }
+  }
+}

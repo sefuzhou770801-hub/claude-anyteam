@@ -1,0 +1,117 @@
+"""Unit tests for protocol message parsing.
+
+Focuses on robustness under partial/malformed input and on the two wire-format
+variants (request_id / requestId) that the adapter has to accept on inbound.
+"""
+
+from __future__ import annotations
+
+import json
+
+from codex_teammate.messages import (
+    PlanApprovalRequestIn,
+    ShutdownRequestIn,
+    ShutdownResponseOut,
+    TaskAssignmentIn,
+    TaskCompleteOut,
+    parse_protocol_text,
+)
+
+
+def test_parse_task_assignment_snake_and_camel():
+    body = {
+        "type": "task_assignment",
+        "taskId": "42",
+        "subject": "Do the thing",
+        "description": "And then the other thing",
+        "assignedBy": "team-lead",
+        "timestamp": "2026-04-21T22:00:00.000Z",
+    }
+    p = parse_protocol_text(json.dumps(body))
+    assert isinstance(p, TaskAssignmentIn)
+    assert p.task_id == "42"
+    assert p.assigned_by == "team-lead"
+
+
+def test_parse_shutdown_request_snake_case():
+    body = {"type": "shutdown_request", "request_id": "abc", "reason": "cleanup"}
+    p = parse_protocol_text(json.dumps(body))
+    assert isinstance(p, ShutdownRequestIn)
+    assert p.effective_request_id() == "abc"
+    assert p.reason == "cleanup"
+
+
+def test_parse_shutdown_request_camel_case():
+    # cs50victor's wire format.
+    body = {"type": "shutdown_request", "requestId": "xyz", "from": "team-lead"}
+    p = parse_protocol_text(json.dumps(body))
+    assert isinstance(p, ShutdownRequestIn)
+    assert p.effective_request_id() == "xyz"
+    assert p.from_ == "team-lead"
+
+
+def test_parse_plan_approval_request():
+    body = {
+        "type": "plan_approval_request",
+        "requestId": "p1",
+        "plan": {"steps": [{"summary": "Step one"}]},
+    }
+    p = parse_protocol_text(json.dumps(body))
+    assert isinstance(p, PlanApprovalRequestIn)
+    assert p.request_id == "p1"
+
+
+def test_parse_non_json_returns_none():
+    assert parse_protocol_text("hello world") is None
+
+
+def test_parse_unknown_type_returns_none():
+    body = {"type": "unknown", "x": 1}
+    assert parse_protocol_text(json.dumps(body)) is None
+
+
+def test_parse_malformed_but_typed_returns_none():
+    # Type field present but required fields missing — model_validate will fail.
+    body = {"type": "task_assignment"}  # missing everything
+    assert parse_protocol_text(json.dumps(body)) is None
+
+
+def test_parse_extra_fields_tolerated():
+    body = {
+        "type": "shutdown_request",
+        "request_id": "abc",
+        "reason": "cleanup",
+        "extra_future_field": "ignored",
+    }
+    p = parse_protocol_text(json.dumps(body))
+    assert isinstance(p, ShutdownRequestIn)
+
+
+def test_shutdown_response_serializes_with_snake_case():
+    r = ShutdownResponseOut(request_id="abc", approve=True)
+    as_dict = json.loads(r.model_dump_json(by_alias=True, exclude_none=True))
+    assert as_dict["type"] == "shutdown_response"
+    assert as_dict["request_id"] == "abc"
+    assert as_dict["approve"] is True
+    assert "feedback" not in as_dict  # omitted when None
+
+
+def test_shutdown_response_with_feedback():
+    r = ShutdownResponseOut(request_id="abc", approve=False, feedback="busy")
+    as_dict = json.loads(r.model_dump_json(by_alias=True, exclude_none=True))
+    assert as_dict["approve"] is False
+    assert as_dict["feedback"] == "busy"
+
+
+def test_task_complete_serializes_with_kind():
+    t = TaskCompleteOut(
+        task_id="7",
+        files_changed=["src/foo.py"],
+        summary="Did the thing",
+        codex_exit_code=0,
+    )
+    as_dict = json.loads(t.model_dump_json(by_alias=True, exclude_none=True))
+    assert as_dict["kind"] == "task_complete"
+    assert as_dict["task_id"] == "7"
+    assert as_dict["files_changed"] == ["src/foo.py"]
+    assert as_dict["codex_exit_code"] == 0

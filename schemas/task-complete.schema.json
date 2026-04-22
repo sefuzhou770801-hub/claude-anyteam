@@ -1,0 +1,19 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "title": "Codex teammate task-complete response",
+  "type": "object",
+  "additionalProperties": false,
+  "required": ["files_changed", "summary"],
+  "properties": {
+    "files_changed": {
+      "type": "array",
+      "items": { "type": "string" },
+      "description": "Absolute or workspace-relative paths of files created or modified to complete the task. Empty array if the task was investigative and produced no file changes."
+    },
+    "summary": {
+      "type": "string",
+      "minLength": 1,
+      "description": "One-paragraph natural-language description of what was done and why. The teammate that reads this (typically the lead) will rely on it for review."
+    }
+  }
+}

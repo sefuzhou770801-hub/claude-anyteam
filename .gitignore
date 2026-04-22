@@ -1,0 +1,23 @@
+# Python
+__pycache__/
+*.py[cod]
+*.pyo
+.venv/
+venv/
+dist/
+build/
+*.egg-info/
+.pytest_cache/
+.mypy_cache/
+.ruff_cache/
+
+# Logs / runtime artifacts
+*.stdout
+*.stderr
+*.log
+/m2-artifacts/
+/sanity-artifacts/
+
+# Spike/scratch dirs (not production code)
+/spike-m0/
+/scrap-ts/
