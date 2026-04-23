@@ -12,8 +12,9 @@ def test_npm_package_metadata_matches_installer_contract() -> None:
     package = json.loads((NPM_DIR / 'package.json').read_text(encoding='utf-8'))
 
     assert package['name'] == 'claude-anyteam'
-    assert package['bin']['claude-anyteam-setup'] == './bin/setup.js'
-    assert package['scripts']['postinstall'] == 'node ./bin/setup.js --postinstall'
+    assert package['bin']['claude-anyteam-setup'] == 'bin/setup.js'
+    assert package['bin']['claude-anyteam'] == 'bin/setup.js'
+    assert package['scripts']['postinstall'] == 'node bin/setup.js --postinstall'
     assert package['engines']['node'] == '>=18'
     assert package['dependencies'] == {
         'gradient-string': '3.0.0',

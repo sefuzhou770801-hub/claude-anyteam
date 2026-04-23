@@ -132,11 +132,11 @@ wheels = [
 
 [[package]]
 name = "claude-anyteam"
-version = "0.1.0"
+version = "0.2.0"
 source = { editable = "." }
 dependencies = [
-    { name = "claude-teams" },
     { name = "fastmcp" },
+    { name = "filelock" },
     { name = "jsonschema" },
     { name = "pydantic" },
 ]
@@ -149,31 +149,10 @@ dev = [
 
 [package.metadata]
 requires-dist = [
-    { name = "claude-teams", directory = "/tmp/cs50victor-teams" },
-    { name = "fastmcp", specifier = "==3.0.0b1" },
-    { name = "jsonschema", specifier = ">=4.20" },
-    { name = "pydantic", specifier = ">=2.10" },
-]
-
-[package.metadata.requires-dev]
-dev = [
-    { name = "pytest", specifier = ">=8.0" },
-    { name = "pytest-asyncio", specifier = ">=0.23" },
-]
-
-[[package]]
-name = "claude-teams"
-version = "0.1.1"
-source = { directory = "/tmp/cs50victor-teams" }
-dependencies = [
-    { name = "fastmcp" },
-    { name = "filelock" },
-]
-
-[package.metadata]
-requires-dist = [
     { name = "fastmcp", specifier = "==3.0.0b1" },
     { name = "filelock", specifier = "==3.16" },
+    { name = "jsonschema", specifier = ">=4.20" },
+    { name = "pydantic", specifier = ">=2.10" },
 ]
 
 [package.metadata.requires-dev]
