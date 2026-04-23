@@ -289,3 +289,131 @@ def test_native_resolution_skips_current_shim(monkeypatch):
     monkeypatch.setattr(spawn_shim.os, "access", lambda path, mode: True)
 
     assert spawn_shim._resolve_native_claude("/shim/bin/claude") == "/usr/bin/claude"
+
+
+# ---- Per-teammate agent config --------------------------------------------
+
+
+def _write_agent_config(tmp_path, team: str, name: str, body: object) -> None:
+    import os as _os
+
+    agents_dir = tmp_path / ".claude" / "teams" / team / "agents"
+    agents_dir.mkdir(parents=True, exist_ok=True)
+    path = agents_dir / f"{name}.json"
+    if isinstance(body, str):
+        path.write_text(body)
+    else:
+        path.write_text(json.dumps(body))
+    _os.chmod(path, 0o644)
+
+
+def _codex_argv_for(monkeypatch, tmp_path, team: str, name: str, capsys):
+    calls = _record_execv(monkeypatch)
+    _clear_binary_env(monkeypatch)
+    monkeypatch.setenv("HOME", str(tmp_path))
+    monkeypatch.setattr(
+        sys,
+        "argv",
+        [
+            "/usr/local/bin/claude-anyteam-spawn-shim",
+            "--agent-name",
+            name,
+            "--team-name",
+            team,
+        ],
+    )
+    monkeypatch.setattr(
+        spawn_shim.shutil,
+        "which",
+        lambda n: {
+            "claude-anyteam": "/usr/local/bin/claude-anyteam",
+            "claude": "/usr/local/bin/claude",
+        }.get(n),
+    )
+
+    assert spawn_shim.main() == 0
+    return calls, capsys.readouterr().err
+
+
+def test_agent_config_forwards_model_and_effort(monkeypatch, tmp_path, capsys):
+    _write_agent_config(tmp_path, "gemini-build", "codex-alice", {"model": "gpt-5.5", "effort": "xhigh"})
+    calls, stderr = _codex_argv_for(monkeypatch, tmp_path, "gemini-build", "codex-alice", capsys)
+
+    _, argv = calls[0]
+    assert argv == [
+        "/usr/local/bin/claude-anyteam",
+        "--name",
+        "codex-alice",
+        "--team",
+        "gemini-build",
+        "--model",
+        "gpt-5.5",
+        "--effort",
+        "xhigh",
+    ]
+    log = json.loads(stderr.strip())
+    assert log["agent_config"] == {"model": "gpt-5.5", "effort": "xhigh"}
+
+
+def test_agent_config_forwards_model_only(monkeypatch, tmp_path, capsys):
+    _write_agent_config(tmp_path, "t", "codex-bob", {"model": "gpt-5.4-mini"})
+    calls, _ = _codex_argv_for(monkeypatch, tmp_path, "t", "codex-bob", capsys)
+    _, argv = calls[0]
+    assert "--model" in argv and "gpt-5.4-mini" in argv
+    assert "--effort" not in argv
+
+
+def test_agent_config_missing_file_is_noop(monkeypatch, tmp_path, capsys):
+    calls, stderr = _codex_argv_for(monkeypatch, tmp_path, "t", "codex-ghost", capsys)
+    _, argv = calls[0]
+    assert "--model" not in argv
+    assert "--effort" not in argv
+    # No error should be logged for a missing file.
+    assert "spawn_shim.agent_config_error" not in stderr
+
+
+def test_agent_config_malformed_json_is_tolerated(monkeypatch, tmp_path, capsys):
+    _write_agent_config(tmp_path, "t", "codex-bad", "{not: valid json")
+    calls, stderr = _codex_argv_for(monkeypatch, tmp_path, "t", "codex-bad", capsys)
+    _, argv = calls[0]
+    assert "--model" not in argv
+    assert "--effort" not in argv
+    # Error event is logged but spawn still proceeds.
+    assert "spawn_shim.agent_config_error" in stderr
+
+
+def test_agent_config_ignores_unknown_keys(monkeypatch, tmp_path, capsys):
+    _write_agent_config(tmp_path, "t", "codex-x", {"model": "gpt-5.5", "poll_s": 2.0, "color": "magenta"})
+    calls, _ = _codex_argv_for(monkeypatch, tmp_path, "t", "codex-x", capsys)
+    _, argv = calls[0]
+    assert "--model" in argv and "gpt-5.5" in argv
+    assert "--color" not in argv
+    assert "--poll-s" not in argv
+
+
+def test_agent_config_not_loaded_for_native_route(monkeypatch, tmp_path, capsys):
+    # A claude-* name should route native and never look up the agents file —
+    # even if one were to exist, it must not influence the argv.
+    _write_agent_config(tmp_path, "t", "claude-worker", {"model": "gpt-5.5"})
+    calls = _record_execv(monkeypatch)
+    _clear_binary_env(monkeypatch)
+    monkeypatch.setenv("HOME", str(tmp_path))
+    argv = [
+        "/usr/local/bin/claude-anyteam-spawn-shim",
+        "--agent-name",
+        "claude-worker",
+        "--team-name",
+        "t",
+    ]
+    monkeypatch.setattr(sys, "argv", argv)
+    monkeypatch.setattr(
+        spawn_shim.shutil,
+        "which",
+        lambda n: {"claude": "/usr/local/bin/claude", "claude-anyteam": "/usr/local/bin/claude-anyteam"}.get(n),
+    )
+
+    assert spawn_shim.main() == 0
+    # Native pass-through preserves the original argv verbatim.
+    _, forwarded = calls[0]
+    assert forwarded == argv
+    assert "--model" not in forwarded

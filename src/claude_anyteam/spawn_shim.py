@@ -93,6 +93,62 @@ def _resolve_binary(default_name: str, *env_vars: str, fallback_name: str | None
     return shutil.which(default_name) or (shutil.which(fallback_name) if fallback_name else None)
 
 
+_AGENT_CONFIG_KEYS = ("model", "effort")
+
+
+def _agent_config_path(team_name: str, agent_name: str) -> str:
+    return os.path.join(
+        os.path.expanduser("~"),
+        ".claude",
+        "teams",
+        team_name,
+        "agents",
+        f"{agent_name}.json",
+    )
+
+
+def _load_agent_config(team_name: str | None, agent_name: str | None) -> dict[str, str]:
+    """Read per-teammate overrides from the team's agents directory.
+
+    Silently returns an empty dict on missing file, unreadable file, malformed
+    JSON, or non-object content. The spawn path must tolerate a broken or
+    missing config — teammates should still start with whatever defaults
+    the adapter picks up from env or ~/.codex/config.toml.
+
+    Only whitelisted keys are forwarded; unknown keys are ignored.
+    """
+    if not team_name or not agent_name:
+        return {}
+    path = _agent_config_path(team_name, agent_name)
+    try:
+        with open(path, "r", encoding="utf-8") as fh:
+            raw = json.load(fh)
+    except FileNotFoundError:
+        return {}
+    except (OSError, json.JSONDecodeError) as exc:
+        sys.stderr.write(
+            json.dumps(
+                {
+                    "event": "spawn_shim.agent_config_error",
+                    "path": path,
+                    "error": str(exc),
+                },
+                sort_keys=True,
+            )
+            + "\n"
+        )
+        sys.stderr.flush()
+        return {}
+    if not isinstance(raw, dict):
+        return {}
+    out: dict[str, str] = {}
+    for key in _AGENT_CONFIG_KEYS:
+        value = raw.get(key)
+        if isinstance(value, str) and value:
+            out[key] = value
+    return out
+
+
 
 def _resolve_current_invocation(argv0: str) -> str | None:
     if not argv0:
@@ -144,13 +200,20 @@ def _codex_route(parsed: ParsedArgs) -> bool:
 
 
 
-def _log_dispatch(route: str, agent_name: str | None, binary: str | None) -> None:
-    record = {
+def _log_dispatch(
+    route: str,
+    agent_name: str | None,
+    binary: str | None,
+    agent_config: dict[str, str] | None = None,
+) -> None:
+    record: dict[str, object] = {
         "event": "spawn_shim.dispatch",
         "route": route,
         "agent_name": agent_name,
         "binary": binary,
     }
+    if agent_config:
+        record["agent_config"] = dict(agent_config)
     sys.stderr.write(json.dumps(record, sort_keys=True) + "\n")
     sys.stderr.flush()
 
@@ -192,7 +255,12 @@ def main(argv: list[str] | None = None) -> int:
             codex_argv.extend(["--team", parsed.team_name])
         if parsed.plan_mode_required:
             codex_argv.append("--plan-mode")
-        _log_dispatch("codex", parsed.agent_name, binary)
+        agent_config = _load_agent_config(parsed.team_name, parsed.agent_name)
+        if "model" in agent_config:
+            codex_argv.extend(["--model", agent_config["model"]])
+        if "effort" in agent_config:
+            codex_argv.extend(["--effort", agent_config["effort"]])
+        _log_dispatch("codex", parsed.agent_name, binary, agent_config or None)
         os.execv(binary, codex_argv)
         return 0
 

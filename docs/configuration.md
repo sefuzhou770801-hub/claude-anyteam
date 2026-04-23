@@ -58,6 +58,34 @@ Every flag has an equivalent env var:
 | `CLAUDE_ANYTEAM_LOG` | `--log` |
 | `CODEX_BINARY` | path to the `codex` binary (default: `codex` on PATH) |
 
+## Per-teammate configuration (shim path)
+
+Claude Code's Agent Teams UI only passes name, team, and plan-mode to the spawn shim — it has no field for per-teammate model/effort. To bridge that gap, the shim looks up a per-agent config file at spawn time:
+
+```
+~/.claude/teams/<team>/agents/<agent-name>.json
+```
+
+Example:
+
+```json
+{
+  "model": "gpt-5.5",
+  "effort": "xhigh"
+}
+```
+
+When the shim dispatches a `codex-*` teammate, it reads this file (if present) and appends `--model` / `--effort` to the `claude-anyteam` invocation. The effect is identical to typing those flags on the command line — both App Server and fresh-exec modes pick them up through the shared `Settings` object.
+
+Behavior:
+
+- Missing file — no-op, teammate starts with env/default config.
+- Malformed JSON or unreadable file — logs `spawn_shim.agent_config_error` to stderr and continues; teammate still starts.
+- Unknown keys — ignored. Only `model` and `effort` are forwarded today; more keys may be added later.
+- Native (`claude-*`) teammates — the file is not consulted; native dispatch is always pass-through.
+
+Precedence (highest wins): per-agent config file → env vars (`CLAUDE_ANYTEAM_MODEL`, `CLAUDE_ANYTEAM_EFFORT`) → adapter defaults → `~/.codex/config.toml`.
+
 ## Shim configuration
 
 | Variable | Purpose |
