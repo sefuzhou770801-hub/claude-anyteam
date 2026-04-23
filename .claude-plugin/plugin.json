@@ -11,5 +11,7 @@
     "plugin",
     "codex",
     "agent-teams"
-  ]
+  ],
+  "homepage": "https://github.com/JonathanRosado/claude-anyteam",
+  "repository": "https://github.com/JonathanRosado/claude-anyteam"
 }

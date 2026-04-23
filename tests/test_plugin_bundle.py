@@ -12,6 +12,7 @@ PLUGIN_MANIFEST = REPO_ROOT / ".claude-plugin" / "plugin.json"
 MARKETPLACE_MANIFEST = REPO_ROOT / ".claude-plugin" / "marketplace.json"
 HOOK_SCRIPT = REPO_ROOT / "hooks" / "session-start.sh"
 WRAPPER_SCRIPT = REPO_ROOT / "bin" / "claude-anyteam"
+HELP_SKILL = REPO_ROOT / "skills" / "help" / "SKILL.md"
 
 
 def _make_executable(path: Path, body: str) -> Path:
@@ -27,10 +28,23 @@ def test_plugin_manifests_exist_and_are_well_formed() -> None:
 
     assert plugin["name"] == "claude-anyteam"
     assert plugin["version"]
+    assert plugin["homepage"] == "https://github.com/JonathanRosado/claude-anyteam"
+    assert plugin["repository"] == "https://github.com/JonathanRosado/claude-anyteam"
     assert "hooks" not in plugin
     assert marketplace["name"] == "claude-anyteam"
     assert marketplace["plugins"][0]["name"] == "claude-anyteam"
     assert marketplace["plugins"][0]["source"] == "./"
+
+
+def test_help_skill_exists_and_teaches_claude_about_codex_teammates() -> None:
+    content = HELP_SKILL.read_text(encoding="utf-8")
+
+    assert "claude-anyteam is installed" in content
+    assert "codex-<something>" in content
+    assert "~/.claude/settings.json" in content
+    assert "Codex works today" in content
+    assert "https://github.com/JonathanRosado/claude-anyteam" in content
+    assert "disable-model-invocation: true" not in content
 
 
 def test_wrapper_delegates_to_real_console_script(tmp_path: Path) -> None:
