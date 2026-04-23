@@ -14,7 +14,7 @@
 
 [**Quickstart**](#quickstart) · [**Architecture**](docs/architecture.md) · [**Roadmap**](docs/roadmap.md)
 
-<img src="assets/diagrams/architecture.svg" alt="claude-anyteam architecture" width="720" />
+<img src="assets/diagrams/architecture.png" alt="claude-anyteam architecture" width="820" />
 
 </div>
 
