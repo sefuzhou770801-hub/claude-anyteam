@@ -131,7 +131,7 @@ claude plugin install claude-anyteam@claude-anyteam
 
 All paths write the same settings. Pick whichever fits your workflow.
 
-Installing the plugin also gives Claude a built-in `/claude-anyteam:help` skill, so the assistant can explain that `codex-<name>` teammates route to Codex, that `~/.claude/settings.json` is already wired by the installer, and that the GitHub repo is the source of truth.
+Installing the plugin also gives Claude a plugin-provided `/claude-anyteam:help` skill, so the assistant can explain that `codex-<name>` teammates route to Codex, that `~/.claude/settings.json` is already wired by the installer, and that the GitHub repo is the source of truth.
 
 ## Launch a teammate directly
 

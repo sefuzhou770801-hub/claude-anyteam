@@ -1,5 +1,6 @@
 ---
-description: Explain that claude-anyteam is installed, routes Agent Teams teammates named `codex-<name>` to Codex today, that `~/.claude/settings.json` is already configured, and that docs live at the public GitHub repo.
+description: Explain that claude-anyteam is installed, routes Agent Teams teammates named `codex-<name>` to Codex today, that `~/.claude/settings.json` is already configured, and that docs live at https://github.com/JonathanRosado/claude-anyteam.
+when_to_use: Use when a user asks how to add, create, invite, use, or troubleshoot a Codex teammate in Claude Code, or asks what claude-anyteam does.
 ---
 
 When the user asks about claude-anyteam, Codex teammates, or setup:

@@ -44,6 +44,7 @@ def test_help_skill_exists_and_teaches_claude_about_codex_teammates() -> None:
     assert "~/.claude/settings.json" in content
     assert "Codex works today" in content
     assert "https://github.com/JonathanRosado/claude-anyteam" in content
+    assert "when_to_use:" in content
     assert "disable-model-invocation: true" not in content
 
 
