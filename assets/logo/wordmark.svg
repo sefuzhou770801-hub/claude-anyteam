@@ -21,7 +21,14 @@
   </g>
 
   <!-- Wordmark -->
-  <text x="130" y="76" font-family="ui-monospace, 'SF Mono', Menlo, Consolas, monospace" font-size="44" font-weight="700" fill="#0f172a">
+  <defs>
+    <linearGradient id="pearl" x1="0" y1="0" x2="0" y2="1">
+      <stop offset="0%" stop-color="#ffffff"/>
+      <stop offset="55%" stop-color="#f1f5f9"/>
+      <stop offset="100%" stop-color="#cbd5e1"/>
+    </linearGradient>
+  </defs>
+  <text x="130" y="76" font-family="ui-monospace, 'SF Mono', Menlo, Consolas, monospace" font-size="44" font-weight="700" fill="url(#pearl)">
     claude<tspan fill="url(#g)">-anyteam</tspan>
   </text>
 </svg>
