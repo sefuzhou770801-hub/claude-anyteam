@@ -250,6 +250,40 @@ Setting `NO_BROWSER=true` in the adapter's environment when it launches Gemini f
 
 (Community confirmation: multiple tracked issues — `#23644`, `#20906`, `#4456`, `#3983` — all document `NO_BROWSER=true` as the headless-auth convention. Issue `#3983` specifically patched device-code prompts to go to stderr, which matters because it means the flag is safe even when we parse stdout as JSONL.)
 
+#### 4.5.6 `google_accounts.json` — not auth-relevant, and it triggers telemetry
+
+Source review of `packages/core/src/utils/userAccountManager.ts` and call sites shows `google_accounts.json` holds `{active: <email>, old: [<email>, ...]}` and is **not consulted during auth resolution**. `fetchCachedCredentials()` in `oauth2.ts` reads `Storage.getOAuthCredsPath()` only; `google_accounts.json` is written post-auth by `fetchAndCacheUserInfo()` but never read back during the `-p` execution path. `readAccountsSync()` explicitly catches `ENOENT` and returns `{active: null, old: []}`, so its absence does not block anything.
+
+The non-auth callers split into two groups:
+- **UI components** (`Footer.tsx`, `UserIdentity.tsx`, `aboutCommand.ts`, `statsCommand.ts`, `creditsFlowHandler.ts`, `acp/commands/about.ts`) — not reached in headless `-p` mode.
+- **Telemetry** — `packages/core/src/telemetry/telemetryAttributes.ts` and `clearcut-logger.ts`. The logger `POST`s to `https://play.googleapis.com/log?format=json&hasfast=true` and, when `getCachedGoogleAccount()` returns an email, includes it as `client_email` in the payload; otherwise it falls back to `client_install_id` (from `~/.gemini/installation_id`).
+
+The telemetry gate is `config.getUsageStatisticsEnabled()`. From `packages/cli/src/config/settingsSchema.ts`:
+
+```ts
+privacy: {
+  type: 'object',
+  ...
+  properties: {
+    usageStatisticsEnabled: {
+      type: 'boolean',
+      default: true,   // <-- ENABLED BY DEFAULT
+      ...
+    },
+  },
+}
+```
+
+**Default is `true`.** A headless subprocess run of `gemini -p 'ok'` with the user's OAuth creds seeded will, by default, emit a usage-statistics event to Google's Clearcut endpoint with the user's email attached. The `installationId` fallback (for API-key mode with no `google_accounts.json`) is less identifying but still emits.
+
+**Implications for the adapter:**
+
+1. **Do not copy `google_accounts.json`** into the adapter home. It is not needed for auth, and copying it promotes telemetry events from `client_install_id` to `client_email`. Dropping it is pure wins: auth still works, telemetry becomes slightly less identifying.
+2. **Disable telemetry in the seeded `settings.json`** by merging in `{"privacy": {"usageStatisticsEnabled": false}}`. This is the right defensive default for a subprocess operating on the user's behalf without their direct observation — they did not opt into telemetry *for the adapter's subprocess*, only for their own interactive `gemini` runs. `requiresRestart: true` in the schema does not apply because the adapter launches a fresh process per task.
+3. **Keep `installation_id` out of the adapter home too.** It is only consulted by the telemetry logger. If we disable telemetry anyway, it is inert, but leaving it out is belt-and-suspenders.
+
+With these changes: §4.7 step 2 copies only `oauth_creds.json` + `settings.json` (merged with `privacy.usageStatisticsEnabled=false`), and the adapter emits no per-task telemetry with user identity attached.
+
 ### 4.6 Revised open sub-questions (for installed-binary confirmation)
 
 Sub-question #1 from §4.4 is **answered** by source read: `GEMINI_API_KEY` beats cached OAuth *unless* `settings.security.auth.selectedType` is non-empty OR `GOOGLE_GENAI_USE_GCA=true`. Needs binary confirmation that the observed behavior matches the source.
@@ -263,6 +297,7 @@ Sub-question #3 from §4.4 remains **open**: does Gemini rewrite `oauth_creds.js
 - whether the message lands on stderr or leaks into stdout
 - whether `--output-format stream-json` emits an `error` event before the process exits, or just exits with a non-zero code and no event
 - whether `gemini -p 'ok'` is a cheap enough probe, or whether we need a lighter-weight way to verify auth (e.g. does `gemini --help` hit the auth path at all? — my read of `gemini.tsx` says no, but confirm)
+- **token-refresh-fails-offline path:** if `oauth_creds.json` is present but `access_token` is expired and the machine is offline, does the CLI return a distinguishable non-zero exit (so the 10-s probe timeout doesn't need to fire), or does it hang on the refresh HTTP call? Low priority — the 10-s ceiling covers it either way — but the distinction matters for the "blocked" error message the probe surfaces (expired-offline vs missing-creds should read differently to the operator).
 
 ### 4.7 Q1(c) startup auth probe — proposed pseudocode
 
@@ -295,19 +330,36 @@ def probe_gemini_auth(
     # resolves to 'oauth-personal' (LOGIN_WITH_GOOGLE).
     real_gemini = real_home / ".gemini"
     creds = real_gemini / "oauth_creds.json"
-    settings = real_gemini / "settings.json"
-    if creds.is_file() and settings.is_file():
+    settings_src = real_gemini / "settings.json"
+    if creds.is_file() and settings_src.is_file():
         adapter_gemini = adapter_home / ".gemini"
         adapter_gemini.mkdir(parents=True, exist_ok=True)
-        # Copy preserving mode 600 on creds (critical; do not use shutil.copy)
-        shutil.copyfile(creds, adapter_gemini / "oauth_creds.json")
-        os.chmod(adapter_gemini / "oauth_creds.json", 0o600)
-        shutil.copyfile(settings, adapter_gemini / "settings.json")
-        # google_accounts.json is not required for auth resolution; copy if present
-        # for completeness (feeds telemetry/account-switcher).
-        acct = real_gemini / "google_accounts.json"
-        if acct.is_file():
-            shutil.copyfile(acct, adapter_gemini / "google_accounts.json")
+
+        # shutil.copyfile copies CONTENT ONLY — no mode, no owner. The explicit
+        # chmod below is therefore required, not redundant. Do NOT "simplify"
+        # to shutil.copy(): that variant carries mode bits from source, which
+        # would make the chmod look like cruft. The defensive posture is the
+        # point — creds must always land mode 600 regardless of source perms.
+        dest_creds = adapter_gemini / "oauth_creds.json"
+        shutil.copyfile(creds, dest_creds)
+        os.chmod(dest_creds, 0o600)
+
+        # Merge settings and disable telemetry in the adapter home. See §4.5.6:
+        # usageStatisticsEnabled defaults to true; leaving it true causes
+        # clearcut-logger to POST to play.googleapis.com/log on every task with
+        # the cached email (if google_accounts.json is seeded) or install id.
+        # Adapter subprocesses should not emit user-visible telemetry the user
+        # did not opt into for this execution context.
+        with settings_src.open("r", encoding="utf-8") as f:
+            settings_data = json.load(f)
+        settings_data.setdefault("privacy", {})["usageStatisticsEnabled"] = False
+        (adapter_gemini / "settings.json").write_text(
+            json.dumps(settings_data, indent=2), encoding="utf-8"
+        )
+
+        # Deliberately NOT copied: google_accounts.json and installation_id.
+        # Neither is consulted during auth resolution (§4.5.6). Omitting them
+        # keeps any residual telemetry keyed to install_id rather than email.
 
         # Verify with a minimal probe. NO_BROWSER=true prevents the 5-minute
         # browser-callback hang if creds are missing/stale; HOME pinned to the
@@ -365,3 +417,4 @@ Design notes for `codex-gemini-loop` implementers:
 
 - 2026-04-23 — initial doc. Blocked on install approval for §§1/2/3/5. §4 answered empirically from on-disk state; §4.5 open sub-questions flagged for installed-binary follow-up.
 - 2026-04-23 — added §4.5 (OAuth first-run source read), §4.6 (revised open sub-questions), §4.7 (Q1(c) probe pseudocode). Source-based findings from HEAD of `google-gemini/gemini-cli`: non-interactive auth resolution order, `isHeadlessMode` logic, `NO_BROWSER` behavior, 5-minute browser-callback timeout, creds-write path. All marked as needing binary confirmation.
+- 2026-04-23 — polish pass from lead review: added §4.5.6 (`google_accounts.json` is telemetry-only, not auth-relevant; default telemetry is on and emits `client_email` to Clearcut). Revised §4.7 to (a) drop `google_accounts.json` copy, (b) merge `{"privacy":{"usageStatisticsEnabled":false}}` into seeded settings, (c) expand the `shutil.copyfile` comment to call out the `shutil.copy` regression trap explicitly. Added offline-token-refresh open question to §4.6.
