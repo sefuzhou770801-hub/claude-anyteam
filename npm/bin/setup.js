@@ -15,6 +15,8 @@ import {
   isCI,
   isInteractive,
   manualInstallLines,
+  runCommand,
+  which,
 } from '../lib/detect.js';
 import {
   TEAMMATE_BINARY_KEY,
@@ -22,6 +24,16 @@ import {
   writeClaudeSettings,
 } from '../lib/settings.js';
 import { renderBanner, renderBox, theme } from '../lib/art.js';
+
+const CLAUDE_PLUGIN_MARKETPLACE_SOURCE = 'JonathanRosado/claude-anyteam';
+const CLAUDE_PLUGIN_MARKETPLACE_NAME = 'claude-anyteam';
+const CLAUDE_PLUGIN_SPEC = `${CLAUDE_PLUGIN_MARKETPLACE_NAME}@${CLAUDE_PLUGIN_MARKETPLACE_NAME}`;
+const CLAUDE_PLUGIN_MANUAL_COMMANDS = [
+  formatCommand('claude', ['plugin', 'marketplace', 'add', CLAUDE_PLUGIN_MARKETPLACE_SOURCE]),
+  formatCommand('claude', ['plugin', 'install', CLAUDE_PLUGIN_SPEC]),
+];
+const CLAUDE_PLUGIN_MARKETPLACE_ALREADY_EXISTS = /\balready (?:on disk|exists)\b/i;
+const CLAUDE_PLUGIN_ALREADY_INSTALLED = /\balready installed\b/i;
 
 function parseArgs(argv) {
   const args = { postinstall: false, settingsPath: undefined, help: false };
@@ -48,8 +60,9 @@ function usage() {
   return [
     'Usage: claude-anyteam-setup [--settings-path <path>] [--postinstall]',
     '',
-    'Installs uv if needed, installs the Python claude-anyteam tool, and writes',
-    '~/.claude/settings.json with absolute launcher paths for Claude Code.',
+    'Installs uv if needed, installs the Python claude-anyteam tool, writes',
+    '~/.claude/settings.json with absolute launcher paths, and registers the',
+    'Claude Code plugin when the claude CLI is available on PATH.',
   ].join('\n');
 }
 
@@ -91,6 +104,12 @@ function printSuccess(lines) {
   console.log('');
 }
 
+function printWarning(title, lines) {
+  console.log('');
+  console.log(renderBox(theme.warn(title), lines, 'yellow'));
+  console.log('');
+}
+
 function trimmedDetails(error) {
   return String(error?.details || error?.message || '').trim();
 }
@@ -98,6 +117,60 @@ function trimmedDetails(error) {
 function postinstallHint(error) {
   const reason = trimmedDetails(error) || error.message;
   console.warn(`claude-anyteam: automatic setup skipped (${reason.split(/\r?\n/, 1)[0]}). Run npx --yes --package claude-anyteam claude-anyteam-setup to finish.`);
+}
+
+function claudePluginManualSummary() {
+  return `skipped (install manually: ${CLAUDE_PLUGIN_MANUAL_COMMANDS.join(' && ')})`;
+}
+
+function claudePluginManualLines() {
+  return CLAUDE_PLUGIN_MANUAL_COMMANDS.map((command) => `    ${theme.accent(command)}`);
+}
+
+function skippedClaudePluginResult(reasonLines) {
+  return {
+    status: 'skipped',
+    summary: claudePluginManualSummary(),
+    warningTitle: 'CLAUDE CODE PLUGIN SKIPPED',
+    warningLines: reasonLines,
+  };
+}
+
+function failedClaudePluginResult(error) {
+  return skippedClaudePluginResult([
+    `${theme.symbols.warn} ${theme.heading('Claude settings were written, but the Claude Code plugin could not be registered automatically.')}`,
+    `${theme.symbols.info} Details: ${trimmedDetails(error) || 'No extra diagnostics.'}`,
+    `${theme.symbols.info} Run these commands manually:`,
+    '',
+    ...claudePluginManualLines(),
+  ]);
+}
+
+async function runClaudePluginCommand(claudePath, args, alreadyPattern) {
+  const result = await runCommand(claudePath, args, { env: process.env });
+  const combined = `${result.stdout}\n${result.stderr}`;
+  if (result.code !== 0 && !alreadyPattern.test(combined)) {
+    const error = new Error(`Command failed: ${formatCommand('claude', args)}`);
+    error.details = combined.trim();
+    error.command = formatCommand('claude', args);
+    throw error;
+  }
+  return { verified: alreadyPattern.test(combined) };
+}
+
+async function registerClaudePlugin({ claudePath }) {
+  const marketplace = await runClaudePluginCommand(
+    claudePath,
+    ['plugin', 'marketplace', 'add', CLAUDE_PLUGIN_MARKETPLACE_SOURCE],
+    CLAUDE_PLUGIN_MARKETPLACE_ALREADY_EXISTS,
+  );
+  const plugin = await runClaudePluginCommand(
+    claudePath,
+    ['plugin', 'install', CLAUDE_PLUGIN_SPEC],
+    CLAUDE_PLUGIN_ALREADY_INSTALLED,
+  );
+  const status = marketplace.verified && plugin.verified ? 'verified' : 'installed';
+  return { status, summary: status };
 }
 
 async function main() {
@@ -114,7 +187,7 @@ async function main() {
   if (!silent) {
     console.log(renderBanner());
     console.log(theme.heading('Zero-friction claude-anyteam setup for Claude Code.'));
-    console.log(theme.muted('We will check Python, install uv if needed, wire up claude-anyteam, and patch Claude settings.'));
+    console.log(theme.muted('We will check Python, install uv if needed, wire up claude-anyteam, patch Claude settings, and register the Claude plugin.'));
     console.log('');
   }
 
@@ -220,6 +293,29 @@ async function main() {
     return 1;
   }
 
+  let claudePlugin = null;
+  const claudePath = await which('claude');
+  if (!claudePath) {
+    claudePlugin = skippedClaudePluginResult([
+      `${theme.symbols.warn} ${theme.heading('Claude Code CLI was not found on PATH, so the plugin install step was skipped.')}`,
+      `${theme.symbols.info} Run these commands once ${theme.accent('claude')} is available:`,
+      '',
+      ...claudePluginManualLines(),
+    ]);
+    if (!silent) {
+      printWarning(claudePlugin.warningTitle, claudePlugin.warningLines);
+    }
+  } else {
+    try {
+      claudePlugin = await withSpinner(`Registering Claude Code plugin`, !silent, () => registerClaudePlugin({ claudePath }));
+    } catch (error) {
+      claudePlugin = failedClaudePluginResult(error);
+      if (!silent) {
+        printWarning(claudePlugin.warningTitle, claudePlugin.warningLines);
+      }
+    }
+  }
+
   if (silent) {
     return 0;
   }
@@ -232,6 +328,7 @@ async function main() {
     `${theme.symbols.info} env.${TEAMMATE_COMMAND_KEY} = ${theme.accent(tool.shimPath)}`,
     `${theme.symbols.info} env.${TEAMMATE_BINARY_KEY} = ${theme.accent(tool.binaryPath)}`,
     `${theme.symbols.info} Tool status = ${theme.accent(toolVerb)}`,
+    `${theme.symbols.info} Claude Code plugin: ${theme.accent(claudePlugin.summary)}`,
     `${theme.symbols.info} uv tool bin directory = ${theme.accent(tool.binDir)}`,
     '',
     `${theme.symbols.info} Launch template:`,

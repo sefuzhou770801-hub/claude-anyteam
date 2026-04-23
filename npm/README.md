@@ -10,7 +10,7 @@ Run exactly this:
 npx --yes --package claude-anyteam claude-anyteam-setup
 ```
 
-The setup flow shows the banner immediately, checks `python3`, installs `uv` if needed, installs or reuses `claude-anyteam`, and writes the Claude Code launcher paths into `~/.claude/settings.json`.
+The setup flow shows the banner immediately, checks `python3`, installs `uv` if needed, installs or reuses `claude-anyteam`, writes the Claude Code launcher paths into `~/.claude/settings.json`, and registers the Claude Code plugin when `claude` is on your `PATH`.
 
 ## What it does
 
@@ -22,6 +22,7 @@ The setup flow shows the banner immediately, checks `python3`, installs `uv` if 
 4. installs `claude-anyteam` with `uv tool install`, or reuses an existing install if it is already available
 5. resolves absolute paths to `claude-anyteam` and `claude-anyteam-spawn-shim`
 6. writes them into `~/.claude/settings.json`
+7. best-effort installs the `claude-anyteam` Claude Code plugin (or reports the exact manual commands if `claude` is unavailable)
 
 If the Python tool is already present in uv's tool bin directory, setup reuses it and only refreshes Claude Code settings.
 
@@ -72,7 +73,7 @@ After a successful run, `~/.claude/settings.json` contains absolute paths like:
 
 Then restart Claude Code.
 
-Running the installer again is safe: it reuses an existing `claude-anyteam` install when available and reports the settings as verified when nothing changed.
+Running the installer again is safe: it reuses an existing `claude-anyteam` install when available, reports the settings as verified when nothing changed, and verifies the Claude Code plugin instead of reinstalling it when it is already present.
 
 ## Maintainer note
 

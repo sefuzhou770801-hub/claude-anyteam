@@ -34,6 +34,14 @@ def test_npm_installer_files_exist() -> None:
     for path in expected:
         assert path.is_file(), path
 
+    setup_source = (NPM_DIR / 'bin' / 'setup.js').read_text(encoding='utf-8')
+    assert 'Registering Claude Code plugin' in setup_source
+    assert 'JonathanRosado/claude-anyteam' in setup_source
+    assert 'CLAUDE_PLUGIN_SPEC' in setup_source
+    assert 'CLAUDE_PLUGIN_MARKETPLACE_NAME' in setup_source
+    assert 'CLAUDE CODE PLUGIN SKIPPED' in setup_source
+    assert 'Claude Code plugin:' in setup_source
+
 
 def test_npm_detect_logic_keeps_uv_tool_resolution_deterministic() -> None:
     detect_source = (NPM_DIR / 'lib' / 'detect.js').read_text(encoding='utf-8')
