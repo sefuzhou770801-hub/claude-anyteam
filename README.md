@@ -36,7 +36,7 @@ That's the entire install. The installer:
 
 - Detects `python3` and installs `uv` if missing (non-interactive, no shell profile edits)
 - Installs the `claude-anyteam` Python tool via `uv tool install`
-- Writes the Claude Code hook (`CLAUDE_CODE_TEAMMATE_COMMAND`) and binary path to `~/.claude/settings.json`
+- Runs `claude-anyteam install` (verifies tmux/psmux, writes `~/.claude/settings.json` + `~/.claude.json`, records install-state for symmetric uninstall)
 
 Restart Claude Code, enable Agent Teams mode, and create a teammate named `codex-<anything>`:
 
@@ -112,6 +112,7 @@ Codex is shipping. Everything in "coming next" is on the same architectural surf
 - [Architecture](docs/architecture.md) — how the adapter integrates with Claude Code's team protocol
 - [Roadmap](docs/roadmap.md) — supported today vs coming next, contribution pointers
 - [Configuration](docs/configuration.md) — CLI flags, env vars, advanced modes
+- [Releasing](docs/releasing.md) — maintainer-facing tag-triggered publish flow
 
 ## License
 
