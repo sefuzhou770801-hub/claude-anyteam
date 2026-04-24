@@ -98,55 +98,6 @@ Each new task forks from the previous task's Codex thread via `thread/fork`. The
 
 Codex is shipping. Everything in "coming next" is on the same architectural surface — each new model is a new adapter binary + one line in the spawn shim's routing table. See [docs/roadmap.md](docs/roadmap.md).
 
-## How installation works
-
-One command writes two env vars to `~/.claude/settings.json`:
-
-```json
-{
-  "env": {
-    "CLAUDE_CODE_TEAMMATE_COMMAND": "/absolute/path/to/claude-anyteam-spawn-shim",
-    "CLAUDE_ANYTEAM_BINARY": "/absolute/path/to/claude-anyteam"
-  }
-}
-```
-
-When Agent Teams mode spawns a teammate, Claude Code invokes `$CLAUDE_CODE_TEAMMATE_COMMAND` (the shim) instead of native `claude`. The shim inspects the agent name:
-
-- `codex-*` → dispatches to the `claude-anyteam` adapter (Codex)
-- Anything else → forwards to native `claude` (unchanged)
-
-Every step is reversible. `claude-anyteam uninstall` cleanly removes the env vars.
-
-## Other install paths
-
-```bash
-# via uv directly (if you already have uv + Python)
-uv tool install claude-anyteam && claude-anyteam install
-
-# via Claude Code plugin (self-heals settings on every session)
-claude plugin marketplace add JonathanRosado/claude-anyteam
-claude plugin install claude-anyteam@claude-anyteam
-```
-
-All paths write the same settings. Pick whichever fits your workflow.
-
-Installing the plugin also gives Claude a plugin-provided `/claude-anyteam:help` skill, so the assistant can explain that `codex-<name>` teammates route to Codex, that `~/.claude/settings.json` is already wired by the installer, and that the GitHub repo is the source of truth.
-
-## Launch a teammate directly
-
-For headless and persistent background adapters (run across multiple Claude Code sessions):
-
-```bash
-setsid nohup claude-anyteam \
-  --team my-team --name codex-alice \
-  --cwd /path/to/workspace \
-  --model gpt-5.5 --effort high \
-  </dev/null >/tmp/codex-alice.stdout 2>/tmp/codex-alice.stderr & disown
-```
-
-This mode is fully messageable (inbox, task claim, peer replies) but does NOT render in Claude Code's TUI presence line — TUI visibility requires the leader-spawn path via the shim (above). Useful when you want the adapter running continuously regardless of the Claude Code session lifecycle.
-
 ## Requirements
 
 - Python 3.12+
@@ -157,6 +108,7 @@ This mode is fully messageable (inbox, task claim, peer replies) but does NOT re
 
 ## Docs
 
+- [Install](docs/install.md) — how the installer wires Claude Code, alternative install methods, headless launches
 - [Architecture](docs/architecture.md) — how the adapter integrates with Claude Code's team protocol
 - [Roadmap](docs/roadmap.md) — supported today vs coming next, contribution pointers
 - [Configuration](docs/configuration.md) — CLI flags, env vars, advanced modes
