@@ -14,7 +14,7 @@
 
 [**Quickstart**](#quickstart) · [**Architecture**](docs/architecture.md) · [**Roadmap**](docs/roadmap.md)
 
-<video src="https://github.com/JonathanRosado/claude-anyteam/releases/download/v0.3.1/speed-claude-anyteam.mp4" controls muted autoplay loop playsinline width="820"></video>
+<img src="assets/demos/speed-claude-anyteam.gif" alt="claude-anyteam spawning a mixed Codex + Claude team" width="820" />
 
 </div>
 
