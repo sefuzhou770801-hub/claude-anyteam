@@ -281,6 +281,8 @@ def test_install_writes_teammate_mode_when_absent(tmp_path: Path, monkeypatch, c
         "schema_version": installer_mod.STATE_SCHEMA_VERSION,
         "teammateMode_original": None,
         "teammateMode_set_by_anyteam": True,
+        "settings_file_created_by_anyteam": True,
+        "claude_json_created_by_anyteam": True,
     }
 
     stdout = capsys.readouterr().out
@@ -312,6 +314,8 @@ def test_install_is_noop_when_teammate_mode_already_tmux(tmp_path: Path, monkeyp
         "schema_version": installer_mod.STATE_SCHEMA_VERSION,
         "teammateMode_original": "tmux",
         "teammateMode_set_by_anyteam": False,
+        "settings_file_created_by_anyteam": True,  # we did create settings.json
+        "claude_json_created_by_anyteam": False,  # claude.json was pre-existing
     }
 
     stdout = capsys.readouterr().out
@@ -357,6 +361,8 @@ def test_install_prompts_and_overwrites_auto_when_accepted(tmp_path: Path, monke
         "schema_version": installer_mod.STATE_SCHEMA_VERSION,
         "teammateMode_original": "auto",
         "teammateMode_set_by_anyteam": True,
+        "settings_file_created_by_anyteam": True,  # we created settings.json (no pre-existing)
+        "claude_json_created_by_anyteam": False,  # claude.json was pre-existing
     }
 
 
@@ -640,3 +646,285 @@ def test_install_then_uninstall_round_trip_preserves_user_state(tmp_path: Path, 
     post_claude_json = json.loads(claude_json_path.read_text(encoding="utf-8"))
     assert post_claude_json == pre_claude_json
     assert not state_path.exists()
+
+
+# ---------------------------------------------------------------------------
+# Uninstall audit — "leave no trace" coverage (schema v2)
+# ---------------------------------------------------------------------------
+
+def test_uninstall_removes_settings_file_when_we_created_it(tmp_path: Path, monkeypatch):
+    """Install on a fresh system creates settings.json; uninstall should unlink
+    it when no non-managed keys remain."""
+    settings_path, claude_json_path, state_path, bin_dir = _fresh_paths(tmp_path)
+    codex_binary = _make_executable(bin_dir / "claude-anyteam")
+    _make_executable(bin_dir / "claude-anyteam-spawn-shim")
+
+    _stub_prereq_found(monkeypatch)
+    monkeypatch.setattr(installer_mod.shutil, "which", lambda name: None)
+    monkeypatch.setattr(cli_mod.sys, "argv", [str(codex_binary)])
+
+    assert cli_mod.main(_install_argv(settings_path, claude_json_path, state_path)) == 0
+    assert settings_path.exists()
+
+    assert cli_mod.main(_uninstall_argv(settings_path, claude_json_path, state_path)) == 0
+    assert not settings_path.exists(), "settings.json we created + that would be empty should be removed"
+
+
+def test_uninstall_keeps_settings_file_when_user_had_one(tmp_path: Path, monkeypatch):
+    """If settings.json existed pre-install with user keys, uninstall strips our
+    keys but leaves the file in place (even if `env` itself becomes empty)."""
+    settings_path, claude_json_path, state_path, bin_dir = _fresh_paths(tmp_path)
+    codex_binary = _make_executable(bin_dir / "claude-anyteam")
+    _make_executable(bin_dir / "claude-anyteam-spawn-shim")
+
+    settings_path.parent.mkdir(parents=True, exist_ok=True)
+    pre_settings = {"theme": "dark", "env": {"KEEP_ME": "yes"}}
+    settings_path.write_text(json.dumps(pre_settings) + "\n", encoding="utf-8")
+
+    _stub_prereq_found(monkeypatch)
+    monkeypatch.setattr(installer_mod.shutil, "which", lambda name: None)
+    monkeypatch.setattr(cli_mod.sys, "argv", [str(codex_binary)])
+
+    assert cli_mod.main(_install_argv(settings_path, claude_json_path, state_path)) == 0
+    assert cli_mod.main(_uninstall_argv(settings_path, claude_json_path, state_path)) == 0
+
+    assert settings_path.exists()
+    assert json.loads(settings_path.read_text(encoding="utf-8")) == pre_settings
+
+
+def test_uninstall_removes_claude_json_when_we_created_it(tmp_path: Path, monkeypatch):
+    """If we added the only key claude.json held, uninstall removes the key AND
+    deletes the now-empty file (we created it)."""
+    settings_path, claude_json_path, state_path, bin_dir = _fresh_paths(tmp_path)
+    codex_binary = _make_executable(bin_dir / "claude-anyteam")
+    _make_executable(bin_dir / "claude-anyteam-spawn-shim")
+
+    _stub_prereq_found(monkeypatch)
+    monkeypatch.setattr(installer_mod.shutil, "which", lambda name: None)
+    monkeypatch.setattr(cli_mod.sys, "argv", [str(codex_binary)])
+
+    assert cli_mod.main(_install_argv(settings_path, claude_json_path, state_path)) == 0
+    assert claude_json_path.exists()
+
+    assert cli_mod.main(_uninstall_argv(settings_path, claude_json_path, state_path)) == 0
+    assert not claude_json_path.exists(), "claude.json we created + now empty should be removed"
+
+
+def test_uninstall_keeps_claude_json_when_user_had_one(tmp_path: Path, monkeypatch):
+    """Even if uninstall pops teammateMode and other keys remain, the file stays."""
+    settings_path, claude_json_path, state_path, bin_dir = _fresh_paths(tmp_path)
+    codex_binary = _make_executable(bin_dir / "claude-anyteam")
+    _make_executable(bin_dir / "claude-anyteam-spawn-shim")
+
+    claude_json_path.parent.mkdir(parents=True, exist_ok=True)
+    pre_claude = {"somethingElse": "x"}
+    claude_json_path.write_text(json.dumps(pre_claude) + "\n", encoding="utf-8")
+
+    _stub_prereq_found(monkeypatch)
+    monkeypatch.setattr(installer_mod.shutil, "which", lambda name: None)
+    monkeypatch.setattr(cli_mod.sys, "argv", [str(codex_binary)])
+
+    assert cli_mod.main(_install_argv(settings_path, claude_json_path, state_path)) == 0
+    assert cli_mod.main(_uninstall_argv(settings_path, claude_json_path, state_path)) == 0
+
+    assert claude_json_path.exists()
+    assert json.loads(claude_json_path.read_text(encoding="utf-8")) == pre_claude
+
+
+def test_uninstall_removes_empty_plugin_data_dir(tmp_path: Path, monkeypatch):
+    """After state file delete, the plugin-data dir should be rmdir'd if empty."""
+    settings_path, claude_json_path, state_path, bin_dir = _fresh_paths(tmp_path)
+    codex_binary = _make_executable(bin_dir / "claude-anyteam")
+    _make_executable(bin_dir / "claude-anyteam-spawn-shim")
+
+    _stub_prereq_found(monkeypatch)
+    monkeypatch.setattr(installer_mod.shutil, "which", lambda name: None)
+    monkeypatch.setattr(cli_mod.sys, "argv", [str(codex_binary)])
+
+    assert cli_mod.main(_install_argv(settings_path, claude_json_path, state_path)) == 0
+    plugin_data_dir = state_path.parent
+    assert plugin_data_dir.exists()
+
+    assert cli_mod.main(_uninstall_argv(settings_path, claude_json_path, state_path)) == 0
+    assert not plugin_data_dir.exists(), "empty plugin-data dir should be rmdir'd"
+
+
+def test_uninstall_leaves_plugin_data_dir_when_nonempty(tmp_path: Path, monkeypatch):
+    """If the user placed their own file in our plugin-data dir, rmdir refuses
+    (OSError on ENOTEMPTY) and we leave it alone."""
+    settings_path, claude_json_path, state_path, bin_dir = _fresh_paths(tmp_path)
+    codex_binary = _make_executable(bin_dir / "claude-anyteam")
+    _make_executable(bin_dir / "claude-anyteam-spawn-shim")
+
+    _stub_prereq_found(monkeypatch)
+    monkeypatch.setattr(installer_mod.shutil, "which", lambda name: None)
+    monkeypatch.setattr(cli_mod.sys, "argv", [str(codex_binary)])
+
+    assert cli_mod.main(_install_argv(settings_path, claude_json_path, state_path)) == 0
+
+    plugin_data_dir = state_path.parent
+    stranger_file = plugin_data_dir / "user-notes.txt"
+    stranger_file.write_text("user's own file\n", encoding="utf-8")
+
+    assert cli_mod.main(_uninstall_argv(settings_path, claude_json_path, state_path)) == 0
+    assert plugin_data_dir.exists()
+    assert stranger_file.exists()
+    assert stranger_file.read_text(encoding="utf-8") == "user's own file\n"
+    # Our state file IS gone; the user's file is not.
+    assert not state_path.exists()
+
+
+def test_uninstall_leaves_plugins_and_data_parents_alone(tmp_path: Path, monkeypatch):
+    """rmdir on our leaf dir must not cascade into plugins/data/ or plugins/."""
+    settings_path, claude_json_path, state_path, bin_dir = _fresh_paths(tmp_path)
+    codex_binary = _make_executable(bin_dir / "claude-anyteam")
+    _make_executable(bin_dir / "claude-anyteam-spawn-shim")
+
+    _stub_prereq_found(monkeypatch)
+    monkeypatch.setattr(installer_mod.shutil, "which", lambda name: None)
+    monkeypatch.setattr(cli_mod.sys, "argv", [str(codex_binary)])
+
+    assert cli_mod.main(_install_argv(settings_path, claude_json_path, state_path)) == 0
+
+    plugin_data_dir = state_path.parent  # .../plugins/data/claude-anyteam-claude-anyteam
+    data_dir = plugin_data_dir.parent     # .../plugins/data
+    plugins_dir = data_dir.parent         # .../plugins
+
+    # Plant a sibling in data/ so the parent is non-empty even after we clean up
+    # our leaf — proves we'd have stopped at our own dir regardless.
+    sibling = data_dir / "some-other-plugin"
+    sibling.mkdir()
+
+    assert cli_mod.main(_uninstall_argv(settings_path, claude_json_path, state_path)) == 0
+
+    assert not plugin_data_dir.exists()
+    assert data_dir.exists()
+    assert plugins_dir.exists()
+    assert sibling.exists()
+
+
+def test_uninstall_refuses_on_corrupted_state(tmp_path: Path):
+    """Malformed state ('teammateMode_original' of wrong type) → exit code 4,
+    state file preserved, claude.json untouched."""
+    settings_path, claude_json_path, state_path, _ = _fresh_paths(tmp_path)
+    claude_json_path.parent.mkdir(parents=True, exist_ok=True)
+    claude_json_path.write_text(
+        json.dumps({installer_mod.TEAMMATE_MODE_KEY: "tmux"}) + "\n",
+        encoding="utf-8",
+    )
+    state_path.parent.mkdir(parents=True, exist_ok=True)
+    state_path.write_text(
+        json.dumps(
+            {
+                "schema_version": installer_mod.STATE_SCHEMA_VERSION,
+                "teammateMode_original": 42,  # malformed: not a string or null
+                "teammateMode_set_by_anyteam": True,
+            }
+        )
+        + "\n",
+        encoding="utf-8",
+    )
+
+    exit_code = cli_mod.main(_uninstall_argv(settings_path, claude_json_path, state_path))
+    assert exit_code == 4
+
+    # State file preserved for the user to inspect.
+    assert state_path.exists()
+    # claude.json untouched.
+    claude_json = json.loads(claude_json_path.read_text(encoding="utf-8"))
+    assert claude_json == {installer_mod.TEAMMATE_MODE_KEY: "tmux"}
+
+
+def test_uninstall_state_schema_v1_forward_compat(tmp_path: Path, monkeypatch):
+    """A state file written by the v1 installer (no created-flags) must be
+    handled safely by the v2 uninstaller: missing flags default to False, so
+    we never delete files we didn't record creating."""
+    settings_path, claude_json_path, state_path, _ = _fresh_paths(tmp_path)
+
+    # Simulate a v1 install result: user had neither file pre-install but the
+    # v1 installer didn't track that. Post-install, both files exist and the
+    # v1 state file is on disk with only the v1 fields.
+    settings_path.parent.mkdir(parents=True, exist_ok=True)
+    settings_path.write_text(
+        json.dumps(
+            {
+                "env": {
+                    installer_mod.TEAMMATE_COMMAND_KEY: "/opt/tools/claude-anyteam-spawn-shim",
+                    installer_mod.TEAMMATE_BINARY_KEY: "/opt/tools/claude-anyteam",
+                }
+            }
+        ),
+        encoding="utf-8",
+    )
+    claude_json_path.parent.mkdir(parents=True, exist_ok=True)
+    claude_json_path.write_text(
+        json.dumps({installer_mod.TEAMMATE_MODE_KEY: "tmux"}) + "\n",
+        encoding="utf-8",
+    )
+    state_path.parent.mkdir(parents=True, exist_ok=True)
+    state_path.write_text(
+        json.dumps(
+            {
+                "schema_version": 1,
+                "teammateMode_original": None,
+                "teammateMode_set_by_anyteam": True,
+            }
+        )
+        + "\n",
+        encoding="utf-8",
+    )
+
+    assert cli_mod.main(_uninstall_argv(settings_path, claude_json_path, state_path)) == 0
+
+    # teammateMode removed (the v1 state knows we set it). But because the
+    # created-flags were missing (v1), we default to False and leave the now-
+    # empty files on disk.
+    assert settings_path.exists()
+    assert claude_json_path.exists()
+    assert json.loads(claude_json_path.read_text(encoding="utf-8")) == {}
+
+
+def test_uninstall_roundtrip_on_fresh_system_leaves_no_trace(tmp_path: Path, monkeypatch):
+    """Headline audit test: install on a genuinely fresh system then uninstall
+    → no file or directory under ~/.claude that we created should remain."""
+    settings_path, claude_json_path, state_path, bin_dir = _fresh_paths(tmp_path)
+    codex_binary = _make_executable(bin_dir / "claude-anyteam")
+    _make_executable(bin_dir / "claude-anyteam-spawn-shim")
+
+    _stub_prereq_found(monkeypatch)
+    monkeypatch.setattr(installer_mod.shutil, "which", lambda name: None)
+    monkeypatch.setattr(cli_mod.sys, "argv", [str(codex_binary)])
+
+    # Pre-state: no ~/.claude anywhere under tmp_path/home.
+    home_claude = tmp_path / "home" / ".claude"
+    assert not home_claude.exists()
+
+    assert cli_mod.main(_install_argv(settings_path, claude_json_path, state_path)) == 0
+    # Post-install: all three artifacts present.
+    assert settings_path.exists()
+    assert claude_json_path.exists()
+    assert state_path.exists()
+
+    assert cli_mod.main(_uninstall_argv(settings_path, claude_json_path, state_path)) == 0
+
+    # Post-uninstall: all three artifacts gone.
+    assert not settings_path.exists()
+    assert not claude_json_path.exists()
+    assert not state_path.exists()
+    assert not state_path.parent.exists(), "plugin-data dir should be cleaned up"
+
+
+def test_uninstall_is_idempotent(tmp_path: Path, monkeypatch):
+    """install → uninstall → uninstall: the second uninstall is a clean no-op."""
+    settings_path, claude_json_path, state_path, bin_dir = _fresh_paths(tmp_path)
+    codex_binary = _make_executable(bin_dir / "claude-anyteam")
+    _make_executable(bin_dir / "claude-anyteam-spawn-shim")
+
+    _stub_prereq_found(monkeypatch)
+    monkeypatch.setattr(installer_mod.shutil, "which", lambda name: None)
+    monkeypatch.setattr(cli_mod.sys, "argv", [str(codex_binary)])
+
+    assert cli_mod.main(_install_argv(settings_path, claude_json_path, state_path)) == 0
+    assert cli_mod.main(_uninstall_argv(settings_path, claude_json_path, state_path)) == 0
+    # Second uninstall: everything already gone; should still return 0, not raise.
+    assert cli_mod.main(_uninstall_argv(settings_path, claude_json_path, state_path)) == 0

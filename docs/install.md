@@ -34,6 +34,24 @@ When Agent Teams mode spawns a teammate, Claude Code invokes `$CLAUDE_CODE_TEAMM
 
 Every step is reversible. `claude-anyteam uninstall` cleanly removes the env vars and reverts `teammateMode` to whatever was there before (or removes it entirely if the install added it).
 
+## Uninstall
+
+`claude-anyteam uninstall` is designed to leave no trace of what the installer wrote. It touches the same three files the installer did:
+
+- `~/.claude/settings.json` — removes the `CLAUDE_CODE_TEAMMATE_COMMAND` and `CLAUDE_ANYTEAM_BINARY` keys from the `env` block. Any other keys you have there (including unrelated `env` entries like `KEEP_ME`) are preserved. If `settings.json` didn't exist before install and is now empty after our removal, the file is deleted.
+- `~/.claude.json` — reverts `teammateMode` to whatever it held before install, or removes the key entirely if install added it from scratch. If the file didn't exist before install and is now empty, it is deleted.
+- `~/.claude/plugins/data/claude-anyteam-claude-anyteam/install-state.json` — deleted. The enclosing plugin-data directory is removed too, but only if empty. Parent directories (`~/.claude/plugins/data/`, `~/.claude/plugins/`) are left alone.
+
+### What uninstall does NOT do
+
+- **Does not uninstall the Python tool.** Run `uv tool uninstall claude-anyteam` to remove the `claude-anyteam` binary itself.
+- **Does not uninstall the Claude Code plugin** (if you installed via the plugin path). Run `claude plugin uninstall claude-anyteam@claude-anyteam` inside Claude Code.
+- **Does not remove tmux or psmux.** These are system-level tools installed via your package manager; uninstall them with `apt remove tmux` / `brew uninstall tmux` / `winget uninstall psmux` as appropriate.
+
+### Safety
+
+If the installer's state file has been manually edited into a form the uninstaller cannot parse, uninstall refuses to touch any config and exits with a distinct error code so you can inspect the state file and either fix or delete it by hand. Uninstall is idempotent — running it twice is a clean no-op.
+
 ## Alternative install methods
 
 ```bash
