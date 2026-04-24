@@ -16,6 +16,7 @@ from . import logger
 from .config import from_env
 from .installer import (
     InstallError,
+    format_install_message,
     format_uninstall_message,
     install as install_settings,
     uninstall as uninstall_settings,
@@ -93,11 +94,29 @@ def _build_install_parser() -> argparse.ArgumentParser:
         prog="claude-anyteam install",
         description=(
             "Persist the claude-anyteam spawn shim in ~/.claude/settings.json so "
-            "Claude Code can launch it in future sessions."
+            "Claude Code can launch it in future sessions, and set "
+            "teammateMode=\"tmux\" in ~/.claude.json so teammates route through "
+            "the pane backend."
         ),
     )
     p.add_argument(
+        "--assume-yes",
+        "-y",
+        action="store_true",
+        help="auto-accept prompts (needed for scripted installs)",
+    )
+    p.add_argument(
         "--settings-path",
+        default=None,
+        help=argparse.SUPPRESS,
+    )
+    p.add_argument(
+        "--claude-json-path",
+        default=None,
+        help=argparse.SUPPRESS,
+    )
+    p.add_argument(
+        "--state-path",
         default=None,
         help=argparse.SUPPRESS,
     )
@@ -111,10 +130,20 @@ def _parse_install_args(argv: list[str] | None = None) -> argparse.Namespace:
 def _build_uninstall_parser() -> argparse.ArgumentParser:
     p = argparse.ArgumentParser(
         prog="claude-anyteam uninstall",
-        description="Remove claude-anyteam-managed entries from ~/.claude/settings.json.",
+        description="Remove claude-anyteam-managed entries from ~/.claude/settings.json and revert teammateMode.",
     )
     p.add_argument(
         "--settings-path",
+        default=None,
+        help=argparse.SUPPRESS,
+    )
+    p.add_argument(
+        "--claude-json-path",
+        default=None,
+        help=argparse.SUPPRESS,
+    )
+    p.add_argument(
+        "--state-path",
         default=None,
         help=argparse.SUPPRESS,
     )
@@ -125,48 +154,69 @@ def _parse_uninstall_args(argv: list[str] | None = None) -> argparse.Namespace:
     return _build_uninstall_parser().parse_args(argv)
 
 
+def _interactive_prompt(current_value: str) -> bool:
+    """Asks the user whether to overwrite an existing teammateMode value.
+
+    Returns False on decline, anything-not-explicitly-yes, or if stdin is not
+    a TTY (scripted install without --assume-yes: fail loudly rather than hang).
+    """
+    if not sys.stdin.isatty():
+        return False
+    try:
+        answer = input(
+            f"claude-anyteam wants to set teammateMode=\"tmux\" in ~/.claude.json. "
+            f"Current value: {current_value!r}. Overwrite? [y/N] "
+        )
+    except EOFError:
+        return False
+    return answer.strip().lower() in {"y", "yes"}
+
+
 def _install_command(
     *,
     settings_path: Path | str | None = None,
+    claude_json_path: Path | str | None = None,
+    state_path: Path | str | None = None,
+    assume_yes: bool = False,
     current_executable: str | None = None,
     out: TextIO | None = None,
 ) -> int:
     stream = out or sys.stdout
+    prompt_fn = (lambda _current: True) if assume_yes else _interactive_prompt
+
     try:
         result = install_settings(
             settings_path=settings_path,
+            claude_json_path=claude_json_path,
+            state_path=state_path,
             argv0=current_executable or sys.argv[0],
+            prompt_fn=prompt_fn,
         )
     except InstallError as exc:
         print(str(exc), file=sys.stderr)
-        return 2
+        return getattr(exc, "cli_exit_code", 2)
 
-    stream.write(f"Updated {result.paths.settings_path}\n")
-    stream.write(
-        f"Set env.CLAUDE_CODE_TEAMMATE_COMMAND={result.paths.shim_path}\n"
-    )
-    stream.write(
-        f"Set env.CLAUDE_ANYTEAM_BINARY={result.paths.binary_path}\n"
-    )
-    stream.write("Restart Claude Code for the changes to take effect.\n")
+    print(format_install_message(result), file=stream)
     return 0
 
 
 def _uninstall_command(
     *,
     settings_path: Path | str | None = None,
+    claude_json_path: Path | str | None = None,
+    state_path: Path | str | None = None,
     out: TextIO | None = None,
 ) -> int:
     stream = out or sys.stdout
     try:
-        result = uninstall_settings(settings_path=settings_path)
+        result = uninstall_settings(
+            settings_path=settings_path,
+            claude_json_path=claude_json_path,
+            state_path=state_path,
+        )
     except InstallError as exc:
         print(str(exc), file=sys.stderr)
         return 2
-
-    if result.removed:
-        print(format_uninstall_message(result), file=stream)
-        return 0
 
     print(format_uninstall_message(result), file=stream)
     return 0
@@ -179,15 +229,23 @@ def main(argv: list[str] | None = None) -> int:
         command = argv[0]
         if command == "install":
             args = _parse_install_args(argv[1:])
-            kwargs: dict[str, object] = {}
+            kwargs: dict[str, object] = {"assume_yes": args.assume_yes}
             if args.settings_path is not None:
                 kwargs["settings_path"] = args.settings_path
+            if args.claude_json_path is not None:
+                kwargs["claude_json_path"] = args.claude_json_path
+            if args.state_path is not None:
+                kwargs["state_path"] = args.state_path
             return _install_command(**kwargs)
         if command == "uninstall":
             args = _parse_uninstall_args(argv[1:])
             kwargs: dict[str, object] = {}
             if args.settings_path is not None:
                 kwargs["settings_path"] = args.settings_path
+            if args.claude_json_path is not None:
+                kwargs["claude_json_path"] = args.claude_json_path
+            if args.state_path is not None:
+                kwargs["state_path"] = args.state_path
             return _uninstall_command(**kwargs)
 
     args = _parse_args(argv)
