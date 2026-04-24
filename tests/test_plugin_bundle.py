@@ -45,12 +45,15 @@ def test_help_skill_exists_and_teaches_claude_about_codex_teammates() -> None:
     content = HELP_SKILL.read_text(encoding="utf-8")
 
     assert "name: help" in content
-    assert "claude-anyteam installed" in content
-    assert "codex-<name>" in content
-    assert "~/.claude/settings.json" in content
-    assert "Codex works today" in content
-    assert "https://github.com/JonathanRosado/claude-anyteam" in content
+    # Core intent of the skill (unchanged across rewrites): teach Claude Code
+    # to name Codex teammates with `codex-` prefix and call the Agent Teams
+    # tools directly instead of explaining the mechanism.
+    assert "codex-" in content
+    assert "^codex-" in content
+    assert "TeamCreate" in content
+    assert "Agent(" in content
     assert "when_to_use:" in content
+    # Must not mark this skill as user-invokable only; it's proactive.
     assert "disable-model-invocation: true" not in content
 
 
