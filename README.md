@@ -14,7 +14,7 @@
 
 [**Quickstart**](#quickstart) · [**Architecture**](docs/architecture.md) · [**Roadmap**](docs/roadmap.md)
 
-<img src="assets/diagrams/architecture.png" alt="claude-anyteam architecture" width="820" />
+<video src="https://github.com/JonathanRosado/claude-anyteam/releases/download/v0.3.1/speed-claude-anyteam.mp4" controls muted autoplay loop playsinline width="820"></video>
 
 </div>
 
@@ -25,6 +25,10 @@
 Claude Code's [Agent Teams](https://code.claude.com/docs/en/agent-teams) feature is built for multi-agent collaboration — but every teammate is a Claude instance. **claude-anyteam** makes it possible for *any* external model to join the same team, with the same native UX, without wrapping it inside a Claude LLM.
 
 Your Claude Code session orchestrates. External models execute. No chat-wrapper overhead. No "Claude pretending to be Codex." Real models, real teammates.
+
+<p align="center">
+  <img src="assets/diagrams/architecture.png" alt="claude-anyteam architecture" width="820" />
+</p>
 
 ## Quickstart
 
