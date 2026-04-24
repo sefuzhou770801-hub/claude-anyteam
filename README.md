@@ -29,7 +29,7 @@ Your Claude Code session orchestrates. External models execute. No chat-wrapper 
 ## Quickstart
 
 ```bash
-npx --yes --package claude-anyteam claude-anyteam-setup
+npx --yes claude-anyteam
 ```
 
 That's the entire install. The installer:

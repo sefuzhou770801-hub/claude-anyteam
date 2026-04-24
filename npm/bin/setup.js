@@ -58,7 +58,7 @@ function parseArgs(argv) {
 
 function usage() {
   return [
-    'Usage: claude-anyteam-setup [--settings-path <path>] [--postinstall]',
+    'Usage: npx --yes claude-anyteam [--settings-path <path>] [--postinstall]',
     '',
     'Installs uv if needed, installs the Python claude-anyteam tool, writes',
     '~/.claude/settings.json with absolute launcher paths, and registers the',
@@ -116,7 +116,7 @@ function trimmedDetails(error) {
 
 function postinstallHint(error) {
   const reason = trimmedDetails(error) || error.message;
-  console.warn(`claude-anyteam: automatic setup skipped (${reason.split(/\r?\n/, 1)[0]}). Run npx --yes --package claude-anyteam claude-anyteam-setup to finish.`);
+  console.warn(`claude-anyteam: automatic setup skipped (${reason.split(/\r?\n/, 1)[0]}). Run npx --yes claude-anyteam to finish.`);
 }
 
 function claudePluginManualSummary() {
@@ -200,7 +200,7 @@ async function main() {
     }
     printFailure('PYTHON 3 REQUIRED', [
       `${theme.symbols.error} ${theme.heading('claude-anyteam needs python3 before anything else can happen.')}`,
-      `${theme.symbols.info} Install Python 3, then rerun ${theme.accent('npx --yes --package claude-anyteam claude-anyteam-setup')}.`,
+      `${theme.symbols.info} Install Python 3, then rerun ${theme.accent('npx --yes claude-anyteam')}.`,
       '',
       ...instructions.map((line) => `${theme.symbols.info} ${line}`),
     ]);
@@ -221,7 +221,7 @@ async function main() {
       }
       printFailure('UV NOT INSTALLED', [
         `${theme.symbols.warn} ${theme.heading('uv is required to install the Python claude-anyteam tool.')}`,
-        `${theme.symbols.info} Install it manually, then rerun ${theme.accent('npx --yes --package claude-anyteam claude-anyteam-setup')}.`,
+        `${theme.symbols.info} Install it manually, then rerun ${theme.accent('npx --yes claude-anyteam')}.`,
         '',
         ...manualInstallLines().map((line) => `${theme.symbols.info} ${line}`),
       ]);
