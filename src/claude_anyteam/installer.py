@@ -50,7 +50,7 @@ MANAGED_BINARY_BASENAMES = {BINARY_BASENAME, LEGACY_BINARY_BASENAME, "gemini-any
 
 TEAMMATE_MODE_KEY = "teammateMode"
 TEAMMATE_MODE_TARGET_VALUE = "tmux"
-STATE_SCHEMA_VERSION = 2  # v2 adds settings_file_created_by_anyteam + claude_json_created_by_anyteam
+STATE_SCHEMA_VERSION = 3  # v3 adds managed permissions.allow allowlist state
 
 PLUGIN_DATA_DIR_NAME = "claude-anyteam-claude-anyteam"
 STATE_FILE_NAME = "install-state.json"
@@ -211,6 +211,9 @@ class InstallResult:
     codex_status: ProviderStatus | None = None
     gemini_status: ProviderStatus | None = None
     force_empty_used: bool = False
+    permissions_allow_added: tuple[str, ...] = ()
+    permissions_allow_managed: tuple[str, ...] = ()
+    permissions_allowlist_skipped: bool = False
 
     @property
     def changed_anything(self) -> bool:
@@ -218,6 +221,7 @@ class InstallResult:
             self.created_file
             or bool(self.changed)
             or bool(self.removed_legacy_keys)
+            or bool(self.permissions_allow_added)
             or (self.teammate_mode is not None and self.teammate_mode.wrote_value)
         )
 
@@ -230,11 +234,13 @@ class UninstallResult:
     file_present: bool
     teammate_mode: TeammateModeRevertResult | None = None
     settings_file_removed: bool = False  # v2: True if the now-empty file was unlinked
+    permissions_allow_removed: tuple[str, ...] = ()
 
     @property
     def changed_anything(self) -> bool:
         return (
             bool(self.removed)
+            or bool(self.permissions_allow_removed)
             or self.settings_file_removed
             or (self.teammate_mode is not None and self.teammate_mode.claude_json_touched)
             or (self.teammate_mode is not None and self.teammate_mode.claude_json_removed)
@@ -387,6 +393,173 @@ def _env_block(settings: dict[str, Any], *, path: Path, create: bool) -> dict[st
             )
 
     return env
+
+
+def _permissions_block(
+    settings: dict[str, Any],
+    *,
+    path: Path,
+    create: bool,
+) -> dict[str, Any]:
+    permissions = settings.get("permissions")
+    if permissions is None:
+        if not create:
+            return {}
+        permissions = {}
+        settings["permissions"] = permissions
+
+    if not isinstance(permissions, dict):
+        raise InstallError(
+            f"{path} has a 'permissions' entry, but it is not a JSON object."
+        )
+
+    return permissions
+
+
+def _permissions_allow_list(
+    settings: dict[str, Any],
+    *,
+    path: Path,
+    create: bool,
+) -> list[str]:
+    permissions = _permissions_block(settings, path=path, create=create)
+    if not permissions and not create:
+        return []
+
+    allow = permissions.get("allow")
+    if allow is None:
+        if not create:
+            return []
+        allow = []
+        permissions["allow"] = allow
+
+    if not isinstance(allow, list):
+        raise InstallError(
+            f"{path} has a 'permissions.allow' entry, but it is not a JSON array."
+        )
+
+    if not all(isinstance(entry, str) for entry in allow):
+        raise InstallError(
+            f"{path} has a non-string entry under 'permissions.allow'; refusing to overwrite it."
+        )
+
+    return allow
+
+
+def _merge_unique_preserving_order(*entry_groups: tuple[str, ...]) -> tuple[str, ...]:
+    merged: list[str] = []
+    seen: set[str] = set()
+    for group in entry_groups:
+        for entry in group:
+            if entry not in seen:
+                seen.add(entry)
+                merged.append(entry)
+    return tuple(merged)
+
+
+def _state_permissions_allow_added(state: dict[str, Any] | None) -> tuple[str, ...]:
+    if state is None:
+        return ()
+    raw = state.get("permissions_allow_added_by_anyteam", ())
+    if not isinstance(raw, list) or not all(isinstance(entry, str) for entry in raw):
+        return ()
+    recommended = set(RECOMMENDED_ALLOWLIST_ENTRIES)
+    return tuple(entry for entry in raw if entry in recommended)
+
+
+def _state_permissions_allow_added_strict(
+    state: dict[str, Any],
+    *,
+    state_path: Path,
+) -> tuple[str, ...]:
+    raw = state.get("permissions_allow_added_by_anyteam", ())
+    if not isinstance(raw, list) or not all(isinstance(entry, str) for entry in raw):
+        err = InstallError(
+            f"{state_path} has a malformed 'permissions_allow_added_by_anyteam' value; "
+            "refusing to touch permissions.allow.\n"
+            f"Inspect or delete the state file manually, then re-run uninstall."
+        )
+        err.cli_exit_code = INSTALL_ERROR_EXIT_CORRUPTED_STATE  # type: ignore[attr-defined]
+        raise err
+    recommended = set(RECOMMENDED_ALLOWLIST_ENTRIES)
+    return tuple(entry for entry in raw if entry in recommended)
+
+
+def _state_permissions_bool(state: dict[str, Any] | None, key: str) -> bool:
+    if state is None:
+        return False
+    return bool(state.get(key, False))
+
+
+def _load_existing_state_for_install(path: Path) -> dict[str, Any] | None:
+    try:
+        return _load_state(path)
+    except InstallError:
+        # Existing install() did not read state before overwriting it. Preserve
+        # that self-healing behavior if a previous receipt is unreadable.
+        return None
+
+
+def _install_permission_allowlist(
+    settings: dict[str, Any],
+    *,
+    path: Path,
+    no_allowlist: bool,
+) -> tuple[tuple[str, ...], bool, bool]:
+    """Append recommended permissions.allow entries, returning what we created.
+
+    Returns (entries_added, permissions_object_created, allow_list_created).
+    The entries are appended idempotently, so re-running install never creates
+    duplicate permission patterns.
+    """
+    if no_allowlist:
+        return (), False, False
+
+    permissions_existed = "permissions" in settings
+    permissions = settings.get("permissions")
+    allow_existed = isinstance(permissions, dict) and "allow" in permissions
+
+    allow = _permissions_allow_list(settings, path=path, create=True)
+    added: list[str] = []
+    for entry in RECOMMENDED_ALLOWLIST_ENTRIES:
+        if entry not in allow:
+            allow.append(entry)
+            added.append(entry)
+
+    return tuple(added), not permissions_existed, not allow_existed
+
+
+def _remove_permission_allowlist_entries(
+    settings: dict[str, Any],
+    *,
+    path: Path,
+    entries: tuple[str, ...],
+    permissions_created_by_anyteam: bool,
+    allow_created_by_anyteam: bool,
+) -> tuple[str, ...]:
+    if not entries:
+        return ()
+
+    permissions = _permissions_block(settings, path=path, create=False)
+    if not permissions:
+        return ()
+
+    allow = _permissions_allow_list(settings, path=path, create=False)
+    if not allow:
+        return ()
+
+    removed: list[str] = []
+    for entry in entries:
+        with contextlib.suppress(ValueError):
+            allow.remove(entry)
+            removed.append(entry)
+
+    if removed and not allow and allow_created_by_anyteam:
+        permissions.pop("allow", None)
+    if removed and not permissions and permissions_created_by_anyteam:
+        settings.pop("permissions", None)
+
+    return tuple(removed)
 
 
 
@@ -884,6 +1057,10 @@ def install_teammate_mode(
     codex_auth: AuthCheck | None = None,
     gemini_auth: AuthCheck | None = None,
     force_empty_used: bool = False,
+    permissions_allow_added_by_anyteam: tuple[str, ...] = (),
+    permissions_allowlist_skipped: bool = False,
+    permissions_created_by_anyteam: bool = False,
+    permissions_allow_created_by_anyteam: bool = False,
 ) -> TeammateModeResult:
     """Ensures ~/.claude.json has teammateMode='tmux', recording what we did in state.
 
@@ -916,6 +1093,10 @@ def install_teammate_mode(
             "settings_file_created_by_anyteam": bool(settings_file_created_by_anyteam),
             "claude_json_created_by_anyteam": bool(claude_json_created_by_anyteam),
             "force_empty_used": bool(force_empty_used),
+            "permissions_allow_added_by_anyteam": list(permissions_allow_added_by_anyteam),
+            "permissions_allowlist_skipped": bool(permissions_allowlist_skipped),
+            "permissions_created_by_anyteam": bool(permissions_created_by_anyteam),
+            "permissions_allow_created_by_anyteam": bool(permissions_allow_created_by_anyteam),
         }
         if codex_cli is not None:
             state["codex_cli_found"] = bool(codex_cli.found)
@@ -1123,6 +1304,7 @@ def install(
     codex_auth_check_fn: Callable[[], AuthCheck] | None = None,
     gemini_auth_check_fn: Callable[[], AuthCheck] | None = None,
     force_empty: bool = False,
+    no_allowlist: bool = False,
 ) -> InstallResult:
     """Full install: prereq check → env block write → teammateMode update.
 
@@ -1178,9 +1360,20 @@ def install(
         shim_path=shim_path,
         binary_path=binary_path,
     )
+    resolved_claude_json = (
+        Path(claude_json_path).expanduser().resolve()
+        if claude_json_path is not None
+        else default_claude_json_path()
+    )
+    resolved_state_path = (
+        Path(state_path).expanduser().resolve()
+        if state_path is not None
+        else default_state_path()
+    )
+    previous_state = _load_existing_state_for_install(resolved_state_path)
 
     settings, existed = _load_settings(paths.settings_path)
-    pre_env_snapshot = copy.deepcopy(settings.get("env"))
+    pre_settings_snapshot = copy.deepcopy(settings)
     env = _env_block(settings, path=paths.settings_path, create=True)
 
     desired = {
@@ -1200,20 +1393,36 @@ def install(
         env.pop(LEGACY_TEAMMATE_BINARY_KEY, None)
         removed_legacy.append(LEGACY_TEAMMATE_BINARY_KEY)
 
-    env_mutation = bool(changed) or bool(removed_legacy) or not existed
-    if env_mutation:
-        _write_settings(paths.settings_path, settings)
+    (
+        permissions_allow_added,
+        permissions_created_now,
+        permissions_allow_created_now,
+    ) = _install_permission_allowlist(
+        settings,
+        path=paths.settings_path,
+        no_allowlist=no_allowlist,
+    )
+    permissions_allow_managed = _merge_unique_preserving_order(
+        _state_permissions_allow_added(previous_state),
+        permissions_allow_added,
+    )
+    permissions_created_by_anyteam = _state_permissions_bool(
+        previous_state,
+        "permissions_created_by_anyteam",
+    ) or permissions_created_now
+    permissions_allow_created_by_anyteam = _state_permissions_bool(
+        previous_state,
+        "permissions_allow_created_by_anyteam",
+    ) or permissions_allow_created_now
 
-    resolved_claude_json = (
-        Path(claude_json_path).expanduser().resolve()
-        if claude_json_path is not None
-        else default_claude_json_path()
+    settings_mutation = (
+        bool(changed)
+        or bool(removed_legacy)
+        or bool(permissions_allow_added)
+        or not existed
     )
-    resolved_state_path = (
-        Path(state_path).expanduser().resolve()
-        if state_path is not None
-        else default_state_path()
-    )
+    if settings_mutation:
+        _write_settings(paths.settings_path, settings)
     effective_prompt = prompt_fn if prompt_fn is not None else (lambda _current: False)
 
     try:
@@ -1227,12 +1436,15 @@ def install(
             codex_auth=codex_auth,
             gemini_auth=gemini_auth,
             force_empty_used=force_empty,
+            permissions_allow_added_by_anyteam=permissions_allow_managed,
+            permissions_allowlist_skipped=no_allowlist,
+            permissions_created_by_anyteam=permissions_created_by_anyteam,
+            permissions_allow_created_by_anyteam=permissions_allow_created_by_anyteam,
         )
     except InstallError:
-        _rollback_env_block(
-            settings=settings,
+        _rollback_settings_file(
             path=paths.settings_path,
-            pre_env_snapshot=pre_env_snapshot,
+            pre_settings_snapshot=pre_settings_snapshot,
             pre_existed=existed,
         )
         raise
@@ -1251,22 +1463,23 @@ def install(
         codex_status=codex_status,
         gemini_status=gemini_status,
         force_empty_used=force_empty,
+        permissions_allow_added=permissions_allow_added,
+        permissions_allow_managed=permissions_allow_managed,
+        permissions_allowlist_skipped=no_allowlist,
     )
 
 
-def _rollback_env_block(
+def _rollback_settings_file(
     *,
-    settings: dict[str, Any],
     path: Path,
-    pre_env_snapshot: Any,
+    pre_settings_snapshot: dict[str, Any],
     pre_existed: bool,
 ) -> None:
-    """Best-effort rollback of the env-block mutation performed earlier in install().
+    """Best-effort rollback of settings.json mutations performed earlier in install().
 
     Called only on post-env-write failure (currently: teammateMode prompt declined).
     If the settings file did not exist before install(), we remove it entirely.
-    Otherwise we restore the captured snapshot (or drop the `env` key if it was
-    absent originally).
+    Otherwise we restore the captured settings snapshot.
     """
     if not pre_existed:
         try:
@@ -1275,11 +1488,7 @@ def _rollback_env_block(
             pass
         return
 
-    if pre_env_snapshot is None:
-        settings.pop("env", None)
-    else:
-        settings["env"] = pre_env_snapshot
-    _write_settings(path, settings)
+    _write_settings(path, pre_settings_snapshot)
 
 
 
@@ -1333,6 +1542,9 @@ def uninstall(
     # cleanup branch below. This is a read-only peek; the mode revert below
     # handles the authoritative delete.
     settings_file_was_ours = False
+    permissions_allow_to_remove: tuple[str, ...] = ()
+    permissions_created_by_anyteam = False
+    permissions_allow_created_by_anyteam = False
     try:
         peeked_state = _load_state(resolved_state_path)
     except InstallError:
@@ -1340,6 +1552,16 @@ def uninstall(
         peeked_state = None
     if peeked_state is not None:
         settings_file_was_ours = bool(peeked_state.get("settings_file_created_by_anyteam", False))
+        permissions_allow_to_remove = _state_permissions_allow_added_strict(
+            peeked_state,
+            state_path=resolved_state_path,
+        )
+        permissions_created_by_anyteam = bool(
+            peeked_state.get("permissions_created_by_anyteam", False)
+        )
+        permissions_allow_created_by_anyteam = bool(
+            peeked_state.get("permissions_allow_created_by_anyteam", False)
+        )
 
     # teammateMode revert is independent of the env-block unwind and should
     # proceed whether or not settings.json exists. May raise InstallError
@@ -1357,6 +1579,7 @@ def uninstall(
             file_present=False,
             teammate_mode=mode_result,
             settings_file_removed=False,
+            permissions_allow_removed=(),
         )
 
     env = _env_block(settings, path=path, create=False)
@@ -1373,8 +1596,17 @@ def uninstall(
         else:
             skipped[key] = value
 
+    permissions_allow_removed = _remove_permission_allowlist_entries(
+        settings,
+        path=path,
+        entries=permissions_allow_to_remove,
+        permissions_created_by_anyteam=permissions_created_by_anyteam,
+        allow_created_by_anyteam=permissions_allow_created_by_anyteam,
+    )
+
     settings_file_removed = False
-    if removed:
+    settings_mutated = bool(removed) or bool(permissions_allow_removed)
+    if settings_mutated:
         if not env:
             settings.pop("env", None)
 
@@ -1397,6 +1629,7 @@ def uninstall(
         file_present=True,
         teammate_mode=mode_result,
         settings_file_removed=settings_file_removed,
+        permissions_allow_removed=permissions_allow_removed,
     )
 
 
@@ -1566,6 +1799,11 @@ def format_install_message(result: InstallResult) -> str:
         else:
             receipt_lines.append(f"{TEAMMATE_MODE_KEY} already \"tmux\" in {mode.claude_json_path}; no change")
 
+    if result.permissions_allowlist_skipped:
+        receipt_lines.append("Permission allowlist skipped (--no-allowlist).")
+    else:
+        receipt_lines.append("Permission allowlist written so spawning teams won't prompt.")
+
     receipt_lines.append("Restart Claude Code for the changes to take effect. Use codex-* or gemini-* teammate names to route to the matching backend.")
     if not result.changed_anything:
         receipt_lines.insert(1, "The existing settings already matched this install.")
@@ -1577,16 +1815,19 @@ def format_install_message(result: InstallResult) -> str:
 def format_uninstall_message(result: UninstallResult) -> str:
     lines: list[str] = []
 
+    removed_items = [f"env.{key}" for key in result.removed]
+    if result.permissions_allow_removed:
+        removed_items.append("permissions.allow entries")
+    removed_summary = ", ".join(removed_items)
+
     if not result.file_present:
         lines.append(f"No settings file found at {result.settings_path}; nothing to remove.")
     elif result.settings_file_removed:
-        removed_keys = ", ".join(f"env.{key}" for key in result.removed)
-        lines.append(f"Removed {removed_keys}")
+        lines.append(f"Removed {removed_summary}")
         lines.append(f"Deleted {result.settings_path} (empty after removal)")
-    elif result.removed:
-        removed_keys = ", ".join(f"env.{key}" for key in result.removed)
+    elif result.removed or result.permissions_allow_removed:
         lines.append(f"Updated {result.settings_path}")
-        lines.append(f"Removed {removed_keys}")
+        lines.append(f"Removed {removed_summary}")
     elif result.skipped:
         lines.append(f"Updated {result.settings_path}")
         lines.append("No claude-anyteam-managed env keys were removed; existing values were left intact.")
