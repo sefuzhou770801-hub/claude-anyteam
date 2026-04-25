@@ -904,16 +904,6 @@ def _expiry_detail(
     return None
 
 
-def _contains_non_empty_string(value: object) -> bool:
-    if _non_empty_string(value):
-        return True
-    if isinstance(value, dict):
-        return any(_contains_non_empty_string(child) for child in value.values())
-    if isinstance(value, list):
-        return any(_contains_non_empty_string(child) for child in value)
-    return False
-
-
 def _check_codex_signin(
     found_path: Path | str | None,
     auth_path: Path | str | None = None,
@@ -936,9 +926,8 @@ def _check_codex_signin(
         if expiry is not None:
             return False, expiry
 
-        token_signed_in = isinstance(tokens, dict) and any(
-            _non_empty_string(tokens.get(key))
-            for key in ("access_token", "id_token", "refresh_token")
+        token_signed_in = isinstance(tokens, dict) and _non_empty_string(
+            tokens.get("access_token")
         )
         if _non_empty_string(raw.get("OPENAI_API_KEY")) or token_signed_in:
             return True, None
@@ -955,6 +944,7 @@ def _check_gemini_signin(
 ) -> tuple[bool, str | None]:
     """Detect Gemini local auth state without exposing token values."""
     del found_path  # The auth file locations are currently independent of the binary path.
+    del google_accounts_path  # Only oauth_creds.json participates in Gemini auth detection.
     try:
         env = os.environ if environ is None else environ
         if _non_empty_string(env.get(GEMINI_API_KEY_ENV)):
@@ -967,34 +957,16 @@ def _check_gemini_signin(
             if oauth_creds_path is not None
             else Path.home() / GEMINI_OAUTH_CREDS_PATH
         )
-        accounts_path = (
-            Path(google_accounts_path).expanduser()
-            if google_accounts_path is not None
-            else Path.home() / GEMINI_GOOGLE_ACCOUNTS_PATH
-        )
-
         oauth_raw, oauth_detail = _read_auth_json_object(oauth_path, label="Gemini OAuth credentials")
         if oauth_raw is not None:
             expiry = _expiry_detail(oauth_raw, path=oauth_path, label="Gemini OAuth credentials")
             if expiry is not None:
                 return False, expiry
-            if any(
-                _non_empty_string(oauth_raw.get(key))
-                for key in ("access_token", "id_token", "refresh_token")
-            ):
+            if _non_empty_string(oauth_raw.get("access_token")):
                 return True, None
             return False, f"Gemini OAuth credentials file empty or missing credentials: {oauth_path}"
 
-        accounts_raw, accounts_detail = _read_auth_json_object(accounts_path, label="Gemini account")
-        if accounts_raw is not None:
-            active = accounts_raw.get("active")
-            if _contains_non_empty_string(active):
-                return True, None
-            return False, f"Gemini account file empty or missing active account: {accounts_path}"
-
-        if oauth_detail and accounts_detail:
-            return False, f"{oauth_detail}; {accounts_detail}"
-        return False, oauth_detail or accounts_detail
+        return False, oauth_detail
     except Exception as exc:
         return False, f"Gemini sign-in check failed: {exc}"
 

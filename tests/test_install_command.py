@@ -1886,6 +1886,50 @@ def test_check_gemini_signin_accepts_valid_oauth_shape(tmp_path: Path):
     assert detail is None
 
 
+@pytest.mark.parametrize("token_key", ["id_token", "refresh_token"])
+def test_check_gemini_signin_rejects_oauth_without_access_token(
+    tmp_path: Path,
+    token_key: str,
+):
+    oauth_path = tmp_path / ".gemini" / "oauth_creds.json"
+    accounts_path = tmp_path / ".gemini" / "google_accounts.json"
+    oauth_path.parent.mkdir(parents=True)
+    oauth_path.write_text(json.dumps({token_key: "token-value"}) + "\n", encoding="utf-8")
+
+    signed_in, detail = installer_mod._check_gemini_signin(
+        tmp_path / "bin" / "gemini",
+        oauth_creds_path=oauth_path,
+        google_accounts_path=accounts_path,
+        environ={},
+    )
+
+    assert signed_in is False
+    assert detail is not None
+    assert "missing credentials" in detail.lower()
+
+
+@pytest.mark.parametrize("active_value", [True, "user@example.com", {"email": "user@example.com"}])
+def test_check_gemini_signin_ignores_google_accounts_without_oauth_creds(
+    tmp_path: Path,
+    active_value: object,
+):
+    oauth_path = tmp_path / ".gemini" / "oauth_creds.json"
+    accounts_path = tmp_path / ".gemini" / "google_accounts.json"
+    accounts_path.parent.mkdir(parents=True)
+    accounts_path.write_text(json.dumps({"active": active_value}) + "\n", encoding="utf-8")
+
+    signed_in, detail = installer_mod._check_gemini_signin(
+        tmp_path / "bin" / "gemini",
+        oauth_creds_path=oauth_path,
+        google_accounts_path=accounts_path,
+        environ={},
+    )
+
+    assert signed_in is False
+    assert detail is not None
+    assert "missing" in detail.lower()
+
+
 @pytest.mark.parametrize(
     ("contents", "expected_detail"),
     [
@@ -2152,6 +2196,28 @@ def test_check_codex_signin_accepts_valid_auth_shape(tmp_path: Path):
 
     assert signed_in is True
     assert detail is None
+
+
+@pytest.mark.parametrize("token_key", ["id_token", "refresh_token"])
+def test_check_codex_signin_rejects_auth_without_access_token(
+    tmp_path: Path,
+    token_key: str,
+):
+    auth_path = tmp_path / ".codex" / "auth.json"
+    auth_path.parent.mkdir(parents=True)
+    auth_path.write_text(
+        json.dumps({"tokens": {token_key: "token-value"}}) + "\n",
+        encoding="utf-8",
+    )
+
+    signed_in, detail = installer_mod._check_codex_signin(
+        tmp_path / "bin" / "codex",
+        auth_path=auth_path,
+    )
+
+    assert signed_in is False
+    assert detail is not None
+    assert "missing credentials" in detail.lower()
 
 
 @pytest.mark.parametrize(
