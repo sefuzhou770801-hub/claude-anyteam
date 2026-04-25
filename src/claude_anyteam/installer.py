@@ -136,7 +136,7 @@ class AuthCheck:
 class ProviderStatus:
     """Display-ready aggregate of a provider's install + sign-in state."""
 
-    provider_key: Literal["codex", "gemini"]
+    provider_key: Literal["codex", "gemini", "kimi"]
     display_name: str
     summary_name: str
     state: ProviderState
@@ -1881,24 +1881,42 @@ def _provider_summary_entry(status: ProviderStatus) -> str:
     return status.summary_entry()
 
 
-def _aggregate_summary_line(codex: ProviderStatus, gemini: ProviderStatus) -> str:
-    if _any_provider_ready(codex, gemini):
+def _coerce_provider_statuses(
+    first: ProviderStatus | tuple[ProviderStatus, ...] | list[ProviderStatus],
+    *rest: ProviderStatus,
+) -> tuple[ProviderStatus, ...]:
+    if isinstance(first, ProviderStatus):
+        return (first, *rest)
+    if rest:
+        raise TypeError("provider statuses must be passed either as a list/tuple or as positional values")
+    return tuple(first)
+
+
+def _aggregate_summary_line(
+    first: ProviderStatus | tuple[ProviderStatus, ...] | list[ProviderStatus],
+    *rest: ProviderStatus,
+) -> str:
+    statuses = _coerce_provider_statuses(first, *rest)
+    if _any_provider_ready(*statuses):
         lead = "Ready"
-    elif codex.state == "NEEDS_SIGNIN" or gemini.state == "NEEDS_SIGNIN":
+    elif any(status.state == "NEEDS_SIGNIN" for status in statuses):
         lead = "Almost ready"
     else:
         lead = "Not ready"
-    return f"{lead}: {_provider_summary_entry(codex)} · {_provider_summary_entry(gemini)}."
+    return f"{lead}: {' · '.join(_provider_summary_entry(status) for status in statuses)}."
 
 
-def _format_provider_status_rows(codex: ProviderStatus, gemini: ProviderStatus) -> str:
+def _format_provider_status_rows(
+    first: ProviderStatus | tuple[ProviderStatus, ...] | list[ProviderStatus],
+    *rest: ProviderStatus,
+) -> str:
+    statuses = _coerce_provider_statuses(first, *rest)
     return "\n".join(
         [
             "Provider status",
             PROVIDER_STATUS_RULE,
             f"{'':<14}{'Installed?':<18}{'Signed in?'}",
-            _provider_row(codex),
-            _provider_row(gemini),
+            *(_provider_row(status) for status in statuses),
             PROVIDER_STATUS_RULE,
         ]
     )
@@ -1925,11 +1943,15 @@ def _render_provider_walkthrough(codex: CodexCliCheck, gemini: GeminiCliCheck) -
     )
 
 
-def _format_provider_status_table(codex: ProviderStatus, gemini: ProviderStatus) -> str:
+def _format_provider_status_table(
+    first: ProviderStatus | tuple[ProviderStatus, ...] | list[ProviderStatus],
+    *rest: ProviderStatus,
+) -> str:
+    statuses = _coerce_provider_statuses(first, *rest)
     return "\n".join(
         [
-            _format_provider_status_rows(codex, gemini),
-            _aggregate_summary_line(codex, gemini),
+            _format_provider_status_rows(statuses),
+            _aggregate_summary_line(statuses),
         ]
     )
 
@@ -1989,10 +2011,22 @@ def _format_gemini_walkthrough(status: ProviderStatus) -> str:
     return "\n".join(lines)
 
 
-def _format_provider_walkthroughs(codex: ProviderStatus, gemini: ProviderStatus) -> str:
+def _format_provider_walkthrough(status: ProviderStatus) -> str:
+    if status.provider_key == "codex":
+        return _format_codex_walkthrough(status)
+    if status.provider_key == "gemini":
+        return _format_gemini_walkthrough(status)
+    return ""
+
+
+def _format_provider_walkthroughs(
+    first: ProviderStatus | tuple[ProviderStatus, ...] | list[ProviderStatus],
+    *rest: ProviderStatus,
+) -> str:
+    statuses = _coerce_provider_statuses(first, *rest)
     blocks = [
         block
-        for block in (_format_codex_walkthrough(codex), _format_gemini_walkthrough(gemini))
+        for block in (_format_provider_walkthrough(status) for status in statuses)
         if block
     ]
     return "\n\n".join(blocks)
@@ -2008,16 +2042,16 @@ def _format_no_provider_refusal_message() -> str:
 
 
 def _format_provider_preamble(
-    codex: ProviderStatus,
-    gemini: ProviderStatus,
-    *,
+    first: ProviderStatus | tuple[ProviderStatus, ...] | list[ProviderStatus],
+    *rest: ProviderStatus,
     force_empty: bool = False,
 ) -> str:
-    blocks = [_format_provider_status_table(codex, gemini)]
-    no_provider_ready = not _any_provider_ready(codex, gemini)
+    statuses = _coerce_provider_statuses(first, *rest)
+    blocks = [_format_provider_status_table(statuses)]
+    no_provider_ready = not _any_provider_ready(*statuses)
     if no_provider_ready:
         blocks.append(_format_no_provider_explainer())
-    walkthrough = _format_provider_walkthroughs(codex, gemini)
+    walkthrough = _format_provider_walkthroughs(statuses)
     if walkthrough:
         blocks.append(walkthrough)
     if force_empty and no_provider_ready:
@@ -2027,11 +2061,15 @@ def _format_provider_preamble(
     return "\n\n".join(blocks)
 
 
-def _format_no_provider_ready_message(codex: ProviderStatus, gemini: ProviderStatus) -> str:
+def _format_no_provider_ready_message(
+    first: ProviderStatus | tuple[ProviderStatus, ...] | list[ProviderStatus],
+    *rest: ProviderStatus,
+) -> str:
+    statuses = _coerce_provider_statuses(first, *rest)
     blocks = [
-        _format_provider_status_table(codex, gemini),
+        _format_provider_status_table(statuses),
         _format_no_provider_explainer(),
-        _format_provider_walkthroughs(codex, gemini),
+        _format_provider_walkthroughs(statuses),
         _format_no_provider_refusal_message(),
     ]
     return "\n\n".join(block for block in blocks if block)
