@@ -184,8 +184,8 @@ Observed user-level Kimi files on this host:
 ~/.kimi/kimi.json                    # work_dirs[]: {path, kaos, last_session_id} — used by `-C/--continue`
 ~/.kimi/device_id                    # device id for telemetry/auth
 ~/.kimi/latest_version.txt           # update check
-~/.kimi/credentials/kimi-code.json   # OAuth tokens, mode 0600
-~/.kimi/credentials/kimi-code.lock
+~/.kimi/credentials/kimi-code.json   # OAuth tokens, mode 0600 — see §Sign-in state detection
+~/.kimi/credentials/kimi-code.lock   # 0-byte refresh lock, mode 0600
 ~/.kimi/sessions/<md5(cwd)>/<sid>/   # per-session: context.jsonl, wire.jsonl, state.json
 ~/.kimi/logs/kimi.log                # rotating log
 ~/.kimi/user-history/                # input line history
@@ -207,6 +207,76 @@ Recommended isolation pattern (mirrors `prepare_isolated_gemini_home`):
 4. Optionally copy `config.toml` if a custom adapter default is desired; otherwise let Kimi initialize with built-in defaults.
 5. **Restore real `HOME` in the wrapper-MCP child env** so the wrapper server can access the real `~/.claude/teams/<team>/` config and inbox. Same pattern as Gemini.
 6. Sessions/workdir map stay in the isolated home, so `-C/--continue` is per-teammate by construction and the kimi.json race goes away.
+
+## Sign-in state detection
+
+`kimi login` writes OAuth tokens under `~/.kimi/credentials/`. This is the canonical "user is signed in" signal for an installer-time probe (analogous to `~/.gemini/oauth_creds.json` for Gemini's installer-time check).
+
+Verified file layout on this signed-in host (run after a recent successful login + headless turn):
+
+```text
+~/.kimi/credentials/
+├── kimi-code.json    # 1487 bytes, mode 0600  — OAuth token bundle for the managed Kimi provider
+└── kimi-code.lock    # 0 bytes,    mode 0600  — fastmcp/authlib lock; empty when not actively refreshing
+```
+
+Plus a peer artifact at `~/.kimi/device_id` (32 ASCII chars, no trailing newline, mode 0600) that is created on first `kimi` invocation regardless of login. **`device_id` alone is NOT a sign-in signal** — it is present after a fresh `kimi info` run with no auth.
+
+Verified `kimi-code.json` shape (keys + value types, redacted; emitted via `python -c json.loads(p.read_text()) ; print shape`):
+
+```json
+{
+  "access_token":  "<str len=672>",
+  "refresh_token": "<str len=673>",
+  "expires_at":    "float",
+  "scope":         "<str len=9>",
+  "token_type":    "<str len=6>",
+  "expires_in":    "float"
+}
+```
+
+Provider-keyed naming. The filename `kimi-code` matches the provider key `managed:kimi-code` configured in `~/.kimi/config.toml`:
+
+```toml
+[providers."managed:kimi-code"]
+type = "kimi"
+base_url = "https://api.kimi.com/coding/v1"
+
+[providers."managed:kimi-code".oauth]
+storage = "file"
+key = "oauth/kimi-code"
+```
+
+The OAuth `key` segment after the slash (`kimi-code`) becomes the credential filename. If a future Kimi release adds a second managed provider with a different key, additional `~/.kimi/credentials/<key>.json` files would appear next to it. v1 installer should only require `kimi-code.json` (the default-provider credential file) to consider the user signed in.
+
+### Recommended `KimiCliCheck` sign-in probe
+
+Mirror the Gemini sign-in helper (`installer.py:_check_gemini_signin`):
+
+```python
+KIMI_OAUTH_CREDS_PATH = Path(".kimi") / "credentials" / "kimi-code.json"
+KIMI_API_KEY_ENV = "KIMI_API_KEY"  # not yet observed but reserve the name
+
+def _check_kimi_signin(env: Mapping[str, str], home: Path | None = None) -> AuthCheck:
+    if _non_empty_string(env.get(KIMI_API_KEY_ENV)):
+        return AuthCheck(method="api-key", ok=True)
+    creds = (home or Path.home()) / KIMI_OAUTH_CREDS_PATH
+    if creds.exists() and creds.stat().st_size > 0:
+        return AuthCheck(method="oauth-personal", ok=True)
+    return AuthCheck(method=None, ok=False, hint="Run `kimi login` to authenticate")
+```
+
+Notes:
+
+- File **existence + nonzero size** is the strongest cheap signal. Parsing the JSON to validate `access_token`/`refresh_token` presence is a safer secondary check; do not parse `expires_at` and refuse on expiry — the live `kimi` process will refresh tokens via `refresh_token` automatically.
+- Do not check `~/.kimi/credentials/kimi-code.lock`. It exists when `kimi-code.json` exists but is irrelevant for sign-in state.
+- Do not require `~/.kimi/device_id`. It exists on every fresh install, signed in or not.
+- `KIMI_API_KEY` is not currently consumed by Kimi 1.39.0 (no Vertex/ADC analog), but reserving the env name keeps parity with `GEMINI_API_KEY` and lets a future release switch detection without breaking the installer.
+- Under HOME isolation (the adapter pattern in this doc), the installer probe must read from the **real** `$HOME/.kimi/credentials/kimi-code.json`, not the adapter-isolated home. The runtime-side `prepare_isolated_kimi_home` then **copies** that file (and its `.lock` sibling) into the isolated home so each Kimi child process has independent OAuth state and refresh cannot race.
+
+### Negative case
+
+A logged-out machine has no `~/.kimi/credentials/` directory at all (or has it empty). `kimi login` creates the directory and writes `kimi-code.json` + `kimi-code.lock` atomically. `kimi logout` (separate subcommand, `--help` confirmed) deletes the credential file but leaves `device_id`, `config.toml`, and any `sessions/` intact — so sign-in state is local to the credentials dir, not to the broader `~/.kimi/`.
 
 ## MCP support and discovery
 
