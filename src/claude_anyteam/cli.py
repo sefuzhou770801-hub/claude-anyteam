@@ -15,6 +15,7 @@ from typing import TextIO
 from . import logger
 from .config import from_env
 from .installer import (
+    INSTALL_ERROR_EXIT_NO_PROVIDER,
     InstallError,
     format_install_message,
     format_uninstall_message,
@@ -233,8 +234,9 @@ def _install_command(
             no_allowlist=no_allowlist,
         )
     except InstallError as exc:
-        print(str(exc), file=sys.stderr)
-        return getattr(exc, "cli_exit_code", 2)
+        exit_code = getattr(exc, "cli_exit_code", 2)
+        print(str(exc), file=stream if exit_code == INSTALL_ERROR_EXIT_NO_PROVIDER else sys.stderr)
+        return exit_code
 
     print(
         format_install_message(result, include_provider_status=not provider_status_rendered),

@@ -18,7 +18,7 @@ import shutil
 import subprocess
 import sys
 import tempfile
-from dataclasses import dataclass, field, replace
+from dataclasses import dataclass, field
 from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any, Callable, Literal
@@ -1558,30 +1558,26 @@ def install(
             message = f"{message}\n\nAdditionally:\n{gemini_warning}"
         raise InstallError(message)
 
-    if not _any_provider_ready(codex_status, gemini_status) and not force_empty:
-        err = InstallError(_format_no_provider_ready_message(codex_status, gemini_status))
-        err.cli_exit_code = INSTALL_ERROR_EXIT_NO_PROVIDER  # type: ignore[attr-defined]
-        raise err
-
+    provider_preamble_rendered = False
     if provider_status_callback is not None:
-        render_codex_cli = replace(
-            codex_cli,
-            signed_in=bool(codex_cli.found and codex_auth.signed_in),
-            signed_in_detail=codex_auth.signed_in_detail,
-        )
-        render_gemini_cli = replace(
-            gemini_cli,
-            signed_in=bool(gemini_cli.found and gemini_auth.signed_in),
-            signed_in_detail=gemini_auth.signed_in_detail,
-        )
         provider_status_callback(
-            "\n".join(
-                [
-                    _render_provider_status(render_codex_cli, render_gemini_cli),
-                    _render_provider_summary(render_codex_cli, render_gemini_cli),
-                ]
+            _format_provider_preamble(
+                codex_status,
+                gemini_status,
+                force_empty=force_empty,
             )
         )
+        provider_preamble_rendered = True
+
+    if not _any_provider_ready(codex_status, gemini_status) and not force_empty:
+        message = (
+            _format_no_provider_refusal_message()
+            if provider_preamble_rendered
+            else _format_no_provider_ready_message(codex_status, gemini_status)
+        )
+        err = InstallError(message)
+        err.cli_exit_code = INSTALL_ERROR_EXIT_NO_PROVIDER  # type: ignore[attr-defined]
+        raise err
 
     paths = discover_managed_paths(
         settings_path=settings_path,
@@ -1947,6 +1943,13 @@ def _render_provider_summary(codex: CodexCliCheck, gemini: GeminiCliCheck) -> st
     )
 
 
+def _render_provider_walkthrough(codex: CodexCliCheck, gemini: GeminiCliCheck) -> str:
+    return _format_provider_walkthroughs(
+        _codex_render_status(codex),
+        _gemini_render_status(gemini),
+    )
+
+
 def _format_provider_status_table(codex: ProviderStatus, gemini: ProviderStatus) -> str:
     return "\n".join(
         [
@@ -2020,18 +2023,42 @@ def _format_provider_walkthroughs(codex: ProviderStatus, gemini: ProviderStatus)
     return "\n\n".join(blocks)
 
 
+def _format_no_provider_refusal_message() -> str:
+    return (
+        "Refusing to install — no provider is ready.\n"
+        "  claude-anyteam needs at least one signed-in CLI (Codex or Gemini) to do anything\n"
+        "  useful. Follow the steps above, then re-run `claude-anyteam install`.\n\n"
+        "  Setting up later? Pass --force-empty to install with no provider ready:\n"
+        "    claude-anyteam install --force-empty"
+    )
+
+
+def _format_provider_preamble(
+    codex: ProviderStatus,
+    gemini: ProviderStatus,
+    *,
+    force_empty: bool = False,
+) -> str:
+    blocks = [_format_provider_status_table(codex, gemini)]
+    no_provider_ready = not _any_provider_ready(codex, gemini)
+    if no_provider_ready:
+        blocks.append(_format_no_provider_explainer())
+    walkthrough = _format_provider_walkthroughs(codex, gemini)
+    if walkthrough:
+        blocks.append(walkthrough)
+    if force_empty and no_provider_ready:
+        blocks.append(
+            "Proceeding with --force-empty: claude-anyteam is installed but inert until a CLI is ready."
+        )
+    return "\n\n".join(blocks)
+
+
 def _format_no_provider_ready_message(codex: ProviderStatus, gemini: ProviderStatus) -> str:
     blocks = [
         _format_provider_status_table(codex, gemini),
         _format_no_provider_explainer(),
         _format_provider_walkthroughs(codex, gemini),
-        (
-            "Refusing to install — no provider is ready.\n"
-            "  claude-anyteam needs at least one signed-in CLI (Codex or Gemini) to do anything\n"
-            "  useful. Follow the steps above, then re-run `claude-anyteam install`.\n\n"
-            "  Setting up later? Pass --force-empty to install with no provider ready:\n"
-            "    claude-anyteam install --force-empty"
-        ),
+        _format_no_provider_refusal_message(),
     ]
     return "\n\n".join(block for block in blocks if block)
 
@@ -2050,15 +2077,12 @@ def format_install_message(result: InstallResult, *, include_provider_status: bo
 
     if codex_status is not None and gemini_status is not None:
         if include_provider_status:
-            lines.append(_format_provider_status_table(codex_status, gemini_status))
-        if result.force_empty_used and not _any_provider_ready(codex_status, gemini_status):
-            lines.append(_format_no_provider_explainer())
-        walkthrough = _format_provider_walkthroughs(codex_status, gemini_status)
-        if walkthrough:
-            lines.append(walkthrough)
-        if result.force_empty_used and not _any_provider_ready(codex_status, gemini_status):
             lines.append(
-                "Proceeding with --force-empty: claude-anyteam is installed but inert until a CLI is ready."
+                _format_provider_preamble(
+                    codex_status,
+                    gemini_status,
+                    force_empty=result.force_empty_used,
+                )
             )
 
     receipt_lines = [

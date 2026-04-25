@@ -245,6 +245,47 @@ def test_render_provider_summary_buckets(
     assert installer_mod._render_provider_summary(codex_cli, gemini_cli) == expected
 
 
+def test_render_provider_walkthrough_buckets():
+    assert installer_mod._render_provider_walkthrough(
+        _codex_cli_ready(signed_in=True),
+        _gemini_cli_ready(signed_in=True),
+    ) == ""
+
+    assert installer_mod._render_provider_walkthrough(
+        _codex_cli_ready(signed_in=True),
+        _gemini_cli_missing(),
+    ) == "\n".join(
+        [
+            "Gemini CLI:",
+            "  1. Install:  npm install -g @google/gemini-cli",
+            "  2. Sign in:  gemini    (or set GEMINI_API_KEY, or configure Vertex)",
+            "  Docs: https://github.com/google-gemini/gemini-cli",
+        ]
+    )
+
+    assert installer_mod._render_provider_walkthrough(
+        _codex_cli_ready(signed_in=False),
+        _gemini_cli_ready(signed_in=False),
+    ) == "\n\n".join(
+        [
+            "\n".join(
+                [
+                    "Codex CLI:",
+                    "  1. Sign in:  codex     (opens an OAuth flow on first run)",
+                    "  Docs: https://github.com/openai/codex#getting-started",
+                ]
+            ),
+            "\n".join(
+                [
+                    "Gemini CLI:",
+                    "  1. Sign in:  gemini    (or set GEMINI_API_KEY, or configure Vertex)",
+                    "  Docs: https://github.com/google-gemini/gemini-cli",
+                ]
+            ),
+        ]
+    )
+
+
 def test_install_prints_provider_status_before_settings_update(
     tmp_path: Path,
     monkeypatch,
@@ -275,8 +316,170 @@ def test_install_prints_provider_status_before_settings_update(
     assert (
         stdout.index(expected_status)
         < stdout.index(expected_summary)
+        < stdout.index("Gemini CLI:")
         < stdout.index(updated_line)
     )
+
+
+def test_install_with_no_providers_refuses_before_settings_mutation(
+    tmp_path: Path,
+    monkeypatch,
+    capsys,
+):
+    settings_path, claude_json_path, state_path, bin_dir = _fresh_paths(tmp_path)
+    codex_binary = _make_executable(bin_dir / "claude-anyteam")
+    _make_executable(bin_dir / "claude-anyteam-spawn-shim")
+
+    _stub_prereq_found(monkeypatch, stub_providers=False)
+    _stub_provider_checks(
+        monkeypatch,
+        codex_cli=_codex_cli_missing(),
+        codex_signed_in=False,
+        gemini_cli=_gemini_cli_missing(),
+        gemini_signed_in=False,
+    )
+    monkeypatch.setattr(cli_mod.sys, "argv", [str(codex_binary)])
+
+    exit_code = cli_mod.main(_install_argv(settings_path, claude_json_path, state_path))
+
+    captured = capsys.readouterr()
+    assert exit_code == installer_mod.INSTALL_ERROR_EXIT_NO_PROVIDER
+    assert "Not ready: Codex (not installed) · Gemini (not installed)." in captured.out
+    assert "Codex CLI:" in captured.out
+    assert "  1. Install:  npm install -g @openai/codex" in captured.out
+    assert "Gemini CLI:" in captured.out
+    assert "  1. Install:  npm install -g @google/gemini-cli" in captured.out
+    assert "Refusing to install — no provider is ready." in captured.out
+    assert "claude-anyteam install --force-empty" in captured.out
+    assert "Updated " not in captured.out
+    assert not settings_path.exists()
+    assert not claude_json_path.exists()
+    assert not state_path.exists()
+
+
+def test_install_with_both_providers_signed_in_updates_settings(
+    tmp_path: Path,
+    monkeypatch,
+    capsys,
+):
+    settings_path, claude_json_path, state_path, bin_dir = _fresh_paths(tmp_path)
+    codex_binary = _make_executable(bin_dir / "claude-anyteam")
+    _make_executable(bin_dir / "claude-anyteam-spawn-shim")
+
+    _stub_prereq_found(monkeypatch, stub_providers=False)
+    _stub_provider_checks(
+        monkeypatch,
+        codex_cli=_codex_cli_ready(signed_in=True),
+        codex_signed_in=True,
+        gemini_cli=_gemini_cli_ready(signed_in=True),
+        gemini_signed_in=True,
+    )
+    monkeypatch.setattr(installer_mod.shutil, "which", lambda name: None)
+    monkeypatch.setattr(cli_mod.sys, "argv", [str(codex_binary)])
+
+    assert cli_mod.main(_install_argv(settings_path, claude_json_path, state_path)) == 0
+
+    stdout = capsys.readouterr().out
+    assert "Ready: Codex 0.124.0 · Gemini 0.39.0." in stdout
+    assert "Refusing to install" not in stdout
+    assert settings_path.exists()
+
+
+def test_install_with_codex_signed_in_only_prints_gemini_walkthrough_and_updates_settings(
+    tmp_path: Path,
+    monkeypatch,
+    capsys,
+):
+    settings_path, claude_json_path, state_path, bin_dir = _fresh_paths(tmp_path)
+    codex_binary = _make_executable(bin_dir / "claude-anyteam")
+    _make_executable(bin_dir / "claude-anyteam-spawn-shim")
+
+    _stub_prereq_found(monkeypatch, stub_providers=False)
+    _stub_provider_checks(
+        monkeypatch,
+        codex_cli=_codex_cli_ready(signed_in=True),
+        codex_signed_in=True,
+        gemini_cli=_gemini_cli_missing(),
+        gemini_signed_in=False,
+    )
+    monkeypatch.setattr(installer_mod.shutil, "which", lambda name: None)
+    monkeypatch.setattr(cli_mod.sys, "argv", [str(codex_binary)])
+
+    assert cli_mod.main(_install_argv(settings_path, claude_json_path, state_path)) == 0
+
+    stdout = capsys.readouterr().out
+    assert "Ready: Codex 0.124.0 · Gemini (not installed)." in stdout
+    assert "Gemini CLI:" in stdout
+    assert "  1. Install:  npm install -g @google/gemini-cli" in stdout
+    assert "Refusing to install" not in stdout
+    assert settings_path.exists()
+
+
+def test_install_with_both_installed_but_not_signed_in_refuses(
+    tmp_path: Path,
+    monkeypatch,
+    capsys,
+):
+    settings_path, claude_json_path, state_path, bin_dir = _fresh_paths(tmp_path)
+    codex_binary = _make_executable(bin_dir / "claude-anyteam")
+    _make_executable(bin_dir / "claude-anyteam-spawn-shim")
+
+    _stub_prereq_found(monkeypatch, stub_providers=False)
+    _stub_provider_checks(
+        monkeypatch,
+        codex_cli=_codex_cli_ready(signed_in=False),
+        codex_signed_in=False,
+        gemini_cli=_gemini_cli_ready(signed_in=False),
+        gemini_signed_in=False,
+    )
+    monkeypatch.setattr(cli_mod.sys, "argv", [str(codex_binary)])
+
+    exit_code = cli_mod.main(_install_argv(settings_path, claude_json_path, state_path))
+
+    stdout = capsys.readouterr().out
+    assert exit_code == installer_mod.INSTALL_ERROR_EXIT_NO_PROVIDER
+    assert "Almost ready: Codex (sign in to finish) · Gemini (sign in to finish)." in stdout
+    assert "  1. Sign in:  codex     (opens an OAuth flow on first run)" in stdout
+    assert "  1. Sign in:  gemini    (or set GEMINI_API_KEY, or configure Vertex)" in stdout
+    assert "Refusing to install — no provider is ready." in stdout
+    assert "Updated " not in stdout
+    assert not settings_path.exists()
+    assert not claude_json_path.exists()
+    assert not state_path.exists()
+
+
+def test_install_force_empty_with_no_providers_updates_settings(
+    tmp_path: Path,
+    monkeypatch,
+    capsys,
+):
+    settings_path, claude_json_path, state_path, bin_dir = _fresh_paths(tmp_path)
+    codex_binary = _make_executable(bin_dir / "claude-anyteam")
+    _make_executable(bin_dir / "claude-anyteam-spawn-shim")
+
+    _stub_prereq_found(monkeypatch, stub_providers=False)
+    _stub_provider_checks(
+        monkeypatch,
+        codex_cli=_codex_cli_missing(),
+        codex_signed_in=False,
+        gemini_cli=_gemini_cli_missing(),
+        gemini_signed_in=False,
+    )
+    monkeypatch.setattr(installer_mod.shutil, "which", lambda name: None)
+    monkeypatch.setattr(cli_mod.sys, "argv", [str(codex_binary)])
+
+    assert cli_mod.main(
+        _install_argv(settings_path, claude_json_path, state_path, "--force-empty")
+    ) == 0
+
+    stdout = capsys.readouterr().out
+    assert (
+        "Proceeding with --force-empty: claude-anyteam is installed but inert until a CLI is ready."
+        in stdout
+    )
+    assert "Refusing to install" not in stdout
+    assert settings_path.exists()
+    assert json.loads(state_path.read_text(encoding="utf-8"))["force_empty_used"] is True
 
 
 def test_install_creates_settings_and_sets_required_env_keys(
