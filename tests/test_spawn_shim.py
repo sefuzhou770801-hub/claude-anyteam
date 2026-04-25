@@ -23,6 +23,13 @@ def _clear_binary_env(monkeypatch) -> None:
     monkeypatch.delenv("CODEX_TEAMMATE_BINARY", raising=False)
 
 
+def _clear_route_env(monkeypatch) -> None:
+    monkeypatch.delenv("CLAUDE_ANYTEAM_SHIM_MATCH", raising=False)
+    monkeypatch.delenv("CODEX_TEAMMATE_SHIM_MATCH", raising=False)
+    monkeypatch.delenv("CLAUDE_ANYTEAM_GEMINI_SHIM_MATCH", raising=False)
+    monkeypatch.delenv("CLAUDE_ANYTEAM_KIMI_SHIM_MATCH", raising=False)
+
+
 def test_codex_dispatch(monkeypatch, capsys):
     calls = _record_execv(monkeypatch)
     _clear_binary_env(monkeypatch)
@@ -487,4 +494,194 @@ def test_gemini_dispatch_forwards_model_and_effort(monkeypatch, tmp_path, capsys
         "gemini-2.5-pro",
         "--effort",
         "xhigh",
+    ]
+
+
+def test_kimi_dispatch_for_kimi_prefix(monkeypatch, capsys):
+    calls = _record_execv(monkeypatch)
+    _clear_route_env(monkeypatch)
+    monkeypatch.delenv("CLAUDE_ANYTEAM_KIMI_BINARY", raising=False)
+    monkeypatch.setattr(
+        sys,
+        "argv",
+        [
+            "/usr/local/bin/claude-anyteam-spawn-shim",
+            "--agent-name",
+            "kimi-rhea",
+            "--team-name",
+            "shim-build",
+        ],
+    )
+    monkeypatch.setattr(
+        spawn_shim.shutil,
+        "which",
+        lambda name: {
+            "kimi-anyteam": "/usr/local/bin/kimi-anyteam",
+            "claude": "/usr/local/bin/claude",
+        }.get(name),
+    )
+
+    assert spawn_shim.main() == 0
+
+    assert calls == [
+        (
+            "/usr/local/bin/kimi-anyteam",
+            [
+                "/usr/local/bin/kimi-anyteam",
+                "--name",
+                "kimi-rhea",
+                "--team",
+                "shim-build",
+            ],
+        )
+    ]
+    assert json.loads(capsys.readouterr().err)["route"] == "kimi"
+
+
+def test_kimi_dispatch_respects_match_env_override(monkeypatch):
+    calls = _record_execv(monkeypatch)
+    _clear_route_env(monkeypatch)
+    monkeypatch.delenv("CLAUDE_ANYTEAM_KIMI_BINARY", raising=False)
+    monkeypatch.setenv("CLAUDE_ANYTEAM_KIMI_SHIM_MATCH", r"^moon-")
+    monkeypatch.setattr(
+        sys,
+        "argv",
+        [
+            "/usr/local/bin/claude-anyteam-spawn-shim",
+            "--agent-name",
+            "moon-scout",
+            "--team-name",
+            "shim-build",
+        ],
+    )
+    monkeypatch.setattr(
+        spawn_shim.shutil,
+        "which",
+        lambda name: {
+            "kimi-anyteam": "/usr/local/bin/kimi-anyteam",
+            "claude": "/usr/local/bin/claude",
+        }.get(name),
+    )
+
+    assert spawn_shim.main() == 0
+
+    assert calls == [
+        (
+            "/usr/local/bin/kimi-anyteam",
+            [
+                "/usr/local/bin/kimi-anyteam",
+                "--name",
+                "moon-scout",
+                "--team",
+                "shim-build",
+            ],
+        )
+    ]
+
+
+def test_kimi_dispatch_respects_binary_env_override(monkeypatch):
+    calls = _record_execv(monkeypatch)
+    _clear_route_env(monkeypatch)
+    monkeypatch.setenv("CLAUDE_ANYTEAM_KIMI_BINARY", "/custom/bin/kimi-launcher")
+    monkeypatch.setattr(
+        sys,
+        "argv",
+        [
+            "/usr/local/bin/claude-anyteam-spawn-shim",
+            "--agent-name",
+            "kimi-builder",
+            "--team-name",
+            "shim-build",
+        ],
+    )
+    monkeypatch.setattr(
+        spawn_shim.shutil,
+        "which",
+        lambda name: {
+            "/custom/bin/kimi-launcher": "/custom/bin/kimi-launcher",
+            "claude": "/usr/local/bin/claude",
+        }.get(name),
+    )
+
+    assert spawn_shim.main() == 0
+
+    assert calls == [
+        (
+            "/custom/bin/kimi-launcher",
+            [
+                "/custom/bin/kimi-launcher",
+                "--name",
+                "kimi-builder",
+                "--team",
+                "shim-build",
+            ],
+        )
+    ]
+
+
+def test_kimi_match_does_not_preempt_codex_or_gemini_routes(monkeypatch):
+    calls = _record_execv(monkeypatch)
+    _clear_route_env(monkeypatch)
+    _clear_binary_env(monkeypatch)
+    monkeypatch.delenv("CLAUDE_ANYTEAM_GEMINI_BINARY", raising=False)
+    monkeypatch.delenv("CLAUDE_ANYTEAM_KIMI_BINARY", raising=False)
+    monkeypatch.setenv("CLAUDE_ANYTEAM_KIMI_SHIM_MATCH", r"^(codex|gemini)-")
+    monkeypatch.setattr(
+        spawn_shim.shutil,
+        "which",
+        lambda name: {
+            "claude-anyteam": "/usr/local/bin/claude-anyteam",
+            "gemini-anyteam": "/usr/local/bin/gemini-anyteam",
+            "kimi-anyteam": "/usr/local/bin/kimi-anyteam",
+            "claude": "/usr/local/bin/claude",
+        }.get(name),
+    )
+
+    monkeypatch.setattr(
+        sys,
+        "argv",
+        [
+            "/usr/local/bin/claude-anyteam-spawn-shim",
+            "--agent-name",
+            "codex-overlap",
+            "--team-name",
+            "shim-build",
+        ],
+    )
+    assert spawn_shim.main() == 0
+
+    monkeypatch.setattr(
+        sys,
+        "argv",
+        [
+            "/usr/local/bin/claude-anyteam-spawn-shim",
+            "--agent-name",
+            "gemini-overlap",
+            "--team-name",
+            "shim-build",
+        ],
+    )
+    assert spawn_shim.main() == 0
+
+    assert calls == [
+        (
+            "/usr/local/bin/claude-anyteam",
+            [
+                "/usr/local/bin/claude-anyteam",
+                "--name",
+                "codex-overlap",
+                "--team",
+                "shim-build",
+            ],
+        ),
+        (
+            "/usr/local/bin/gemini-anyteam",
+            [
+                "/usr/local/bin/gemini-anyteam",
+                "--name",
+                "gemini-overlap",
+                "--team",
+                "shim-build",
+            ],
+        ),
     ]
