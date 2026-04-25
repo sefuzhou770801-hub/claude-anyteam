@@ -115,6 +115,15 @@ export function manualInstallLines({ includePython = false } = {}) {
   return lines;
 }
 
+export function providerPrereqLines() {
+  return [
+    'Provider CLIs are optional at setup time but required for their prefixes:',
+    '  codex-*  → OpenAI Codex CLI 0.120+ (`npm install -g @openai/codex`, then run `codex` to sign in)',
+    '  gemini-* → Gemini CLI (`npm install -g @google/gemini-cli`, then run `gemini` or configure GEMINI_API_KEY/Vertex)',
+    '  kimi-*   → Kimi CLI (`pip install kimi-cli` or the upstream installer, then run `kimi login`)',
+  ];
+}
+
 export function formatCommand(command, args = []) {
   return [command, ...args].join(' ');
 }
