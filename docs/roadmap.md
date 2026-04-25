@@ -22,10 +22,12 @@ These are the adapters planned on the same architecture. Each one is a Python ad
 
 | Adapter | Model(s) | Backend CLI | Status |
 |---|---|---|---|
-| **Kimi** | Kimi K2 family | Moonshot's CLI or API-direct | Planned |
-| **GLM** | GLM-4.x family | Zhipu's CLI | Planned |
-| **DeepSeek** | DeepSeek V3 / R1 | DeepSeek's CLI or API-direct | Planned |
+| **Kimi** | Kimi K2 family | Moonshot's CLI (first-class swarm primitives, native skills, ACP, MCP) | Next — see [rationale](internal/kimi-rationale.md) |
+| **GLM** | GLM-4.x family | Zhipu's CLI | Planned (after Kimi) |
+| **DeepSeek** | DeepSeek V3 / R1 | DeepSeek's CLI or API-direct | Planned (after Kimi) |
 | **Generic API adapter** | Any OpenAI-compatible endpoint | Direct HTTP | Planned — covers OpenRouter, LM Studio, local vLLM, etc. |
+
+Kimi is sequenced first deliberately: it's the most architecturally distinct mainstream coding CLI, with its own multi-agent model, and resolving how `claude-anyteam`'s team layer composes with that is the most important architectural decision left to make. GLM / DeepSeek / Qwen become trivially easy after Kimi. See [`docs/internal/kimi-rationale.md`](internal/kimi-rationale.md) for the full reasoning.
 
 ## Contributing a new adapter
 
