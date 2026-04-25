@@ -26,6 +26,7 @@ from typing import Any, Callable, Literal
 TEAMMATE_COMMAND_KEY = "CLAUDE_CODE_TEAMMATE_COMMAND"
 TEAMMATE_BINARY_KEY = "CLAUDE_ANYTEAM_BINARY"
 GEMINI_TEAMMATE_BINARY_KEY = "CLAUDE_ANYTEAM_GEMINI_BINARY"
+KIMI_TEAMMATE_BINARY_KEY = "CLAUDE_ANYTEAM_KIMI_BINARY"
 LEGACY_TEAMMATE_BINARY_KEY = "CODEX_TEAMMATE_BINARY"
 
 SHIM_BASENAME = "claude-anyteam-spawn-shim"
@@ -39,8 +40,10 @@ RECOMMENDED_ALLOWLIST_ENTRIES = (
     "Write(~/.claude/tasks/**)",
     "Edit(~/.claude/teams/**/config.json)",
     "Bash(setsid nohup uv run gemini-anyteam *)",
+    "Bash(setsid nohup uv run kimi-anyteam *)",
     "Bash(setsid nohup uv run claude-anyteam *)",
     "Bash(pkill -f gemini-anyteam *)",
+    "Bash(pkill -f kimi-anyteam *)",
     "Bash(pkill -f claude-anyteam *)",
     "Bash(mkdir -p ~/.claude/teams/**)",
     "Bash(claude-anyteam team-agent *)",
@@ -48,9 +51,21 @@ RECOMMENDED_ALLOWLIST_ENTRIES = (
     "Bash(claude-anyteam team-roster *)",
 )
 
-MANAGED_BINARY_KEYS = (TEAMMATE_BINARY_KEY, GEMINI_TEAMMATE_BINARY_KEY, LEGACY_TEAMMATE_BINARY_KEY)
+MANAGED_BINARY_KEYS = (
+    TEAMMATE_BINARY_KEY,
+    GEMINI_TEAMMATE_BINARY_KEY,
+    KIMI_TEAMMATE_BINARY_KEY,
+    LEGACY_TEAMMATE_BINARY_KEY,
+)
 MANAGED_SHIM_BASENAMES = {SHIM_BASENAME, LEGACY_SHIM_BASENAME}
-MANAGED_BINARY_BASENAMES = {BINARY_BASENAME, LEGACY_BINARY_BASENAME, "gemini-anyteam", "claude-anyteam-gemini"}
+MANAGED_BINARY_BASENAMES = {
+    BINARY_BASENAME,
+    LEGACY_BINARY_BASENAME,
+    "gemini-anyteam",
+    "claude-anyteam-gemini",
+    "kimi-anyteam",
+    "claude-anyteam-kimi",
+}
 
 TEAMMATE_MODE_KEY = "teammateMode"
 TEAMMATE_MODE_TARGET_VALUE = "tmux"
@@ -104,6 +119,22 @@ class GeminiCliCheck:
     raw_output: str | None
     capabilities: dict[str, bool] = field(default_factory=dict)
     missing_capabilities: tuple[str, ...] = ()
+    signed_in: bool = False
+    signed_in_detail: str | None = None
+
+
+@dataclass(frozen=True)
+class KimiCliCheck:
+    """Result of probing for the Moonshot Kimi Code CLI on PATH.
+
+    Kimi CLI is required at runtime for kimi-* teammates but is not a hard
+    install prereq. v1 treats any parseable Kimi CLI version as acceptable.
+    """
+
+    found: bool
+    path: Path | None
+    version: str | None
+    raw_output: str | None
     signed_in: bool = False
     signed_in_detail: str | None = None
 
@@ -215,10 +246,13 @@ class InstallResult:
     teammate_mode: TeammateModeResult | None = None
     codex_cli: CodexCliCheck | None = None
     gemini_cli: GeminiCliCheck | None = None
+    kimi_cli: KimiCliCheck | None = None
     codex_auth: AuthCheck | None = None
     gemini_auth: AuthCheck | None = None
+    kimi_auth: AuthCheck | None = None
     codex_status: ProviderStatus | None = None
     gemini_status: ProviderStatus | None = None
+    kimi_status: ProviderStatus | None = None
     force_empty_used: bool = False
     permissions_allow_added: tuple[str, ...] = ()
     permissions_allow_managed: tuple[str, ...] = ()
@@ -733,9 +767,15 @@ GEMINI_CLI_BINARY = "gemini"
 GEMINI_CLI_INSTALL_COMMAND = "npm install -g @google/gemini-cli"
 GEMINI_CLI_DOCS_URL = "https://github.com/google-gemini/gemini-cli"
 GEMINI_CLI_VERSION_TIMEOUT_S = 5
+KIMI_CLI_BINARY = "kimi"
+KIMI_CLI_INSTALL_COMMAND = "uv tool install --python 3.13 kimi-cli"
+KIMI_CLI_CURL_INSTALL_COMMAND = "curl -LsSf https://code.kimi.com/install.sh | bash"
+KIMI_CLI_DOCS_URL = "https://moonshotai.github.io/kimi-cli/"
+KIMI_CLI_VERSION_TIMEOUT_S = 5
 CODEX_AUTH_PATH = Path(".codex") / "auth.json"
 GEMINI_OAUTH_CREDS_PATH = Path(".gemini") / "oauth_creds.json"
 GEMINI_GOOGLE_ACCOUNTS_PATH = Path(".gemini") / "google_accounts.json"
+KIMI_CREDENTIALS_PATH = Path(".kimi") / "credentials" / "kimi-code.json"
 GEMINI_API_KEY_ENV = "GEMINI_API_KEY"
 GEMINI_VERTEX_ENV_KEYS = ("GOOGLE_APPLICATION_CREDENTIALS", "GOOGLE_GENAI_USE_VERTEXAI")
 
@@ -974,6 +1014,31 @@ def _check_gemini_signin(
         return False, f"Gemini sign-in check failed: {exc}"
 
 
+def _check_kimi_signin(
+    found_path: Path | str | None,
+    credentials_path: Path | str | None = None,
+) -> tuple[bool, str | None]:
+    """Detect Kimi local auth state without exposing token values."""
+    del found_path  # The auth file location is currently independent of the binary path.
+    try:
+        path = (
+            Path(credentials_path).expanduser()
+            if credentials_path is not None
+            else Path.home() / KIMI_CREDENTIALS_PATH
+        )
+        raw, detail = _read_auth_json_object(path, label="Kimi credentials")
+        if raw is None:
+            return False, detail
+
+        if _non_empty_string(raw.get("access_token")) and _non_empty_string(
+            raw.get("refresh_token")
+        ):
+            return True, None
+        return False, f"Kimi credentials file empty or missing credentials: {path}"
+    except Exception as exc:
+        return False, f"Kimi sign-in check failed: {exc}"
+
+
 def _check_codex_auth(auth_path: Path | str | None = None) -> AuthCheck:
     """Detect whether Codex has usable local auth without exposing secrets."""
     signed_in, detail = _check_codex_signin(CODEX_CLI_BINARY, auth_path=auth_path)
@@ -1108,6 +1173,51 @@ def _check_gemini_cli() -> GeminiCliCheck:
     )
 
 
+def _check_kimi_cli() -> KimiCliCheck:
+    found_path = shutil.which(KIMI_CLI_BINARY)
+    if not found_path:
+        return KimiCliCheck(
+            found=False,
+            path=None,
+            version=None,
+            raw_output=None,
+            signed_in=False,
+            signed_in_detail="Kimi CLI not found on PATH",
+        )
+
+    resolved = Path(found_path).resolve()
+    raw: str | None = None
+    version: str | None = None
+    try:
+        completed = subprocess.run(
+            [str(resolved), "info"],
+            capture_output=True,
+            text=True,
+            timeout=KIMI_CLI_VERSION_TIMEOUT_S,
+            check=False,
+        )
+    except (OSError, subprocess.SubprocessError):
+        completed = None
+
+    if completed is not None and completed.returncode == 0:
+        raw = ((completed.stdout or "") or (completed.stderr or "")).strip() or None
+        version = _parse_cli_version(raw or "")
+
+    try:
+        signed_in, signed_in_detail = _check_kimi_signin(resolved)
+    except Exception as exc:
+        signed_in, signed_in_detail = False, f"Kimi sign-in check failed: {exc}"
+
+    return KimiCliCheck(
+        found=True,
+        path=resolved,
+        version=version,
+        raw_output=raw,
+        signed_in=signed_in,
+        signed_in_detail=signed_in_detail,
+    )
+
+
 def _check_gemini_auth(
     oauth_creds_path: Path | str | None = None,
     google_accounts_path: Path | str | None = None,
@@ -1119,6 +1229,15 @@ def _check_gemini_auth(
         oauth_creds_path=oauth_creds_path,
         google_accounts_path=google_accounts_path,
         environ=environ,
+    )
+    return AuthCheck(signed_in=signed_in, signed_in_detail=detail)
+
+
+def _check_kimi_auth(credentials_path: Path | str | None = None) -> AuthCheck:
+    """Detect whether Kimi CLI has usable local OAuth credentials."""
+    signed_in, detail = _check_kimi_signin(
+        KIMI_CLI_BINARY,
+        credentials_path=credentials_path,
     )
     return AuthCheck(signed_in=signed_in, signed_in_detail=detail)
 
@@ -1145,6 +1264,43 @@ def _gemini_cli_warning(check: GeminiCliCheck) -> str | None:
             f"    {GEMINI_CLI_INSTALL_COMMAND}\n"
             f"  Setup guide: {GEMINI_CLI_DOCS_URL}"
         )
+    return None
+
+
+def _kimi_cli_warning(check: KimiCliCheck) -> str | None:
+    signin_hint = f"  After installing, run `{KIMI_CLI_BINARY} login` to sign in."
+    docs_line = f"  Setup guide: {KIMI_CLI_DOCS_URL}"
+    install_lines = (
+        f"    {KIMI_CLI_CURL_INSTALL_COMMAND}\n"
+        f"  Or, if you already have uv installed:\n"
+        f"    {KIMI_CLI_INSTALL_COMMAND}"
+    )
+
+    if not check.found:
+        return (
+            f"Warning: the Kimi CLI (`{KIMI_CLI_BINARY}`) was not found on PATH.\n"
+            f"  claude-anyteam is installed, but kimi-* teammates will fail to launch\n"
+            f"  until Kimi CLI is installed and authenticated. Add it with:\n"
+            f"{install_lines}\n"
+            f"{signin_hint}\n"
+            f"{docs_line}"
+        )
+
+    if check.version is None:
+        login_line = (
+            f"  Also run `{KIMI_CLI_BINARY} login` to sign in.\n"
+            if not check.signed_in
+            else ""
+        )
+        return (
+            f"Warning: detected Kimi CLI at {check.path}, but `{KIMI_CLI_BINARY} info`\n"
+            f"  did not include a parseable `kimi-cli version: X.Y.Z` line.\n"
+            f"  Reinstall or upgrade with:\n"
+            f"{install_lines}\n"
+            f"{login_line}"
+            f"{docs_line}"
+        )
+
     return None
 
 
@@ -1202,6 +1358,30 @@ def _gemini_provider_status(cli: GeminiCliCheck, auth: AuthCheck) -> ProviderSta
     )
 
 
+def _kimi_provider_status(cli: KimiCliCheck, auth: AuthCheck) -> ProviderStatus:
+    if not cli.found:
+        state: ProviderState = "MISSING"
+        upgrade_summary = None
+        upgrade_hint = None
+    elif auth.signed_in:
+        state = "READY"
+        upgrade_summary = None
+        upgrade_hint = None
+    else:
+        state = "NEEDS_SIGNIN"
+        upgrade_summary = None
+        upgrade_hint = None
+    return ProviderStatus(
+        provider_key="kimi",
+        display_name="Kimi CLI",
+        summary_name="Kimi",
+        state=state,
+        version=cli.version,
+        upgrade_summary=upgrade_summary,
+        upgrade_hint=upgrade_hint,
+    )
+
+
 def _any_provider_ready(*statuses: ProviderStatus) -> bool:
     return any(status.ready for status in statuses)
 
@@ -1218,8 +1398,10 @@ def install_teammate_mode(
     settings_file_created_by_anyteam: bool = False,
     codex_cli: CodexCliCheck | None = None,
     gemini_cli: GeminiCliCheck | None = None,
+    kimi_cli: KimiCliCheck | None = None,
     codex_auth: AuthCheck | None = None,
     gemini_auth: AuthCheck | None = None,
+    kimi_auth: AuthCheck | None = None,
     force_empty_used: bool = False,
     permissions_allow_added_by_anyteam: tuple[str, ...] = (),
     permissions_allowlist_skipped: bool = False,
@@ -1273,6 +1455,11 @@ def install_teammate_mode(
             state["gemini_cli_capabilities"] = dict(gemini_cli.capabilities)
         if gemini_auth is not None:
             state["gemini_signed_in"] = bool(gemini_auth.signed_in)
+        if kimi_cli is not None:
+            state["kimi_cli_found"] = bool(kimi_cli.found)
+            state["kimi_cli_version"] = kimi_cli.version
+        if kimi_auth is not None:
+            state["kimi_signed_in"] = bool(kimi_auth.signed_in)
         return state
 
     # Case 1: absent.
@@ -1465,8 +1652,10 @@ def install(
     prereq_check_fn: Callable[[], PrereqCheck] | None = None,
     codex_cli_check_fn: Callable[[], CodexCliCheck] | None = None,
     gemini_cli_check_fn: Callable[[], GeminiCliCheck] | None = None,
+    kimi_cli_check_fn: Callable[[], KimiCliCheck] | None = None,
     codex_auth_check_fn: Callable[[], AuthCheck] | None = None,
     gemini_auth_check_fn: Callable[[], AuthCheck] | None = None,
+    kimi_auth_check_fn: Callable[[], AuthCheck] | None = None,
     provider_status_callback: Callable[[str], None] | None = None,
     force_empty: bool = False,
     no_allowlist: bool = False,
@@ -1489,9 +1678,11 @@ def install(
     checker = prereq_check_fn if prereq_check_fn is not None else _check_terminal_multiplexer
     codex_checker = codex_cli_check_fn if codex_cli_check_fn is not None else _check_codex_cli
     gemini_checker = gemini_cli_check_fn if gemini_cli_check_fn is not None else _check_gemini_cli
+    kimi_checker = kimi_cli_check_fn if kimi_cli_check_fn is not None else _check_kimi_cli
     prereq = checker()
     codex_cli = codex_checker()
     gemini_cli = gemini_checker()
+    kimi_cli = kimi_checker()
     if not codex_cli.found:
         codex_auth = AuthCheck(signed_in=False, signed_in_detail=codex_cli.signed_in_detail)
     elif codex_auth_check_fn is not None:
@@ -1515,8 +1706,21 @@ def install(
         )
     else:
         gemini_auth = _check_gemini_auth()
+
+    if not kimi_cli.found:
+        kimi_auth = AuthCheck(signed_in=False, signed_in_detail=kimi_cli.signed_in_detail)
+    elif kimi_auth_check_fn is not None:
+        kimi_auth = kimi_auth_check_fn()
+    elif kimi_cli.signed_in or kimi_cli.signed_in_detail is not None:
+        kimi_auth = AuthCheck(
+            signed_in=kimi_cli.signed_in,
+            signed_in_detail=kimi_cli.signed_in_detail,
+        )
+    else:
+        kimi_auth = _check_kimi_auth()
     codex_status = _codex_provider_status(codex_cli, codex_auth)
     gemini_status = _gemini_provider_status(gemini_cli, gemini_auth)
+    kimi_status = _kimi_provider_status(kimi_cli, kimi_auth)
 
     if not prereq.found:
         message = (
@@ -1531,6 +1735,9 @@ def install(
         gemini_warning = _gemini_cli_warning(gemini_cli)
         if gemini_warning is not None:
             message = f"{message}\n\nAdditionally:\n{gemini_warning}"
+        kimi_warning = _kimi_cli_warning(kimi_cli)
+        if kimi_warning is not None:
+            message = f"{message}\n\nAdditionally:\n{kimi_warning}"
         raise InstallError(message)
 
     provider_preamble_rendered = False
@@ -1539,16 +1746,17 @@ def install(
             _format_provider_preamble(
                 codex_status,
                 gemini_status,
+                kimi_status,
                 force_empty=force_empty,
             )
         )
         provider_preamble_rendered = True
 
-    if not _any_provider_ready(codex_status, gemini_status) and not force_empty:
+    if not _any_provider_ready(codex_status, gemini_status, kimi_status) and not force_empty:
         message = (
             _format_no_provider_refusal_message()
             if provider_preamble_rendered
-            else _format_no_provider_ready_message(codex_status, gemini_status)
+            else _format_no_provider_ready_message(codex_status, gemini_status, kimi_status)
         )
         err = InstallError(message)
         err.cli_exit_code = INSTALL_ERROR_EXIT_NO_PROVIDER  # type: ignore[attr-defined]
@@ -1580,6 +1788,7 @@ def install(
         TEAMMATE_COMMAND_KEY: str(paths.shim_path),
         TEAMMATE_BINARY_KEY: str(paths.binary_path),
         GEMINI_TEAMMATE_BINARY_KEY: str(paths.binary_path.with_name("gemini-anyteam")),
+        KIMI_TEAMMATE_BINARY_KEY: str(paths.binary_path.with_name("kimi-anyteam")),
     }
     changed: dict[str, str] = {}
     for key, value in desired.items():
@@ -1633,8 +1842,10 @@ def install(
             settings_file_created_by_anyteam=not existed,
             codex_cli=codex_cli,
             gemini_cli=gemini_cli,
+            kimi_cli=kimi_cli,
             codex_auth=codex_auth,
             gemini_auth=gemini_auth,
+            kimi_auth=kimi_auth,
             force_empty_used=force_empty,
             permissions_allow_added_by_anyteam=permissions_allow_managed,
             permissions_allowlist_skipped=no_allowlist,
@@ -1658,10 +1869,13 @@ def install(
         teammate_mode=mode_result,
         codex_cli=codex_cli,
         gemini_cli=gemini_cli,
+        kimi_cli=kimi_cli,
         codex_auth=codex_auth,
         gemini_auth=gemini_auth,
+        kimi_auth=kimi_auth,
         codex_status=codex_status,
         gemini_status=gemini_status,
+        kimi_status=kimi_status,
         force_empty_used=force_empty,
         permissions_allow_added=permissions_allow_added,
         permissions_allow_managed=permissions_allow_managed,
@@ -1786,7 +2000,13 @@ def uninstall(
     removed: dict[str, str] = {}
     skipped: dict[str, str] = {}
 
-    for key in (TEAMMATE_COMMAND_KEY, TEAMMATE_BINARY_KEY, GEMINI_TEAMMATE_BINARY_KEY, LEGACY_TEAMMATE_BINARY_KEY):
+    for key in (
+        TEAMMATE_COMMAND_KEY,
+        TEAMMATE_BINARY_KEY,
+        GEMINI_TEAMMATE_BINARY_KEY,
+        KIMI_TEAMMATE_BINARY_KEY,
+        LEGACY_TEAMMATE_BINARY_KEY,
+    ):
         value = env.get(key)
         if value is None:
             continue
@@ -1870,6 +2090,22 @@ def _gemini_render_status(gemini: GeminiCliCheck) -> ProviderStatus:
         summary_name="Gemini",
         state=state,
         version=gemini.version,
+    )
+
+
+def _kimi_render_status(kimi: KimiCliCheck) -> ProviderStatus:
+    if not kimi.found:
+        state: ProviderState = "MISSING"
+    elif kimi.signed_in:
+        state = "READY"
+    else:
+        state = "NEEDS_SIGNIN"
+    return ProviderStatus(
+        provider_key="kimi",
+        display_name="Kimi CLI",
+        summary_name="Kimi",
+        state=state,
+        version=kimi.version,
     )
 
 
@@ -1959,7 +2195,7 @@ def _format_provider_status_table(
 def _format_no_provider_explainer() -> str:
     return "\n".join(
         [
-            "claude-anyteam routes some Claude Code teammates to external AI CLIs (Codex, Gemini).",
+            "claude-anyteam routes some Claude Code teammates to external AI CLIs (Codex, Gemini, Kimi).",
             "You need at least one signed-in CLI for it to do anything useful.",
             "Pick whichever you have access to.",
         ]
@@ -2011,11 +2247,34 @@ def _format_gemini_walkthrough(status: ProviderStatus) -> str:
     return "\n".join(lines)
 
 
+def _format_kimi_walkthrough(status: ProviderStatus) -> str:
+    if status.state == "READY":
+        return ""
+
+    lines = ["Kimi CLI:"]
+    step = 1
+    if status.state == "MISSING":
+        lines.append(f"  {step}. Install:  {KIMI_CLI_CURL_INSTALL_COMMAND}")
+        lines.append(f"     Or with uv: {KIMI_CLI_INSTALL_COMMAND}")
+        step += 1
+    elif status.state == "NEEDS_UPGRADE":
+        suffix = f" ({status.upgrade_hint})" if status.upgrade_hint else ""
+        lines.append(f"  {step}. Upgrade:  {KIMI_CLI_INSTALL_COMMAND}{suffix}")
+        step += 1
+
+    if status.state in ("MISSING", "NEEDS_SIGNIN"):
+        lines.append(f"  {step}. Sign in:  {KIMI_CLI_BINARY} login")
+    lines.append(f"  Docs: {KIMI_CLI_DOCS_URL}")
+    return "\n".join(lines)
+
+
 def _format_provider_walkthrough(status: ProviderStatus) -> str:
     if status.provider_key == "codex":
         return _format_codex_walkthrough(status)
     if status.provider_key == "gemini":
         return _format_gemini_walkthrough(status)
+    if status.provider_key == "kimi":
+        return _format_kimi_walkthrough(status)
     return ""
 
 
@@ -2086,13 +2345,18 @@ def format_install_message(result: InstallResult, *, include_provider_status: bo
         result.gemini_cli or GeminiCliCheck(found=False, path=None, version=None, raw_output=None),
         result.gemini_auth or AuthCheck(signed_in=False),
     )
+    kimi_status = result.kimi_status or _kimi_provider_status(
+        result.kimi_cli or KimiCliCheck(found=False, path=None, version=None, raw_output=None),
+        result.kimi_auth or AuthCheck(signed_in=False),
+    )
 
-    if codex_status is not None and gemini_status is not None:
+    if codex_status is not None and gemini_status is not None and kimi_status is not None:
         if include_provider_status:
             lines.append(
                 _format_provider_preamble(
                     codex_status,
                     gemini_status,
+                    kimi_status,
                     force_empty=result.force_empty_used,
                 )
             )
@@ -2102,6 +2366,7 @@ def format_install_message(result: InstallResult, *, include_provider_status: bo
         f"Set env.{TEAMMATE_COMMAND_KEY}={result.paths.shim_path}",
         f"Set env.{TEAMMATE_BINARY_KEY}={result.paths.binary_path}",
         f"Set env.{GEMINI_TEAMMATE_BINARY_KEY}={result.paths.binary_path.with_name('gemini-anyteam')}",
+        f"Set env.{KIMI_TEAMMATE_BINARY_KEY}={result.paths.binary_path.with_name('kimi-anyteam')}",
     ]
     if result.removed_legacy_keys:
         receipt_lines.append(f"Removed legacy env.{LEGACY_TEAMMATE_BINARY_KEY} entry.")
@@ -2124,7 +2389,7 @@ def format_install_message(result: InstallResult, *, include_provider_status: bo
     else:
         receipt_lines.append("Permission allowlist written so spawning teams won't prompt.")
 
-    receipt_lines.append("Restart Claude Code for the changes to take effect. Use codex-* or gemini-* teammate names to route to the matching backend.")
+    receipt_lines.append("Restart Claude Code for the changes to take effect. Use codex-*, gemini-*, or kimi-* teammate names to route to the matching backend.")
     if not result.changed_anything:
         receipt_lines.insert(1, "The existing settings already matched this install.")
     lines.append("\n".join(receipt_lines))
