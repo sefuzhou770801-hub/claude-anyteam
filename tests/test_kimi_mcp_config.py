@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import json
+import sys
 from pathlib import Path
 
 from claude_anyteam.backends.kimi import invoke
@@ -53,3 +54,24 @@ def test_write_mcp_config_restores_real_home_when_kimi_home_is_isolated(tmp_path
     assert server["env"]["HOME"] != str(env_home)
     assert server["env"]["CLAUDE_ANYTEAM_TEAM"] == "team-with-isolated-home"
     assert server["env"]["CLAUDE_ANYTEAM_NAME"] == "kimi-agent"
+
+
+def test_write_mcp_config_falls_back_to_module_wrapper_when_binary_is_missing(tmp_path, monkeypatch):
+    monkeypatch.setattr(invoke.shutil, "which", lambda _name: None)
+
+    config_path = invoke.write_mcp_config(
+        tmp_path / "isolated-home",
+        team="fallback-team",
+        agent_name="kimi-fallback",
+    )
+
+    server = json.loads(config_path.read_text(encoding="utf-8"))["mcpServers"]["anyteam"]
+    assert server["command"] == sys.executable
+    assert server["args"] == [
+        "-m",
+        "claude_anyteam.wrapper_server",
+        "--team",
+        "fallback-team",
+        "--name",
+        "kimi-fallback",
+    ]
