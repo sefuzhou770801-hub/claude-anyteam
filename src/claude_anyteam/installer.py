@@ -20,7 +20,7 @@ import sys
 import tempfile
 from dataclasses import dataclass, field
 from pathlib import Path
-from typing import Any, Callable
+from typing import Any, Callable, Literal
 
 TEAMMATE_COMMAND_KEY = "CLAUDE_CODE_TEAMMATE_COMMAND"
 TEAMMATE_BINARY_KEY = "CLAUDE_ANYTEAM_BINARY"
@@ -31,6 +31,18 @@ SHIM_BASENAME = "claude-anyteam-spawn-shim"
 LEGACY_SHIM_BASENAME = "codex-teammate-spawn-shim"
 BINARY_BASENAME = "claude-anyteam"
 LEGACY_BINARY_BASENAME = "codex-teammate"
+
+RECOMMENDED_ALLOWLIST_ENTRIES = (
+    "Write(~/.claude/teams/**/config.json)",
+    "Write(~/.claude/teams/**/agents/**.json)",
+    "Write(~/.claude/tasks/**)",
+    "Edit(~/.claude/teams/**/config.json)",
+    "Bash(setsid nohup uv run gemini-anyteam *)",
+    "Bash(setsid nohup uv run claude-anyteam *)",
+    "Bash(pkill -f gemini-anyteam *)",
+    "Bash(pkill -f claude-anyteam *)",
+    "Bash(mkdir -p ~/.claude/teams/**)",
+)
 
 MANAGED_BINARY_KEYS = (TEAMMATE_BINARY_KEY, GEMINI_TEAMMATE_BINARY_KEY, LEGACY_TEAMMATE_BINARY_KEY)
 MANAGED_SHIM_BASENAMES = {SHIM_BASENAME, LEGACY_SHIM_BASENAME}
@@ -47,9 +59,13 @@ STATE_FILE_NAME = "install-state.json"
 #   2 = generic install failure (default, when cli_exit_code is unset)
 #   3 = install aborted by user (teammateMode overwrite prompt declined)
 #   4 = uninstall refuses to mutate files due to corrupted/malformed state
+#   5 = install refused because no provider CLI is installed and signed in
 INSTALL_ERROR_EXIT_GENERIC = 2
 INSTALL_ERROR_EXIT_PROMPT_DECLINED = 3
 INSTALL_ERROR_EXIT_CORRUPTED_STATE = 4
+INSTALL_ERROR_EXIT_NO_PROVIDER = 5
+
+ProviderState = Literal["READY", "NEEDS_SIGNIN", "NEEDS_UPGRADE", "MISSING"]
 
 
 @dataclass(frozen=True)
@@ -101,6 +117,58 @@ class CodexCliCheck:
 
 
 @dataclass(frozen=True)
+class AuthCheck:
+    """Non-secret result of probing a provider's local auth state."""
+
+    signed_in: bool
+
+
+@dataclass(frozen=True)
+class ProviderStatus:
+    """Display-ready aggregate of a provider's install + sign-in state."""
+
+    provider_key: Literal["codex", "gemini"]
+    display_name: str
+    summary_name: str
+    state: ProviderState
+    version: str | None = None
+    upgrade_summary: str | None = None
+    upgrade_hint: str | None = None
+
+    @property
+    def ready(self) -> bool:
+        return self.state == "READY"
+
+    @property
+    def signed_in(self) -> bool:
+        return self.state == "READY"
+
+    def installed_cell(self) -> str:
+        if self.state in ("READY", "NEEDS_SIGNIN"):
+            return f"✅ {self.version}" if self.version else "✅"
+        if self.state == "NEEDS_UPGRADE":
+            return f"⚠️  {self.version}" if self.version else "⚠️"
+        return "❌"
+
+    def signin_cell(self) -> str:
+        if self.state == "READY":
+            return "✅"
+        if self.state == "NEEDS_SIGNIN":
+            return "❌"
+        return "—"
+
+    def summary_entry(self) -> str:
+        if self.state == "READY":
+            return f"{self.summary_name} {self.version}" if self.version else self.summary_name
+        if self.state == "NEEDS_SIGNIN":
+            return f"{self.summary_name} (sign in to finish)"
+        if self.state == "NEEDS_UPGRADE":
+            detail = self.upgrade_summary or "upgrade required"
+            return f"{self.summary_name} ({detail})"
+        return f"{self.summary_name} (not installed)"
+
+
+@dataclass(frozen=True)
 class TeammateModeResult:
     """Outcome of install_teammate_mode()."""
 
@@ -138,6 +206,11 @@ class InstallResult:
     teammate_mode: TeammateModeResult | None = None
     codex_cli: CodexCliCheck | None = None
     gemini_cli: GeminiCliCheck | None = None
+    codex_auth: AuthCheck | None = None
+    gemini_auth: AuthCheck | None = None
+    codex_status: ProviderStatus | None = None
+    gemini_status: ProviderStatus | None = None
+    force_empty_used: bool = False
 
     @property
     def changed_anything(self) -> bool:
@@ -468,7 +541,7 @@ def _install_instructions(platform: str) -> str:
 # ---------------------------------------------------------------------------
 
 CODEX_CLI_BINARY = "codex"
-CODEX_CLI_INSTALL_COMMAND = "npm i -g @openai/codex"
+CODEX_CLI_INSTALL_COMMAND = "npm install -g @openai/codex"
 CODEX_CLI_DOCS_URL = "https://github.com/openai/codex#getting-started"
 CODEX_CLI_MIN_VERSION: tuple[int, int, int] = (0, 120, 0)
 CODEX_CLI_VERSION_TIMEOUT_S = 5
@@ -476,6 +549,10 @@ GEMINI_CLI_BINARY = "gemini"
 GEMINI_CLI_INSTALL_COMMAND = "npm install -g @google/gemini-cli"
 GEMINI_CLI_DOCS_URL = "https://github.com/google-gemini/gemini-cli"
 GEMINI_CLI_VERSION_TIMEOUT_S = 5
+CODEX_AUTH_PATH = Path(".codex") / "auth.json"
+GEMINI_OAUTH_CREDS_PATH = Path(".gemini") / "oauth_creds.json"
+GEMINI_API_KEY_ENV = "GEMINI_API_KEY"
+GEMINI_VERTEX_ENV_KEYS = ("GOOGLE_APPLICATION_CREDENTIALS", "GOOGLE_GENAI_USE_VERTEXAI")
 
 # Accepts semver-ish tokens like "0.124.0", "0.124", or "0.124.0-rc1". Rejects
 # garbage ("12abc"), leading-v prefixes ("v0.124.0"), and trailing junk.
@@ -542,6 +619,34 @@ def _check_codex_cli() -> CodexCliCheck:
             version = _parse_cli_version(raw)
 
     return CodexCliCheck(found=True, path=resolved, version=version, raw_output=raw)
+
+
+def _non_empty_string(value: object) -> bool:
+    return isinstance(value, str) and bool(value.strip())
+
+
+def _load_json_object_or_none(path: Path) -> dict[str, Any] | None:
+    try:
+        raw = json.loads(path.read_text(encoding="utf-8"))
+    except (OSError, json.JSONDecodeError):
+        return None
+    if not isinstance(raw, dict):
+        return None
+    return raw
+
+
+def _check_codex_auth(auth_path: Path | str | None = None) -> AuthCheck:
+    """Detect whether Codex has usable local auth without exposing secrets."""
+    path = Path(auth_path).expanduser() if auth_path is not None else Path.home() / CODEX_AUTH_PATH
+    raw = _load_json_object_or_none(path)
+    if raw is None:
+        return AuthCheck(signed_in=False)
+
+    tokens = raw.get("tokens")
+    access_token = tokens.get("access_token") if isinstance(tokens, dict) else None
+    return AuthCheck(
+        signed_in=_non_empty_string(access_token) or _non_empty_string(raw.get("OPENAI_API_KEY"))
+    )
 
 
 def _codex_cli_warning(check: CodexCliCheck) -> str | None:
@@ -659,6 +764,28 @@ def _check_gemini_cli() -> GeminiCliCheck:
     )
 
 
+def _check_gemini_auth(
+    oauth_creds_path: Path | str | None = None,
+    environ: dict[str, str] | None = None,
+) -> AuthCheck:
+    """Detect whether Gemini CLI has usable OAuth/API-key/Vertex auth."""
+    env = os.environ if environ is None else environ
+    if _non_empty_string(env.get(GEMINI_API_KEY_ENV)):
+        return AuthCheck(signed_in=True)
+    if any(_non_empty_string(env.get(key)) for key in GEMINI_VERTEX_ENV_KEYS):
+        return AuthCheck(signed_in=True)
+
+    path = (
+        Path(oauth_creds_path).expanduser()
+        if oauth_creds_path is not None
+        else Path.home() / GEMINI_OAUTH_CREDS_PATH
+    )
+    raw = _load_json_object_or_none(path)
+    if raw is None:
+        return AuthCheck(signed_in=False)
+    return AuthCheck(signed_in=_non_empty_string(raw.get("access_token")))
+
+
 def _gemini_cli_warning(check: GeminiCliCheck) -> str | None:
     if not check.found:
         return (
@@ -684,6 +811,64 @@ def _gemini_cli_warning(check: GeminiCliCheck) -> str | None:
     return None
 
 
+def _codex_provider_status(cli: CodexCliCheck, auth: AuthCheck) -> ProviderStatus:
+    if not cli.found:
+        state: ProviderState = "MISSING"
+        upgrade_summary = None
+        upgrade_hint = None
+    elif _codex_meets_minimum(cli) is False:
+        state = "NEEDS_UPGRADE"
+        detected = cli.version or "unknown"
+        floor = _min_version_str()
+        upgrade_summary = f"upgrade — {detected} < {floor} floor"
+        upgrade_hint = f"detected {detected}, need ≥ {floor}"
+    elif auth.signed_in:
+        state = "READY"
+        upgrade_summary = None
+        upgrade_hint = None
+    else:
+        state = "NEEDS_SIGNIN"
+        upgrade_summary = None
+        upgrade_hint = None
+    return ProviderStatus(
+        provider_key="codex",
+        display_name="Codex CLI",
+        summary_name="Codex",
+        state=state,
+        version=cli.version,
+        upgrade_summary=upgrade_summary,
+        upgrade_hint=upgrade_hint,
+    )
+
+
+def _gemini_provider_status(cli: GeminiCliCheck, auth: AuthCheck) -> ProviderStatus:
+    if not cli.found:
+        state: ProviderState = "MISSING"
+        upgrade_summary = None
+        upgrade_hint = None
+    elif auth.signed_in:
+        state = "READY"
+        upgrade_summary = None
+        upgrade_hint = None
+    else:
+        state = "NEEDS_SIGNIN"
+        upgrade_summary = None
+        upgrade_hint = None
+    return ProviderStatus(
+        provider_key="gemini",
+        display_name="Gemini CLI",
+        summary_name="Gemini",
+        state=state,
+        version=cli.version,
+        upgrade_summary=upgrade_summary,
+        upgrade_hint=upgrade_hint,
+    )
+
+
+def _any_provider_ready(*statuses: ProviderStatus) -> bool:
+    return any(status.ready for status in statuses)
+
+
 # ---------------------------------------------------------------------------
 # teammateMode install/uninstall
 # ---------------------------------------------------------------------------
@@ -696,6 +881,9 @@ def install_teammate_mode(
     settings_file_created_by_anyteam: bool = False,
     codex_cli: CodexCliCheck | None = None,
     gemini_cli: GeminiCliCheck | None = None,
+    codex_auth: AuthCheck | None = None,
+    gemini_auth: AuthCheck | None = None,
+    force_empty_used: bool = False,
 ) -> TeammateModeResult:
     """Ensures ~/.claude.json has teammateMode='tmux', recording what we did in state.
 
@@ -727,14 +915,19 @@ def install_teammate_mode(
             # can remove exactly those if and only if they end up empty later.
             "settings_file_created_by_anyteam": bool(settings_file_created_by_anyteam),
             "claude_json_created_by_anyteam": bool(claude_json_created_by_anyteam),
+            "force_empty_used": bool(force_empty_used),
         }
         if codex_cli is not None:
             state["codex_cli_found"] = bool(codex_cli.found)
             state["codex_cli_version"] = codex_cli.version
+        if codex_auth is not None:
+            state["codex_signed_in"] = bool(codex_auth.signed_in)
         if gemini_cli is not None:
             state["gemini_cli_found"] = bool(gemini_cli.found)
             state["gemini_cli_version"] = gemini_cli.version
             state["gemini_cli_capabilities"] = dict(gemini_cli.capabilities)
+        if gemini_auth is not None:
+            state["gemini_signed_in"] = bool(gemini_auth.signed_in)
         return state
 
     # Case 1: absent.
@@ -914,6 +1107,7 @@ def uninstall_teammate_mode(
 # Top-level install / uninstall
 # ---------------------------------------------------------------------------
 
+
 def install(
     *,
     settings_path: Path | str | None = None,
@@ -926,6 +1120,9 @@ def install(
     prereq_check_fn: Callable[[], PrereqCheck] | None = None,
     codex_cli_check_fn: Callable[[], CodexCliCheck] | None = None,
     gemini_cli_check_fn: Callable[[], GeminiCliCheck] | None = None,
+    codex_auth_check_fn: Callable[[], AuthCheck] | None = None,
+    gemini_auth_check_fn: Callable[[], AuthCheck] | None = None,
+    force_empty: bool = False,
 ) -> InstallResult:
     """Full install: prereq check → env block write → teammateMode update.
 
@@ -945,9 +1142,15 @@ def install(
     checker = prereq_check_fn if prereq_check_fn is not None else _check_terminal_multiplexer
     codex_checker = codex_cli_check_fn if codex_cli_check_fn is not None else _check_codex_cli
     gemini_checker = gemini_cli_check_fn if gemini_cli_check_fn is not None else _check_gemini_cli
+    codex_auth_checker = codex_auth_check_fn if codex_auth_check_fn is not None else _check_codex_auth
+    gemini_auth_checker = gemini_auth_check_fn if gemini_auth_check_fn is not None else _check_gemini_auth
     prereq = checker()
     codex_cli = codex_checker()
     gemini_cli = gemini_checker()
+    codex_auth = codex_auth_checker() if codex_cli.found else AuthCheck(signed_in=False)
+    gemini_auth = gemini_auth_checker() if gemini_cli.found else AuthCheck(signed_in=False)
+    codex_status = _codex_provider_status(codex_cli, codex_auth)
+    gemini_status = _gemini_provider_status(gemini_cli, gemini_auth)
 
     if not prereq.found:
         message = (
@@ -963,6 +1166,11 @@ def install(
         if gemini_warning is not None:
             message = f"{message}\n\nAdditionally:\n{gemini_warning}"
         raise InstallError(message)
+
+    if not _any_provider_ready(codex_status, gemini_status) and not force_empty:
+        err = InstallError(_format_no_provider_ready_message(codex_status, gemini_status))
+        err.cli_exit_code = INSTALL_ERROR_EXIT_NO_PROVIDER  # type: ignore[attr-defined]
+        raise err
 
     paths = discover_managed_paths(
         settings_path=settings_path,
@@ -1016,6 +1224,9 @@ def install(
             settings_file_created_by_anyteam=not existed,
             codex_cli=codex_cli,
             gemini_cli=gemini_cli,
+            codex_auth=codex_auth,
+            gemini_auth=gemini_auth,
+            force_empty_used=force_empty,
         )
     except InstallError:
         _rollback_env_block(
@@ -1035,6 +1246,11 @@ def install(
         teammate_mode=mode_result,
         codex_cli=codex_cli,
         gemini_cli=gemini_cli,
+        codex_auth=codex_auth,
+        gemini_auth=gemini_auth,
+        codex_status=codex_status,
+        gemini_status=gemini_status,
+        force_empty_used=force_empty,
     )
 
 
@@ -1189,58 +1405,172 @@ def uninstall(
 # User-facing summary formatting
 # ---------------------------------------------------------------------------
 
+PROVIDER_STATUS_RULE = "─" * 45
+
+
+def _provider_row(status: ProviderStatus) -> str:
+    return f"{status.display_name:<14}{status.installed_cell():<18}{status.signin_cell()}"
+
+
+def _provider_summary_entry(status: ProviderStatus) -> str:
+    return status.summary_entry()
+
+
+def _aggregate_summary_line(codex: ProviderStatus, gemini: ProviderStatus) -> str:
+    if _any_provider_ready(codex, gemini):
+        lead = "Ready"
+    elif codex.state == "NEEDS_SIGNIN" or gemini.state == "NEEDS_SIGNIN":
+        lead = "Almost ready"
+    else:
+        lead = "Not ready"
+    return f"{lead}: {_provider_summary_entry(codex)} · {_provider_summary_entry(gemini)}."
+
+
+def _format_provider_status_table(codex: ProviderStatus, gemini: ProviderStatus) -> str:
+    return "\n".join(
+        [
+            "Provider status",
+            PROVIDER_STATUS_RULE,
+            f"{'':<14}{'Installed?':<18}{'Signed in?'}",
+            _provider_row(codex),
+            _provider_row(gemini),
+            PROVIDER_STATUS_RULE,
+            _aggregate_summary_line(codex, gemini),
+        ]
+    )
+
+
+def _format_no_provider_explainer() -> str:
+    return "\n".join(
+        [
+            "claude-anyteam routes some Claude Code teammates to external AI CLIs (Codex, Gemini).",
+            "You need at least one signed-in CLI for it to do anything useful.",
+            "Pick whichever you have access to.",
+        ]
+    )
+
+
+def _format_codex_walkthrough(status: ProviderStatus) -> str:
+    if status.state == "READY":
+        return ""
+
+    lines = ["Codex CLI:"]
+    step = 1
+    if status.state == "MISSING":
+        lines.append(f"  {step}. Install:  {CODEX_CLI_INSTALL_COMMAND}")
+        step += 1
+    elif status.state == "NEEDS_UPGRADE":
+        suffix = f" ({status.upgrade_hint})" if status.upgrade_hint else ""
+        lines.append(
+            f"  {step}. Upgrade:  {CODEX_CLI_INSTALL_COMMAND}{suffix}"
+        )
+        step += 1
+
+    if status.state in ("MISSING", "NEEDS_SIGNIN"):
+        lines.append(f"  {step}. Sign in:  {CODEX_CLI_BINARY}     (opens an OAuth flow on first run)")
+    lines.append(f"  Docs: {CODEX_CLI_DOCS_URL}")
+    return "\n".join(lines)
+
+
+def _format_gemini_walkthrough(status: ProviderStatus) -> str:
+    if status.state == "READY":
+        return ""
+
+    lines = ["Gemini CLI:"]
+    step = 1
+    if status.state == "MISSING":
+        lines.append(f"  {step}. Install:  {GEMINI_CLI_INSTALL_COMMAND}")
+        step += 1
+    elif status.state == "NEEDS_UPGRADE":
+        suffix = f" ({status.upgrade_hint})" if status.upgrade_hint else ""
+        lines.append(f"  {step}. Upgrade:  {GEMINI_CLI_INSTALL_COMMAND}{suffix}")
+        step += 1
+
+    if status.state in ("MISSING", "NEEDS_SIGNIN"):
+        lines.append(
+            f"  {step}. Sign in:  {GEMINI_CLI_BINARY}    "
+            "(or set GEMINI_API_KEY, or configure Vertex)"
+        )
+    lines.append(f"  Docs: {GEMINI_CLI_DOCS_URL}")
+    return "\n".join(lines)
+
+
+def _format_provider_walkthroughs(codex: ProviderStatus, gemini: ProviderStatus) -> str:
+    blocks = [
+        block
+        for block in (_format_codex_walkthrough(codex), _format_gemini_walkthrough(gemini))
+        if block
+    ]
+    return "\n\n".join(blocks)
+
+
+def _format_no_provider_ready_message(codex: ProviderStatus, gemini: ProviderStatus) -> str:
+    blocks = [
+        _format_provider_status_table(codex, gemini),
+        _format_no_provider_explainer(),
+        _format_provider_walkthroughs(codex, gemini),
+        (
+            "Refusing to install — no provider is ready.\n"
+            "  claude-anyteam needs at least one signed-in CLI (Codex or Gemini) to do anything\n"
+            "  useful. Follow the steps above, then re-run `claude-anyteam install`.\n\n"
+            "  Setting up later? Pass --force-empty to install with no provider ready:\n"
+            "    claude-anyteam install --force-empty"
+        ),
+    ]
+    return "\n\n".join(block for block in blocks if block)
+
+
 def format_install_message(result: InstallResult) -> str:
-    lines = [
+    lines: list[str] = []
+
+    codex_status = result.codex_status or _codex_provider_status(
+        result.codex_cli or CodexCliCheck(found=False, path=None, version=None, raw_output=None),
+        result.codex_auth or AuthCheck(signed_in=False),
+    )
+    gemini_status = result.gemini_status or _gemini_provider_status(
+        result.gemini_cli or GeminiCliCheck(found=False, path=None, version=None, raw_output=None),
+        result.gemini_auth or AuthCheck(signed_in=False),
+    )
+
+    if codex_status is not None and gemini_status is not None:
+        lines.append(_format_provider_status_table(codex_status, gemini_status))
+        if result.force_empty_used and not _any_provider_ready(codex_status, gemini_status):
+            lines.append(_format_no_provider_explainer())
+        walkthrough = _format_provider_walkthroughs(codex_status, gemini_status)
+        if walkthrough:
+            lines.append(walkthrough)
+        if result.force_empty_used and not _any_provider_ready(codex_status, gemini_status):
+            lines.append(
+                "Proceeding with --force-empty: claude-anyteam is installed but inert until a CLI is ready."
+            )
+
+    receipt_lines = [
         f"Updated {result.paths.settings_path}",
         f"Set env.{TEAMMATE_COMMAND_KEY}={result.paths.shim_path}",
         f"Set env.{TEAMMATE_BINARY_KEY}={result.paths.binary_path}",
         f"Set env.{GEMINI_TEAMMATE_BINARY_KEY}={result.paths.binary_path.with_name('gemini-anyteam')}",
     ]
     if result.removed_legacy_keys:
-        lines.append(f"Removed legacy env.{LEGACY_TEAMMATE_BINARY_KEY} entry.")
+        receipt_lines.append(f"Removed legacy env.{LEGACY_TEAMMATE_BINARY_KEY} entry.")
 
     mode = result.teammate_mode
     if mode is not None:
         if mode.wrote_value:
             if mode.previous_value is None:
-                lines.append(f"Set {TEAMMATE_MODE_KEY}=\"tmux\" in {mode.claude_json_path}")
+                receipt_lines.append(f"Set {TEAMMATE_MODE_KEY}=\"tmux\" in {mode.claude_json_path}")
             else:
-                lines.append(
+                receipt_lines.append(
                     f"Set {TEAMMATE_MODE_KEY}=\"tmux\" in {mode.claude_json_path} "
                     f"(was {mode.previous_value!r})"
                 )
         else:
-            lines.append(f"{TEAMMATE_MODE_KEY} already \"tmux\" in {mode.claude_json_path}; no change")
+            receipt_lines.append(f"{TEAMMATE_MODE_KEY} already \"tmux\" in {mode.claude_json_path}; no change")
 
-    codex_cli = result.codex_cli
-    if codex_cli is not None:
-        warning = _codex_cli_warning(codex_cli)
-        if warning is not None:
-            lines.append(warning)
-        elif codex_cli.found:
-            if codex_cli.version:
-                lines.append(f"Detected Codex CLI {codex_cli.version} at {codex_cli.path}")
-            else:
-                # Parse-fail branch: presence-only acknowledgment.
-                lines.append(f"Detected Codex CLI at {codex_cli.path}")
-
-    gemini_cli = result.gemini_cli
-    if gemini_cli is not None:
-        warning = _gemini_cli_warning(gemini_cli)
-        if warning is not None:
-            lines.append(warning)
-        elif gemini_cli.found:
-            if gemini_cli.version:
-                lines.append(f"Detected Gemini CLI {gemini_cli.version} at {gemini_cli.path}")
-            else:
-                lines.append(f"Detected Gemini CLI at {gemini_cli.path}")
-            if gemini_cli.capabilities.get("--acp") is False:
-                lines.append("Gemini CLI ACP support was not detected; headless gemini-* routing remains available.")
-
-    lines.append("Restart Claude Code for the changes to take effect. Use codex-* or gemini-* teammate names to route to the matching backend.")
+    receipt_lines.append("Restart Claude Code for the changes to take effect. Use codex-* or gemini-* teammate names to route to the matching backend.")
     if not result.changed_anything:
-        lines.insert(1, "The existing settings already matched this install.")
-    return "\n".join(lines)
+        receipt_lines.insert(1, "The existing settings already matched this install.")
+    lines.append("\n".join(receipt_lines))
+    return "\n\n".join(lines)
 
 
 
