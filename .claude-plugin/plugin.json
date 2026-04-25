@@ -1,7 +1,7 @@
 {
   "name": "claude-anyteam",
   "version": "0.5.0",
-  "description": "Claude Code plugin that wires claude-anyteam into agent teams with zero-friction Codex/Gemini session setup.",
+  "description": "Claude Code plugin that wires claude-anyteam into agent teams with zero-friction Codex/Gemini/Kimi session setup.",
   "author": {
     "name": "friction-research"
   },
@@ -10,7 +10,8 @@
     "claude-code",
     "plugin",
     "codex",
-        "gemini",
+    "gemini",
+    "kimi",
     "agent-teams"
   ],
   "homepage": "https://github.com/JonathanRosado/claude-anyteam",
