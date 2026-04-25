@@ -114,7 +114,7 @@ def _build_install_parser() -> argparse.ArgumentParser:
     p.add_argument(
         "--no-input",
         action="store_true",
-        help="fail instead of prompting (CI safety)",
+        help="fail instead of prompting; use in CI",
     )
     p.add_argument(
         "--no-allowlist",
@@ -210,6 +210,9 @@ def _install_command(
     if assume_yes:
         prompt_fn = lambda _current: True
     elif no_input or self_heal:
+        # --no-input is a prompt guard for CI. The current provider-ready /
+        # refuse-to-install path is non-interactive, but future prompts should
+        # route through this branch and fail fast instead of blocking on stdin.
         prompt_fn = lambda _current: False
     else:
         prompt_fn = _interactive_prompt

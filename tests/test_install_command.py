@@ -162,6 +162,14 @@ def _uninstall_argv(
 # Existing coverage, updated to stub the prereq check.
 # ---------------------------------------------------------------------------
 
+def test_install_help_documents_no_input(capsys):
+    with pytest.raises(SystemExit) as excinfo:
+        cli_mod.main(["install", "--help"])
+
+    assert excinfo.value.code == 0
+    assert "--no-input" in capsys.readouterr().out
+
+
 @pytest.mark.parametrize(
     ("codex_cli", "gemini_cli", "expected"),
     [
@@ -357,6 +365,38 @@ def test_install_with_no_providers_refuses_before_settings_mutation(
     assert not state_path.exists()
 
 
+def test_install_no_input_refuses_with_no_providers(
+    tmp_path: Path,
+    monkeypatch,
+    capsys,
+):
+    settings_path, claude_json_path, state_path, bin_dir = _fresh_paths(tmp_path)
+    codex_binary = _make_executable(bin_dir / "claude-anyteam")
+    _make_executable(bin_dir / "claude-anyteam-spawn-shim")
+
+    _stub_prereq_found(monkeypatch, stub_providers=False)
+    _stub_provider_checks(
+        monkeypatch,
+        codex_cli=_codex_cli_missing(),
+        codex_signed_in=False,
+        gemini_cli=_gemini_cli_missing(),
+        gemini_signed_in=False,
+    )
+    monkeypatch.setattr(cli_mod.sys, "argv", [str(codex_binary)])
+
+    exit_code = cli_mod.main(
+        _install_argv(settings_path, claude_json_path, state_path, "--no-input")
+    )
+
+    stdout = capsys.readouterr().out
+    assert exit_code == installer_mod.INSTALL_ERROR_EXIT_NO_PROVIDER
+    assert "Refusing to install — no provider is ready." in stdout
+    assert "claude-anyteam install --force-empty" in stdout
+    assert not settings_path.exists()
+    assert not claude_json_path.exists()
+    assert not state_path.exists()
+
+
 def test_install_with_both_providers_signed_in_updates_settings(
     tmp_path: Path,
     monkeypatch,
@@ -381,6 +421,36 @@ def test_install_with_both_providers_signed_in_updates_settings(
 
     stdout = capsys.readouterr().out
     assert "Ready: Codex 0.124.0 · Gemini 0.39.0." in stdout
+    assert "Refusing to install" not in stdout
+    assert settings_path.exists()
+
+
+def test_install_no_input_with_ready_provider_updates_settings(
+    tmp_path: Path,
+    monkeypatch,
+    capsys,
+):
+    settings_path, claude_json_path, state_path, bin_dir = _fresh_paths(tmp_path)
+    codex_binary = _make_executable(bin_dir / "claude-anyteam")
+    _make_executable(bin_dir / "claude-anyteam-spawn-shim")
+
+    _stub_prereq_found(monkeypatch, stub_providers=False)
+    _stub_provider_checks(
+        monkeypatch,
+        codex_cli=_codex_cli_ready(signed_in=True),
+        codex_signed_in=True,
+        gemini_cli=_gemini_cli_missing(),
+        gemini_signed_in=False,
+    )
+    monkeypatch.setattr(installer_mod.shutil, "which", lambda name: None)
+    monkeypatch.setattr(cli_mod.sys, "argv", [str(codex_binary)])
+
+    assert cli_mod.main(
+        _install_argv(settings_path, claude_json_path, state_path, "--no-input")
+    ) == 0
+
+    stdout = capsys.readouterr().out
+    assert "Ready: Codex 0.124.0 · Gemini (not installed)." in stdout
     assert "Refusing to install" not in stdout
     assert settings_path.exists()
 
