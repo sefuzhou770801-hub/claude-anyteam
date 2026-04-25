@@ -145,3 +145,20 @@ This audit should be re-run and updated once #17 and #18 merge. The §"Per-point
 Plan A Kimi support is **structurally complete and empirically correct against the runtime findings**. 7 of 8 critical findings ship cleanly; finding #5 ships with an accepted prompt-discipline mitigation that needs a follow-up shared-module change. The PR is **not yet merge-ready** because the user-facing surface (Tasks #17 and #18) still describes Kimi as "next" while the code routes it as "today". Once those land — and after one more refresh of this audit — the branch should be ready to file as the third first-class adapter behind Codex and Gemini.
 
 Plan B (`kimi acp`) is deferred behind a single empirical blocker (stdout buffering when stdin stays open) that has a tractable investigation path. The Phase-2 follow-up should reuse Gemini's `jsonrpc_stdio.py` framing — protocol versions match at 1.
+
+## Follow-up issue
+
+**Wrapper exposes 7 `mcp_anyteam_*` shadow tools beyond the 6 protocol tools. Kimi mitigates via prompt discipline. Follow-up: add `--protocol-only` flag to `wrapper_server.py` for Kimi adapter use.**
+
+Decision (`team-lead`, 2026-04-25): ship v1 as option (a) — accept the deviation. Rationale recorded with the decision:
+
+- The shadow tools work correctly via the wrapper if a model accidentally calls one. The failure mode is "model uses `mcp_anyteam_shell` instead of Kimi's native `Shell`" — degraded ergonomics, not a correctness bug.
+- A `wrapper_server.py --protocol-only` flag is a shared-module change that affects the Codex and Gemini callers too. That generalization deserves its own PR with explicit cross-backend consensus, not a tail-end addition to the Kimi PR.
+- Prompt discipline (Kimi prompts mention only the 6 bare protocol tools and steer the model to Kimi built-ins) plus the `WRAPPER_TOOL_NAMES` counter constant are sufficient v1 guards.
+
+Action carried into the follow-up issue (to file after this PR merges):
+
+- Add `--protocol-only` (or `--enabled-tools <NAMES>`) flag to `src/claude_anyteam/wrapper_server.py`.
+- Wire `backends/kimi/invoke.py:write_mcp_config` to pass `--protocol-only` by default (using the existing `WRAPPER_TOOL_NAMES = frozenset({...})` set as the canonical six).
+- Decide and document whether Codex and Gemini should also opt into `--protocol-only` once the flag exists, or stay on the full 13-tool surface for backward compatibility.
+- Add wrapper-server tests asserting that `--protocol-only` actually narrows the exposed tool set, plus a Kimi adapter test asserting the flag is present in the MCP config it writes.
