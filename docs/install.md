@@ -1,8 +1,8 @@
 # Install
 
-`claude-anyteam install` writes the shared spawn shim once. After restart, `codex-*` teammate names route to Codex and `gemini-*` names route to Gemini CLI. The installer checks terminal-multiplexer support as a hard prerequisite and reports Codex/Gemini CLI availability as non-blocking warnings.
+`claude-anyteam install` writes the shared spawn shim once. After restart, `codex-*` teammate names route to Codex, `gemini-*` names route to Gemini CLI, and `kimi-*` names route to Kimi CLI. The installer checks terminal-multiplexer support as a hard prerequisite and reports Codex/Gemini/Kimi CLI availability as non-blocking warnings.
 
-Install/authenticate Codex for `codex-*` teammates and Gemini CLI for `gemini-*` teammates (`gemini` once for OAuth, or use `GEMINI_API_KEY`/Vertex auth for unattended runs).
+Install/authenticate Codex for `codex-*` teammates, Gemini CLI for `gemini-*` teammates (`gemini` once for OAuth, or use `GEMINI_API_KEY`/Vertex auth for unattended runs), and Kimi CLI for `kimi-*` teammates (`pip install kimi-cli` or the upstream installer, then `kimi login`).
 
 # Install
 
@@ -18,7 +18,8 @@ That's the entire install. The npm installer:
 - Installs the `claude-anyteam` Python tool via `uv tool install`
 - Delegates the config writes to `claude-anyteam install --assume-yes`, which:
   - Verifies a terminal multiplexer (tmux or psmux) is on PATH — see [configuration.md](configuration.md#teammate-display-mode) for install commands
-  - Checks whether the OpenAI Codex CLI (`codex`) is on PATH and at version 0.120+. If it's missing or below the floor, prints a warning with install/upgrade instructions and a `codex` sign-in hint — but **does not** block the install (codex-* teammates need it at runtime, not at install time). If `codex` is present but its version can't be parsed, the installer falls back to a plain "Detected Codex CLI at …" line and proceeds without a warning. If both tmux and `codex` are missing, both warnings are emitted together before the tmux halt
+  - Checks whether the OpenAI Codex CLI (`codex`) is on PATH and at version 0.120+. If it's missing or below the floor, prints a warning with install/upgrade instructions and a `codex` sign-in hint — but **does not** block the install (codex-* teammates need it at runtime, not at install time). If `codex` is present but its version can't be parsed, the installer falls back to a plain "Detected Codex CLI at …" line and proceeds without a warning.
+  - Checks whether Gemini CLI (`gemini`) and Kimi CLI (`kimi`) are on PATH and authenticated. Missing CLIs or missing sign-in print provider-specific walkthroughs but do not block the install.
   - Writes the Claude Code hook (`CLAUDE_CODE_TEAMMATE_COMMAND`) and binary path to `~/.claude/settings.json`
   - Sets `teammateMode="tmux"` in `~/.claude.json` (prompts before overwriting a non-default value)
   - Records what it changed in `~/.claude/plugins/data/claude-anyteam-claude-anyteam/install-state.json` so uninstall can cleanly reverse it
@@ -33,7 +34,8 @@ The Python installer writes these env vars to `~/.claude/settings.json`:
   "env": {
     "CLAUDE_CODE_TEAMMATE_COMMAND": "/absolute/path/to/claude-anyteam-spawn-shim",
     "CLAUDE_ANYTEAM_BINARY": "/absolute/path/to/claude-anyteam",
-    "CLAUDE_ANYTEAM_GEMINI_BINARY": "/absolute/path/to/gemini-anyteam"
+    "CLAUDE_ANYTEAM_GEMINI_BINARY": "/absolute/path/to/gemini-anyteam",
+    "CLAUDE_ANYTEAM_KIMI_BINARY": "/absolute/path/to/kimi-anyteam"
   }
 }
 ```
@@ -42,6 +44,7 @@ When Agent Teams mode spawns a teammate, Claude Code invokes `$CLAUDE_CODE_TEAMM
 
 - `codex-*` → dispatches to the `claude-anyteam` adapter (Codex)
 - `gemini-*` → dispatches to the `gemini-anyteam` adapter (Gemini CLI)
+- `kimi-*` → dispatches to the `kimi-anyteam` adapter (Kimi CLI)
 - Anything else → forwards to native `claude` (unchanged)
 
 Every step is reversible. `claude-anyteam uninstall` cleanly removes the env vars, reverts `teammateMode` to whatever was there before (or removes the key if install added it from scratch), and deletes the state file plus its plugin-data directory if they're now empty.
@@ -50,7 +53,7 @@ Every step is reversible. `claude-anyteam uninstall` cleanly removes the env var
 
 `claude-anyteam uninstall` is designed to leave no trace of what the installer wrote. It touches the same three files the installer did:
 
-- `~/.claude/settings.json` — removes the `CLAUDE_CODE_TEAMMATE_COMMAND`, `CLAUDE_ANYTEAM_BINARY`, and `CLAUDE_ANYTEAM_GEMINI_BINARY` keys from the `env` block. Any other keys you have there (including unrelated `env` entries like `KEEP_ME`) are preserved. If `settings.json` didn't exist before install and is now empty after our removal, the file is deleted.
+- `~/.claude/settings.json` — removes the `CLAUDE_CODE_TEAMMATE_COMMAND`, `CLAUDE_ANYTEAM_BINARY`, `CLAUDE_ANYTEAM_GEMINI_BINARY`, and `CLAUDE_ANYTEAM_KIMI_BINARY` keys from the `env` block. Any other keys you have there (including unrelated `env` entries like `KEEP_ME`) are preserved. If `settings.json` didn't exist before install and is now empty after our removal, the file is deleted.
 - `~/.claude.json` — reverts `teammateMode` to whatever it held before install, or removes the key entirely if install added it from scratch. If the file didn't exist before install and is now empty, it is deleted.
 - `~/.claude/plugins/data/claude-anyteam-claude-anyteam/install-state.json` — deleted. The enclosing plugin-data directory is removed too, but only if empty. Parent directories (`~/.claude/plugins/data/`, `~/.claude/plugins/`) are left alone.
 
@@ -77,7 +80,7 @@ claude plugin install claude-anyteam@claude-anyteam
 
 All paths write the same settings. Pick whichever fits your workflow.
 
-Installing the plugin also gives Claude a plugin-provided `/claude-anyteam:help` skill, so the assistant can explain that `codex-<name>` teammates route to Codex and `gemini-<name>` teammates route to Gemini CLI, that `~/.claude/settings.json` is already wired by the installer, and that the GitHub repo is the source of truth.
+Installing the plugin also gives Claude a plugin-provided `/claude-anyteam:help` skill, so the assistant can explain that `codex-<name>` teammates route to Codex, `gemini-<name>` teammates route to Gemini CLI, and `kimi-<name>` teammates route to Kimi CLI, that `~/.claude/settings.json` is already wired by the installer, and that the GitHub repo is the source of truth.
 
 ## Headless / persistent teammates
 
@@ -104,6 +107,22 @@ setsid nohup gemini-anyteam \
   --cwd /path/to/workspace \
   --model gemini-2.5-pro --effort medium --backend acp \
   </dev/null >/tmp/gemini-acp.stdout 2>/tmp/gemini-acp.stderr & disown
+
+# Kimi (headless backend; default model is kimi-code/kimi-for-coding)
+setsid nohup kimi-anyteam \
+  --team my-team --name kimi-architect \
+  --cwd /path/to/workspace \
+  --model kimi-code/kimi-for-coding --effort high \
+  </dev/null >/tmp/kimi-architect.stdout 2>/tmp/kimi-architect.stderr & disown
 ```
 
 This mode is fully messageable (inbox, task claim, peer replies) but does NOT render in Claude Code's TUI presence line — TUI visibility requires the leader-spawn path via the shim. Useful when you want the adapter running continuously regardless of the Claude Code session lifecycle.
+
+## Kimi v1 limitations
+
+Kimi support is first-class for Agent Teams routing, task claiming, inbox polling, and TUI presence, but its CLI surface is different from Codex:
+
+- no Codex App Server path and no live `turn/steer`; steer is next-prompt only
+- no `--output-schema`; the adapter embeds schemas in prompts and validates in Python
+- stream-json emits per-message `assistant` / `tool` NDJSON, not Codex or Gemini event shapes
+- MCP wrapper tools use bare names (`send_message`, `task_update`), not Gemini's `mcp_anyteam_*` names
