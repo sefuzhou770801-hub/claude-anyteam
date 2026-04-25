@@ -8,15 +8,13 @@ from typing import Literal
 
 from claude_anyteam.config import _pick
 from claude_anyteam.env import (
-    COLOR_ENV, CWD_ENV, LEGACY_COLOR_ENV, LEGACY_CWD_ENV, LEGACY_MODEL_ENV,
-    LEGACY_NAME_ENV, LEGACY_PLAN_MODE_ENV, LEGACY_POLL_ENV, LEGACY_TEAM_ENV,
-    MODEL_ENV, NAME_ENV, PLAN_MODE_ENV, POLL_ENV, TEAM_ENV, env_first,
+    COLOR_ENV, CWD_ENV, EFFORT_ENV, MODEL_ENV, NAME_ENV, PLAN_MODE_ENV,
+    POLL_ENV, TEAM_ENV, env_first,
 )
 
 KIMI_BINARY_ENV = "CLAUDE_ANYTEAM_KIMI_BINARY"
 KIMI_HOME_ENV = "CLAUDE_ANYTEAM_KIMI_HOME"
 KIMI_BACKEND_ENV = "CLAUDE_ANYTEAM_KIMI_BACKEND"
-KIMI_EFFORT_ENV = "CLAUDE_ANYTEAM_KIMI_EFFORT"
 KIMI_THINKING_ENV = "CLAUDE_ANYTEAM_KIMI_THINKING"
 
 KIMI_THINKING = frozenset({"on", "off", "auto"})
@@ -42,24 +40,24 @@ class KimiSettings:
 
 def from_env(overrides: dict[str, object] | None = None) -> KimiSettings:
     overrides = overrides or {}
-    team_name = _pick(overrides, "team_name", env_first(os.environ, TEAM_ENV, LEGACY_TEAM_ENV))
-    agent_name = _pick(overrides, "agent_name", env_first(os.environ, NAME_ENV, LEGACY_NAME_ENV))
+    team_name = _pick(overrides, "team_name", env_first(os.environ, TEAM_ENV))
+    agent_name = _pick(overrides, "agent_name", env_first(os.environ, NAME_ENV))
     if not team_name:
         raise ValueError(f"team_name is required (CLI --team or {TEAM_ENV})")
     if not agent_name:
         raise ValueError(f"agent_name is required (CLI --name or {NAME_ENV})")
 
-    cwd_raw = _pick(overrides, "cwd", env_first(os.environ, CWD_ENV, LEGACY_CWD_ENV, default=os.getcwd()))
+    cwd_raw = _pick(overrides, "cwd", env_first(os.environ, CWD_ENV, default=os.getcwd()))
     cwd = Path(str(cwd_raw)).resolve()
     if not cwd.is_absolute():
         raise ValueError(f"cwd must be absolute, got {cwd}")
 
-    poll = float(_pick(overrides, "poll_interval_s", env_first(os.environ, POLL_ENV, LEGACY_POLL_ENV, default="1.5")))
-    color = str(_pick(overrides, "color", env_first(os.environ, COLOR_ENV, LEGACY_COLOR_ENV, default="cyan")))
-    plan_raw = str(_pick(overrides, "plan_mode_required", env_first(os.environ, PLAN_MODE_ENV, LEGACY_PLAN_MODE_ENV, default="false")))
+    poll = float(_pick(overrides, "poll_interval_s", env_first(os.environ, POLL_ENV, default="1.5")))
+    color = str(_pick(overrides, "color", env_first(os.environ, COLOR_ENV, default="cyan")))
+    plan_raw = str(_pick(overrides, "plan_mode_required", env_first(os.environ, PLAN_MODE_ENV, default="false")))
     plan_mode_required = plan_raw.lower() in {"1", "true", "yes", "on"}
-    model_raw = _pick(overrides, "model", env_first(os.environ, MODEL_ENV, LEGACY_MODEL_ENV))
-    effort_raw = _pick(overrides, "effort", os.environ.get(KIMI_EFFORT_ENV))
+    model_raw = _pick(overrides, "model", env_first(os.environ, MODEL_ENV))
+    effort_raw = _pick(overrides, "effort", env_first(os.environ, EFFORT_ENV))
     effort = str(effort_raw) if effort_raw else None
     if effort is not None and effort not in KIMI_EFFORTS:
         raise ValueError(
