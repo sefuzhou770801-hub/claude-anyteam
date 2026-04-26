@@ -255,7 +255,12 @@ export async function installTool({ uvPath, pythonPath }) {
   }
 
   const { env, binDir } = await resolveToolBinDir({ uvPath });
-  const args = ['--no-config', 'tool', 'install', '--force'];
+  // --prerelease=allow: claude-anyteam currently pins fastmcp==3.0.0b1 (a
+  // beta), and uv refuses pre-release deps by default. Without this flag the
+  // install fails on a clean machine with the cryptic uv "no solution found"
+  // dependency-resolver error. Until fastmcp ships a stable 3.x we always
+  // allow pre-releases for our own tool install.
+  const args = ['--no-config', 'tool', 'install', '--force', '--prerelease=allow'];
   if (pythonPath) {
     args.push('--python', pythonPath);
   }

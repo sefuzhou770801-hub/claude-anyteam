@@ -325,7 +325,7 @@ async function main() {
       }
       printFailure('TOOL INSTALL FAILED', [
         `${theme.symbols.error} ${theme.heading(`uv could not install ${TOOL_NAME}.`)}`,
-        `${theme.symbols.info} Command: ${theme.accent(formatCommand(uv.path, ['--no-config', 'tool', 'install', '--force', '--python', python.path, TOOL_NAME]))}`,
+        `${theme.symbols.info} Command: ${theme.accent(formatCommand(uv.path, ['--no-config', 'tool', 'install', '--force', '--prerelease=allow', '--python', python.path, TOOL_NAME]))}`,
         `${theme.symbols.info} Details: ${trimmedDetails(error) || 'No extra diagnostics.'}`,
       ]);
       return 1;
