@@ -319,6 +319,42 @@ def test_install_error_fields_for_provider_version_probe_failure(
     )
 
 
+def test_install_collects_version_probe_diagnostics_for_all_providers():
+    diagnostics = installer_mod._collect_soft_diagnostics(
+        installer_mod.CodexCliCheck(
+            found=True,
+            path=Path("/usr/local/bin/codex"),
+            version=None,
+            raw_output="codex exploded",
+            version_probe_error="`codex --version` exited with code 2.",
+        ),
+        installer_mod.GeminiCliCheck(
+            found=True,
+            path=Path("/usr/local/bin/gemini"),
+            version=None,
+            raw_output="gemini exploded",
+            version_probe_error="`gemini --version` output was not recognizable: wat",
+        ),
+        installer_mod.KimiCliCheck(
+            found=True,
+            path=Path("/usr/local/bin/kimi"),
+            version=None,
+            raw_output="kimi exploded",
+            version_probe_error="`kimi info` printed no version.",
+        ),
+    )
+
+    assert [diagnostic.title for diagnostic in diagnostics] == [
+        "Found `codex` but couldn't read its version",
+        "Found `gemini` but couldn't read its version",
+        "Found `kimi` but couldn't read its version",
+    ]
+    assert all(diagnostic.severity == "soft" for diagnostic in diagnostics)
+    assert "codex --version" in diagnostics[0].action
+    assert "gemini --version" in diagnostics[1].action
+    assert "kimi info" in diagnostics[2].action
+
+
 def test_install_error_fields_for_provider_not_signed_in(tmp_path: Path, monkeypatch):
     settings_path, claude_json_path, state_path, bin_dir = _ready_install_paths(tmp_path, monkeypatch)
     codex_cli = _codex_cli_ready(signed_in=False)
