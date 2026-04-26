@@ -115,7 +115,12 @@ export function manualInstallLines({ includePython = false } = {}) {
     if (includePython) {
       lines.push('PowerShell: winget install Python.Python.3.12');
     }
-    lines.push('PowerShell: winget install Astral-sh.uv');
+    lines.push('PowerShell (preferred): winget install Astral-sh.uv');
+    // winget ships on Windows 10 1709+ but corporate-locked images often
+    // strip it. The official Astral PowerShell installer is the universal
+    // fallback — it doesn't require winget or admin and writes uv to the
+    // same %USERPROFILE%\.local\bin location uv tools expect.
+    lines.push('PowerShell (no winget):  irm https://astral.sh/uv/install.ps1 | iex');
     lines.push('Then rerun from PowerShell: npx --yes --package claude-anyteam claude-anyteam-setup');
     return lines;
   }
@@ -284,7 +289,7 @@ export async function detectUv() {
 
 export async function installUv() {
   if (process.platform === 'win32') {
-    throw new Error('Automatic uv installation uses the official shell installer on macOS/Linux. On Windows, install uv from PowerShell with: winget install Astral-sh.uv');
+    throw new Error('Automatic uv installation uses the official shell installer on macOS/Linux. On Windows, install uv from PowerShell with: `winget install Astral-sh.uv` (preferred) — or, if winget is unavailable on your image, `irm https://astral.sh/uv/install.ps1 | iex` (no admin or winget required).');
   }
   const workingDir = await fs.mkdtemp(path.join(tmpdir(), 'claude-anyteam-uv-'));
   const scriptPath = path.join(workingDir, 'install-uv.sh');
