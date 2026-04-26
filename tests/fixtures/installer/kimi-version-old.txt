@@ -1,0 +1,5 @@
+# synthesized: `kimi info` output when the installed Kimi CLI is below the supported version.
+kimi-cli version: 0.9.8
+config path: /home/alice/.config/kimi/config.toml
+auth status: signed in
+update available: install kimi-cli 1.0.0 or newer before rerunning claude-anyteam install
