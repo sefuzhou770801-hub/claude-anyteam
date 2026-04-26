@@ -1,0 +1,9 @@
+# synthesized: claude-anyteam Python installer prereq failure when tmux/psmux is missing.
+claude-anyteam needs a terminal multiplexer before it can install teammate mode.
+
+No supported multiplexer was found on PATH for linux.
+Install tmux, then rerun `claude-anyteam install --assume-yes`.
+
+Suggested commands:
+  Debian/Ubuntu: sudo apt-get update && sudo apt-get install -y tmux
+  macOS/Homebrew: brew install tmux

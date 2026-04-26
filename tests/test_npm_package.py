@@ -36,6 +36,7 @@ def test_npm_installer_files_exist() -> None:
         NPM_DIR / 'bin' / 'setup.js',
         NPM_DIR / 'lib' / 'art.js',
         NPM_DIR / 'lib' / 'detect.js',
+        NPM_DIR / 'lib' / 'error-translator.js',
     ]
 
     for path in expected:
@@ -114,6 +115,20 @@ def test_npm_detect_logic_keeps_uv_tool_resolution_deterministic() -> None:
     assert "tool', 'dir', '--bin'" in detect_source
     assert 'cwd: toolWorkingDir()' in detect_source
     assert 'function toolWorkingDir()' in detect_source
+
+
+def test_npm_installer_contains_windows_hardening_paths() -> None:
+    setup_source = (NPM_DIR / 'bin' / 'setup.js').read_text(encoding='utf-8')
+    detect_source = (NPM_DIR / 'lib' / 'detect.js').read_text(encoding='utf-8')
+
+    assert 'formatPowerShellArgument' in detect_source
+    assert 'PYTHONUTF8' in detect_source
+    assert 'ensureWindowsLongPaths' in detect_source
+    assert 'checkWindowsSymlinkPrivilege' in detect_source
+    assert 'WINDOWS_SYMLINK_PERMISSION' in detect_source
+    assert 'Windows Defender PowerShell' in detect_source
+    assert 'Windows single-terminal compatibility' in setup_source
+    assert 'PowerShell as Administrator' in setup_source
 
 
 def test_pyproject_version_matches_npm_version() -> None:

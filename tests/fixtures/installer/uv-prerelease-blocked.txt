@@ -1,0 +1,11 @@
+# captured: user-reported uv stderr from https://github.com/JonathanRosado/claude-anyteam installer failure.
+× No solution found when resolving dependencies:
+  ╰─▶ Because there is no version of fastmcp==3.0.0b1 and all versions of
+      claude-anyteam depend on fastmcp==3.0.0b1, we can conclude that all
+      versions of claude-anyteam cannot be used.
+      And because you require claude-anyteam, we can conclude that your
+      requirements are unsatisfiable.
+
+      hint: `fastmcp` was requested with a pre-release marker (e.g.,
+      fastmcp==3.0.0b1), but pre-releases weren't enabled (try:
+      `--prerelease=allow`)

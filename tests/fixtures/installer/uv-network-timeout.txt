@@ -1,0 +1,5 @@
+# synthesized: uv download retry failure while resolving/installing claude-anyteam from PyPI.
+error: Failed to download: `https://files.pythonhosted.org/packages/61/3c/claude_anyteam-0.5.0-py3-none-any.whl`
+  Caused by: Request failed after 3 retries
+  Caused by: error sending request for url (https://files.pythonhosted.org/packages/61/3c/claude_anyteam-0.5.0-py3-none-any.whl)
+  Caused by: operation timed out

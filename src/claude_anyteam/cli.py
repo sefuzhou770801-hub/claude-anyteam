@@ -14,7 +14,7 @@ from typing import TextIO
 
 from . import logger
 from .config import from_env
-from .installer import (
+from claude_anyteam.installer import (
     INSTALL_ERROR_EXIT_NO_PROVIDER,
     InstallError,
     format_install_message,
@@ -23,6 +23,46 @@ from .installer import (
     uninstall as uninstall_settings,
 )
 from .loop import run
+
+
+def _bold(text: str) -> str:
+    return f"\033[1m{text}\033[0m"
+
+
+def _strip_ansi(text: str) -> str:
+    # Tiny local stripper: enough for our own bold escape.
+    return text.replace("\033[1m", "").replace("\033[0m", "")
+
+
+def _render_box(title: str, lines: list[str]) -> str:
+    rows = [title, *lines]
+    width = max((len(_strip_ansi(row)) for row in rows), default=0)
+
+    def fill(row: str) -> str:
+        return row + " " * (width - len(_strip_ansi(row)))
+
+    return "\n".join(
+        [
+            f"╭{'─' * (width + 2)}╮",
+            f"│ {fill(rows[0])} │",
+            f"├{'─' * (width + 2)}┤",
+            *(f"│ {fill(row)} │" for row in rows[1:]),
+            f"╰{'─' * (width + 2)}╯",
+        ]
+    )
+
+
+def _format_install_error(exc: InstallError) -> str:
+    lines: list[str] = [_bold(exc.title)]
+    lines.extend(exc.explanation.splitlines() or [""])
+    for idx, line in enumerate(exc.action.splitlines() or [""]):
+        prefix = "Next step: " if idx == 0 else "           "
+        lines.append(f"{prefix}{line}")
+    lines.append(f"Severity: {exc.severity}")
+    if exc.details:
+        lines.append("Raw details (for debugging):")
+        lines.extend(f"  {line}" for line in exc.details.splitlines())
+    return _render_box("INSTALL FAILED", lines)
 
 
 def _build_run_parser() -> argparse.ArgumentParser:
@@ -238,10 +278,14 @@ def _install_command(
             provider_status_callback=_print_provider_status,
             force_empty=force_empty or self_heal,
             no_allowlist=no_allowlist,
+            register_plugin=True,
         )
     except InstallError as exc:
         exit_code = getattr(exc, "cli_exit_code", 2)
-        print(str(exc), file=stream if exit_code == INSTALL_ERROR_EXIT_NO_PROVIDER else sys.stderr)
+        print(
+            _format_install_error(exc),
+            file=stream if exit_code == INSTALL_ERROR_EXIT_NO_PROVIDER else sys.stderr,
+        )
         return exit_code
 
     print(
@@ -266,7 +310,7 @@ def _uninstall_command(
             state_path=state_path,
         )
     except InstallError as exc:
-        print(str(exc), file=sys.stderr)
+        print(_format_install_error(exc), file=sys.stderr)
         return getattr(exc, "cli_exit_code", 2)
 
     print(format_uninstall_message(result), file=stream)

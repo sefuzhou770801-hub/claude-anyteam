@@ -1,0 +1,7 @@
+# synthesized: Python installer failure when ~/.claude/settings.json cannot be written by the current user.
+Traceback (most recent call last):
+  File "/home/alice/.local/share/uv/tools/claude-anyteam/lib/python3.12/site-packages/claude_anyteam/installer.py", line 442, in _atomic_write_json
+    os.replace(tmp_path, path)
+PermissionError: [Errno 13] Permission denied: '/home/alice/.claude/settings.json'
+
+claude_anyteam.installer.InstallError: Could not write /home/alice/.claude/settings.json: Permission denied

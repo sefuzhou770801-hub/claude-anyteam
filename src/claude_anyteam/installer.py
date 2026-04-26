@@ -11,6 +11,7 @@ from __future__ import annotations
 
 import contextlib
 import copy
+import errno
 import json
 import os
 import re
@@ -85,6 +86,7 @@ INSTALL_ERROR_EXIT_CORRUPTED_STATE = 4
 INSTALL_ERROR_EXIT_NO_PROVIDER = 5
 
 ProviderState = Literal["READY", "NEEDS_SIGNIN", "NEEDS_UPGRADE", "MISSING"]
+InstallSeverity = Literal["blocker", "hard-stop", "soft"]
 
 
 @dataclass(frozen=True)
@@ -121,22 +123,7 @@ class GeminiCliCheck:
     missing_capabilities: tuple[str, ...] = ()
     signed_in: bool = False
     signed_in_detail: str | None = None
-
-
-@dataclass(frozen=True)
-class KimiCliCheck:
-    """Result of probing for the Moonshot Kimi Code CLI on PATH.
-
-    Kimi CLI is required at runtime for kimi-* teammates but is not a hard
-    install prereq. v1 treats any parseable Kimi CLI version as acceptable.
-    """
-
-    found: bool
-    path: Path | None
-    version: str | None
-    raw_output: str | None
-    signed_in: bool = False
-    signed_in_detail: str | None = None
+    version_probe_error: str | None = None
 
 
 @dataclass(frozen=True)
@@ -153,6 +140,7 @@ class CodexCliCheck:
     raw_output: str | None  # raw `codex --version` stdout, retained for debugging
     signed_in: bool = False
     signed_in_detail: str | None = None
+    version_probe_error: str | None = None
 
 
 @dataclass(frozen=True)
@@ -161,6 +149,19 @@ class AuthCheck:
 
     signed_in: bool
     signed_in_detail: str | None = None
+
+
+@dataclass(frozen=True)
+class KimiCliCheck:
+    """Result of probing for the Kimi CLI on PATH."""
+
+    found: bool
+    path: Path | None
+    version: str | None
+    raw_output: str | None
+    signed_in: bool = False
+    signed_in_detail: str | None = None
+    version_probe_error: str | None = None
 
 
 @dataclass(frozen=True)
@@ -253,6 +254,7 @@ class InstallResult:
     codex_status: ProviderStatus | None = None
     gemini_status: ProviderStatus | None = None
     kimi_status: ProviderStatus | None = None
+    diagnostics: tuple["InstallError", ...] = ()
     force_empty_used: bool = False
     permissions_allow_added: tuple[str, ...] = ()
     permissions_allow_managed: tuple[str, ...] = ()
@@ -291,12 +293,288 @@ class UninstallResult:
 
 
 class InstallError(ValueError):
-    """Raised when install/uninstall cannot safely update Claude settings.
+    """Structured installer diagnostic.
+
+    Most instances are raised, but soft diagnostics may also be attached to a
+    successful :class:`InstallResult` so the CLI can warn and keep going.
 
     Some install failures warrant a distinct CLI exit code (e.g. user declining
     the teammateMode overwrite prompt). Callers may attach a ``cli_exit_code``
     attribute on the exception instance to steer the CLI; default is 2.
     """
+
+    title: str
+    explanation: str
+    action: str
+    severity: InstallSeverity
+    details: str | None
+
+    def __init__(
+        self,
+        message: str | None = None,
+        *,
+        title: str | None = None,
+        explanation: str | None = None,
+        action: str | None = None,
+        severity: InstallSeverity = "hard-stop",
+        details: str | None = None,
+        cli_exit_code: int | None = None,
+    ) -> None:
+        legacy = (message or "").strip()
+        if title is None:
+            title = legacy.splitlines()[0] if legacy else "Install failed"
+        if explanation is None:
+            rest = "\n".join(legacy.splitlines()[1:]).strip()
+            explanation = rest or legacy or "The installer could not finish safely."
+        if action is None:
+            action = "Re-run `claude-anyteam install` after fixing the problem."
+        self.title = title
+        self.explanation = explanation
+        self.action = action
+        self.severity = severity
+        self.details = details if details is not None else (legacy or None)
+        if cli_exit_code is not None:
+            self.cli_exit_code = cli_exit_code  # type: ignore[attr-defined]
+        super().__init__(self.as_plain_text())
+
+    def as_plain_text(self, *, include_details: bool = True) -> str:
+        lines = [
+            self.title,
+            self.explanation,
+            f"Next step: {self.action}",
+            f"Severity: {self.severity}",
+        ]
+        if include_details and self.details:
+            lines.extend(["Raw details:", self.details])
+        return "\n".join(lines)
+
+    def __str__(self) -> str:
+        return self.as_plain_text()
+
+
+def _quote_command_path(path: Path) -> str:
+    text = _display_path(path)
+    if _is_windows_platform():
+        escaped = text.replace("'", "''")
+        return f"'{escaped}'"
+    escaped = text.replace("'", "'\"'\"'")
+    return f"'{escaped}'"
+
+
+def _is_windows_platform() -> bool:
+    return sys.platform in ("win32", "cygwin")
+
+
+def _display_path(path: Path) -> str:
+    try:
+        resolved = path.expanduser().resolve()
+        home = Path.home().expanduser().resolve()
+        rel = resolved.relative_to(home)
+        if _is_windows_platform():
+            return "~\\" + "\\".join(rel.parts)
+        return f"~/{rel.as_posix()}"
+    except Exception:
+        text = str(path)
+        return text.replace("/", "\\") if _is_windows_platform() else text
+
+
+def _path_for_action(path: Path) -> str:
+    return _quote_command_path(path)
+
+
+def _rename_action(path: Path, *, command: str) -> str:
+    backup = path.with_name(f"{path.name}.broken")
+    if _is_windows_platform():
+        return (
+            "From PowerShell, run "
+            f"`Move-Item -LiteralPath {_path_for_action(path)} -Destination {_path_for_action(backup)}; {command}`."
+        )
+    return f"Run `mv {_path_for_action(path)} {_path_for_action(backup)}` then `{command}`."
+
+
+def _settings_corrupt_error(path: Path, details: str, *, not_json: bool = False) -> InstallError:
+    if not_json:
+        explanation = (
+            "Your Claude Code settings file is corrupted (not valid JSON). "
+            "Quick fix: rename it to settings.json.broken so the installer can write a fresh one. "
+            "We'll preserve your old file so you can copy-paste anything you need."
+        )
+    else:
+        explanation = (
+            "Your Claude Code settings file has an unexpected shape, so the installer will not edit it. "
+            "Rename it to settings.json.broken so the installer can write a fresh one, then copy back anything you need."
+        )
+    return InstallError(
+        title="Your Claude Code settings file is corrupted",
+        explanation=explanation,
+        action=_rename_action(path, command="claude-anyteam install"),
+        severity="hard-stop",
+        details=details,
+    )
+
+
+def _settings_read_error(path: Path, exc: BaseException) -> InstallError:
+    return InstallError(
+        title="Can't read your Claude Code settings file",
+        explanation=(
+            f"The installer could not read {_display_path(path)}, so it stopped before making changes."
+        ),
+        action="Check file ownership and permissions, then run `claude-anyteam install` again.",
+        severity="hard-stop",
+        details=f"{type(exc).__name__}: {exc}",
+    )
+
+
+def _settings_write_error(path: Path, exc: BaseException) -> InstallError:
+    is_locked = isinstance(exc, OSError) and exc.errno in {
+        errno.EACCES,
+        errno.EPERM,
+        getattr(errno, "EBUSY", 16),
+    }
+    if is_locked:
+        if _is_windows_platform():
+            return InstallError(
+                title="Can't write your Claude Code settings file",
+                explanation=(
+                    f"Can't write to {_display_path(path)} — Claude Code, OneDrive, or antivirus may be locking it."
+                ),
+                action=(
+                    "Close Claude Code and retry from PowerShell with `claude-anyteam install`. "
+                    "If it keeps happening, add your `.claude` folder to Windows Defender exclusions."
+                ),
+                severity="hard-stop",
+                details=f"{type(exc).__name__}: {exc}",
+            )
+        return InstallError(
+            title="Can't write your Claude Code settings file",
+            explanation=(
+                f"Can't write to {_display_path(path)} — likely Claude Code is running. "
+                "Quit Claude Code and re-run."
+            ),
+            action="Quit Claude Code, then run `claude-anyteam install` again.",
+            severity="hard-stop",
+            details=f"{type(exc).__name__}: {exc}",
+        )
+    return InstallError(
+        title="Couldn't write your Claude Code settings file",
+        explanation="The installer could not save your Claude Code settings, so it stopped before making unsafe changes.",
+        action="Check file permissions, then run `claude-anyteam install` again.",
+        severity="hard-stop",
+        details=f"{type(exc).__name__}: {exc}",
+    )
+
+
+def _claude_json_corrupt_error(path: Path, details: str, *, not_json: bool = False) -> InstallError:
+    if not_json:
+        explanation = (
+            f"Your Claude Code config ({_display_path(path)}) is corrupted. "
+            "Same recovery as settings: rename and let the installer write a fresh one."
+        )
+    else:
+        explanation = (
+            f"Your Claude Code config ({_display_path(path)}) has an unexpected shape, so the installer will not edit it. "
+            "Rename it and let the installer write a fresh one."
+        )
+    return InstallError(
+        title="Your Claude Code config file is corrupted",
+        explanation=explanation,
+        action=_rename_action(path, command="claude-anyteam install"),
+        severity="hard-stop",
+        details=details,
+    )
+
+
+def _claude_json_read_error(path: Path, exc: BaseException) -> InstallError:
+    return InstallError(
+        title="Can't read your Claude Code config file",
+        explanation=(
+            f"The installer could not read {_display_path(path)}, so teammateMode was not changed."
+        ),
+        action="Check file ownership and permissions, then run `claude-anyteam install` again.",
+        severity="hard-stop",
+        details=f"{type(exc).__name__}: {exc}",
+    )
+
+
+def _claude_json_write_error(path: Path, exc: BaseException) -> InstallError:
+    if _is_windows_platform():
+        return InstallError(
+            title="Couldn't write your Claude Code config file",
+            explanation=(
+                f"The installer could not save {_display_path(path)}, so teammateMode was not changed. "
+                "Claude Code, OneDrive, or antivirus may be locking the file."
+            ),
+            action=(
+                "Close Claude Code and retry from PowerShell with `claude-anyteam install`. "
+                "If it keeps happening, add your Claude config directory to Windows Defender exclusions."
+            ),
+            severity="hard-stop",
+            details=f"{type(exc).__name__}: {exc}",
+        )
+    return InstallError(
+        title="Couldn't write your Claude Code config file",
+        explanation=(
+            f"The installer could not save {_display_path(path)}, so teammateMode was not changed."
+        ),
+        action="Quit Claude Code, then run `claude-anyteam install` again.",
+        severity="hard-stop",
+        details=f"{type(exc).__name__}: {exc}",
+    )
+
+
+def _state_error(path: Path, details: str, *, cli_exit_code: int | None = None) -> InstallError:
+    return InstallError(
+        title="claude-anyteam's install receipt is corrupted",
+        explanation=(
+            "The installer could not read the receipt it uses to safely undo changes. "
+            "It stopped rather than guessing what to remove."
+        ),
+        action=f"Inspect or delete `{_display_path(path)}`, then run `claude-anyteam uninstall` again.",
+        severity="hard-stop",
+        details=details,
+        cli_exit_code=cli_exit_code,
+    )
+
+
+def _state_read_error(path: Path, exc: BaseException) -> InstallError:
+    return _state_error(
+        path,
+        f"Could not read {path}: {type(exc).__name__}: {exc}",
+        cli_exit_code=INSTALL_ERROR_EXIT_CORRUPTED_STATE,
+    )
+
+
+def _provider_version_probe_error(
+    binary: str,
+    provider_name: str,
+    details: str,
+    *,
+    probe_command: str | None = None,
+) -> InstallError:
+    command = probe_command or f"{binary} --version"
+    return InstallError(
+        title=f"Found `{binary}` but couldn't read its version",
+        explanation=(
+            f"Found `{binary}` on PATH but it didn't return a recognizable version. "
+            "The installer will warn but continue — you may need to upgrade or reinstall the provider CLI."
+        ),
+        action=f"Upgrade or reinstall {provider_name}, then run `{command}` again.",
+        severity="soft",
+        details=details,
+    )
+
+
+def _plugin_registration_error(details: str) -> InstallError:
+    return InstallError(
+        title="Couldn't register the Claude Code plugin",
+        explanation=(
+            "Couldn't register the claude-anyteam plugin with Claude Code. "
+            "The installer will continue — the spawn shim still works without plugin registration."
+        ),
+        action="To install manually later: `claude plugin install JonathanRosado/claude-anyteam`.",
+        severity="soft",
+        details=details,
+    )
 
 
 
@@ -381,13 +659,23 @@ def discover_managed_paths(
 
     if resolved_binary is None:
         raise InstallError(
-            "Unable to resolve the claude-anyteam binary. Ensure the package is "
-            "installed and the console script is on PATH."
+            title="claude-anyteam is not on PATH",
+            explanation=(
+                "The installer could not find the claude-anyteam command it needs to write into Claude Code settings."
+            ),
+            action="Run `uv tool install --reinstall claude-anyteam`, then run `claude-anyteam install` again.",
+            severity="blocker",
+            details="Unable to resolve the claude-anyteam binary.",
         )
     if resolved_shim is None:
         raise InstallError(
-            "Unable to resolve the claude-anyteam-spawn-shim binary. Ensure the "
-            "package is installed and the console script is on PATH."
+            title="claude-anyteam's spawn shim is not on PATH",
+            explanation=(
+                "The installer could not find the spawn shim that Claude Code uses to launch routed teammates."
+            ),
+            action="Run `uv tool install --reinstall claude-anyteam`, then run `claude-anyteam install` again.",
+            severity="blocker",
+            details="Unable to resolve the claude-anyteam-spawn-shim binary.",
         )
 
     return ManagedPaths(
@@ -409,10 +697,15 @@ def _load_settings(path: Path) -> tuple[dict[str, Any], bool]:
     try:
         raw = json.loads(path.read_text(encoding="utf-8"))
     except json.JSONDecodeError as exc:
-        raise InstallError(f"{path} is not valid JSON: {exc}") from exc
+        raise _settings_corrupt_error(path, f"{path} is not valid JSON: {exc}", not_json=True) from exc
+    except OSError as exc:
+        raise _settings_read_error(path, exc) from exc
 
     if not isinstance(raw, dict):
-        raise InstallError(f"{path} must contain a JSON object at the top level.")
+        raise _settings_corrupt_error(
+            path,
+            f"{path} must contain a JSON object at the top level.",
+        )
 
     return raw, True
 
@@ -427,12 +720,16 @@ def _env_block(settings: dict[str, Any], *, path: Path, create: bool) -> dict[st
         settings["env"] = env
 
     if not isinstance(env, dict):
-        raise InstallError(f"{path} has an 'env' entry, but it is not a JSON object.")
+        raise _settings_corrupt_error(
+            path,
+            f"{path} has an 'env' entry, but it is not a JSON object.",
+        )
 
     for key, value in env.items():
         if not isinstance(key, str) or not isinstance(value, str):
-            raise InstallError(
-                f"{path} has a non-string entry under 'env'; refusing to overwrite it."
+            raise _settings_corrupt_error(
+                path,
+                f"{path} has a non-string entry under 'env'; refusing to overwrite it.",
             )
 
     return env
@@ -452,8 +749,9 @@ def _permissions_block(
         settings["permissions"] = permissions
 
     if not isinstance(permissions, dict):
-        raise InstallError(
-            f"{path} has a 'permissions' entry, but it is not a JSON object."
+        raise _settings_corrupt_error(
+            path,
+            f"{path} has a 'permissions' entry, but it is not a JSON object.",
         )
 
     return permissions
@@ -477,13 +775,15 @@ def _permissions_allow_list(
         permissions["allow"] = allow
 
     if not isinstance(allow, list):
-        raise InstallError(
-            f"{path} has a 'permissions.allow' entry, but it is not a JSON array."
+        raise _settings_corrupt_error(
+            path,
+            f"{path} has a 'permissions.allow' entry, but it is not a JSON array.",
         )
 
     if not all(isinstance(entry, str) for entry in allow):
-        raise InstallError(
-            f"{path} has a non-string entry under 'permissions.allow'; refusing to overwrite it."
+        raise _settings_corrupt_error(
+            path,
+            f"{path} has a non-string entry under 'permissions.allow'; refusing to overwrite it.",
         )
 
     return allow
@@ -519,13 +819,12 @@ def _state_permissions_allow_added_strict(
         return ()
     raw = state.get("permissions_allow_added_by_anyteam")
     if not isinstance(raw, list) or not all(isinstance(entry, str) for entry in raw):
-        err = InstallError(
+        raise _state_error(
+            state_path,
             f"{state_path} has a malformed 'permissions_allow_added_by_anyteam' value; "
-            "refusing to touch permissions.allow.\n"
-            f"Inspect or delete the state file manually, then re-run uninstall."
+            "refusing to touch permissions.allow.",
+            cli_exit_code=INSTALL_ERROR_EXIT_CORRUPTED_STATE,
         )
-        err.cli_exit_code = INSTALL_ERROR_EXIT_CORRUPTED_STATE  # type: ignore[attr-defined]
-        raise err
     recommended = set(RECOMMENDED_ALLOWLIST_ENTRIES)
     return tuple(entry for entry in raw if entry in recommended)
 
@@ -630,7 +929,12 @@ def _atomic_write_json(path: Path, payload: dict[str, Any]) -> None:
 
 
 def _write_settings(path: Path, settings: dict[str, Any]) -> None:
-    _atomic_write_json(path, settings)
+    try:
+        _atomic_write_json(path, settings)
+    except InstallError:
+        raise
+    except Exception as exc:
+        raise _settings_write_error(path, exc) from exc
 
 
 def _load_claude_json(path: Path) -> tuple[dict[str, Any], bool]:
@@ -641,16 +945,26 @@ def _load_claude_json(path: Path) -> tuple[dict[str, Any], bool]:
     try:
         raw = json.loads(path.read_text(encoding="utf-8"))
     except json.JSONDecodeError as exc:
-        raise InstallError(f"{path} is not valid JSON: {exc}") from exc
+        raise _claude_json_corrupt_error(path, f"{path} is not valid JSON: {exc}", not_json=True) from exc
+    except OSError as exc:
+        raise _claude_json_read_error(path, exc) from exc
 
     if not isinstance(raw, dict):
-        raise InstallError(f"{path} must contain a JSON object at the top level.")
+        raise _claude_json_corrupt_error(
+            path,
+            f"{path} must contain a JSON object at the top level.",
+        )
 
     return raw, True
 
 
 def _write_claude_json(path: Path, payload: dict[str, Any]) -> None:
-    _atomic_write_json(path, payload)
+    try:
+        _atomic_write_json(path, payload)
+    except InstallError:
+        raise
+    except Exception as exc:
+        raise _claude_json_write_error(path, exc) from exc
 
 
 
@@ -670,16 +984,35 @@ def _load_state(path: Path) -> dict[str, Any] | None:
     try:
         raw = json.loads(path.read_text(encoding="utf-8"))
     except json.JSONDecodeError as exc:
-        raise InstallError(f"{path} is not valid JSON: {exc}") from exc
+        raise _state_error(path, f"{path} is not valid JSON: {exc}", cli_exit_code=INSTALL_ERROR_EXIT_CORRUPTED_STATE) from exc
+    except OSError as exc:
+        raise _state_read_error(path, exc) from exc
 
     if not isinstance(raw, dict):
-        raise InstallError(f"{path} must contain a JSON object at the top level.")
+        raise _state_error(
+            path,
+            f"{path} must contain a JSON object at the top level.",
+            cli_exit_code=INSTALL_ERROR_EXIT_CORRUPTED_STATE,
+        )
 
     return raw
 
 
 def _write_state(path: Path, state: dict[str, Any]) -> None:
-    _atomic_write_json(path, state)
+    try:
+        _atomic_write_json(path, state)
+    except InstallError:
+        raise
+    except Exception as exc:
+        raise InstallError(
+            title="Couldn't write claude-anyteam's install receipt",
+            explanation=(
+                "The installer could not save the receipt it uses to safely uninstall later."
+            ),
+            action="Check file permissions, then run `claude-anyteam install` again.",
+            severity="hard-stop",
+            details=f"{type(exc).__name__}: {exc}",
+        ) from exc
 
 
 def _delete_state(path: Path) -> bool:
@@ -688,6 +1021,14 @@ def _delete_state(path: Path) -> bool:
         return True
     except FileNotFoundError:
         return False
+    except OSError as exc:
+        raise InstallError(
+            title="Couldn't remove claude-anyteam's install receipt",
+            explanation="The uninstaller could not remove its receipt after applying the recorded changes.",
+            action=f"Check permissions on `{_display_path(path)}`, then run `claude-anyteam uninstall` again.",
+            severity="hard-stop",
+            details=f"{type(exc).__name__}: {exc}",
+        ) from exc
 
 
 
@@ -707,23 +1048,19 @@ def _platform_name() -> str:
 
 
 def _check_terminal_multiplexer() -> PrereqCheck:
-    """Checks PATH for tmux (Linux/mac) or psmux/tmux (Windows).
+    """Checks PATH for tmux on Linux/macOS.
 
-    Windows prefers ``psmux`` (handles Claude Code's POSIX-shaped teammate-spawn
-    command via a PowerShell translator), but accepts a plain ``tmux`` binary if
-    the user installed one via Cygwin / MSYS2 / WSL-interop.
-
-    Linux and macOS require ``tmux`` on PATH — there is no reason to look for
-    psmux there.
+    Windows has no equivalent multiplexer requirement in the Python installer:
+    the install proceeds and Claude Code/plugin behavior decides how to spawn
+    panes there. This keeps Windows users from being blocked by a Unix-only
+    prerequisite.
     """
     platform = _platform_name()
 
     if platform == "windows":
-        candidates = ("psmux", "tmux")
-    else:
-        candidates = ("tmux",)
+        return PrereqCheck(found=True, binary=None, path=None, platform=platform)
 
-    for name in candidates:
+    for name in ("tmux",):
         found_path = shutil.which(name)
         if found_path:
             return PrereqCheck(
@@ -747,8 +1084,7 @@ def _install_instructions(platform: str) -> str:
         return "  macOS (Homebrew): brew install tmux"
     if platform == "windows":
         return (
-            "  Recommended: winget install psmux\n"
-            "  Also supported: choco install psmux / scoop install psmux"
+            "  Windows: no tmux install is required. Agent Teams uses single-terminal mode."
         )
     return "  Install tmux via your platform's package manager."
 
@@ -772,6 +1108,9 @@ KIMI_CLI_INSTALL_COMMAND = "uv tool install --python 3.13 kimi-cli"
 KIMI_CLI_CURL_INSTALL_COMMAND = "curl -LsSf https://code.kimi.com/install.sh | bash"
 KIMI_CLI_DOCS_URL = "https://moonshotai.github.io/kimi-cli/"
 KIMI_CLI_VERSION_TIMEOUT_S = 5
+CLAUDE_PLUGIN_BINARY = "claude"
+CLAUDE_PLUGIN_INSTALL_COMMAND = "claude plugin install JonathanRosado/claude-anyteam"
+CLAUDE_PLUGIN_INSTALL_TIMEOUT_S = 20
 CODEX_AUTH_PATH = Path(".codex") / "auth.json"
 GEMINI_OAUTH_CREDS_PATH = Path(".gemini") / "oauth_creds.json"
 GEMINI_GOOGLE_ACCOUNTS_PATH = Path(".gemini") / "google_accounts.json"
@@ -834,6 +1173,7 @@ def _check_codex_cli() -> CodexCliCheck:
     resolved = Path(found_path).resolve()
     raw: str | None = None
     version: str | None = None
+    version_probe_error: str | None = None
     try:
         completed = subprocess.run(
             [str(resolved), "--version"],
@@ -842,13 +1182,24 @@ def _check_codex_cli() -> CodexCliCheck:
             timeout=CODEX_CLI_VERSION_TIMEOUT_S,
             check=False,
         )
-    except (OSError, subprocess.SubprocessError):
+    except (OSError, subprocess.SubprocessError) as exc:
         completed = None
+        version_probe_error = f"`{CODEX_CLI_BINARY} --version` failed to run: {exc}"
 
-    if completed is not None and completed.returncode == 0:
-        raw = (completed.stdout or "").strip() or None
-        if raw:
+    if completed is not None:
+        raw = ((completed.stdout or "") or (completed.stderr or "")).strip() or None
+        if completed.returncode != 0:
+            version_probe_error = (
+                f"`{CODEX_CLI_BINARY} --version` exited with code {completed.returncode}."
+            )
+        elif raw:
             version = _parse_cli_version(raw)
+            if version is None:
+                version_probe_error = (
+                    f"`{CODEX_CLI_BINARY} --version` output was not recognizable: {raw}"
+                )
+        else:
+            version_probe_error = f"`{CODEX_CLI_BINARY} --version` printed no version."
 
     try:
         signed_in, signed_in_detail = _check_codex_signin(resolved)
@@ -862,6 +1213,7 @@ def _check_codex_cli() -> CodexCliCheck:
         raw_output=raw,
         signed_in=signed_in,
         signed_in_detail=signed_in_detail,
+        version_probe_error=version_probe_error,
     )
 
 
@@ -1058,7 +1410,7 @@ def _codex_cli_warning(check: CodexCliCheck) -> str | None:
     actually confirm the floor was violated.
     """
     min_version = _min_version_str()
-    signin_hint = f"  After installing, run `{CODEX_CLI_BINARY}` once to sign in."
+    signin_hint = f"  After installing, run `{CODEX_CLI_BINARY} login` to sign in."
     docs_line = f"  Setup guide: {CODEX_CLI_DOCS_URL}"
 
     if not check.found:
@@ -1128,6 +1480,7 @@ def _check_gemini_cli() -> GeminiCliCheck:
     resolved = Path(found_path).resolve()
     raw = None
     version = None
+    version_probe_error: str | None = None
     try:
         completed = subprocess.run(
             [str(resolved), "--version"],
@@ -1136,11 +1489,23 @@ def _check_gemini_cli() -> GeminiCliCheck:
             timeout=GEMINI_CLI_VERSION_TIMEOUT_S,
             check=False,
         )
-    except (OSError, subprocess.SubprocessError):
+    except (OSError, subprocess.SubprocessError) as exc:
         completed = None
-    if completed is not None and completed.returncode == 0:
+        version_probe_error = f"`{GEMINI_CLI_BINARY} --version` failed to run: {exc}"
+    if completed is not None:
         raw = ((completed.stdout or "") or (completed.stderr or "")).strip() or None
-        version = _parse_cli_version(raw or "")
+        if completed.returncode != 0:
+            version_probe_error = (
+                f"`{GEMINI_CLI_BINARY} --version` exited with code {completed.returncode}."
+            )
+        elif raw:
+            version = _parse_cli_version(raw or "")
+            if version is None:
+                version_probe_error = (
+                    f"`{GEMINI_CLI_BINARY} --version` output was not recognizable: {raw}"
+                )
+        else:
+            version_probe_error = f"`{GEMINI_CLI_BINARY} --version` printed no version."
 
     help_text = ""
     try:
@@ -1170,6 +1535,7 @@ def _check_gemini_cli() -> GeminiCliCheck:
         missing_capabilities=missing,
         signed_in=signed_in,
         signed_in_detail=signed_in_detail,
+        version_probe_error=version_probe_error,
     )
 
 
@@ -1249,7 +1615,7 @@ def _gemini_cli_warning(check: GeminiCliCheck) -> str | None:
             f"  claude-anyteam is installed, but gemini-* teammates will fail to launch\n"
             f"  until Gemini CLI is installed and authenticated. Add it with:\n"
             f"    {GEMINI_CLI_INSTALL_COMMAND}\n"
-            f"  After installing, run `{GEMINI_CLI_BINARY}` once to sign in, or configure GEMINI_API_KEY/Vertex auth.\n"
+            f"  After installing, run `{GEMINI_CLI_BINARY} login` to sign in, or configure GEMINI_API_KEY/Vertex auth.\n"
             f"  Setup guide: {GEMINI_CLI_DOCS_URL}"
         )
     if check.missing_capabilities:
@@ -1386,6 +1752,71 @@ def _any_provider_ready(*statuses: ProviderStatus) -> bool:
     return any(status.ready for status in statuses)
 
 
+def _collect_soft_diagnostics(
+    codex_cli: CodexCliCheck,
+    gemini_cli: GeminiCliCheck,
+    kimi_cli: KimiCliCheck,
+) -> tuple[InstallError, ...]:
+    diagnostics: list[InstallError] = []
+    if codex_cli.found and codex_cli.version_probe_error:
+        diagnostics.append(
+            _provider_version_probe_error(
+                CODEX_CLI_BINARY,
+                "Codex CLI",
+                codex_cli.version_probe_error,
+            )
+        )
+    if gemini_cli.found and gemini_cli.version_probe_error:
+        diagnostics.append(
+            _provider_version_probe_error(
+                GEMINI_CLI_BINARY,
+                "Gemini CLI",
+                gemini_cli.version_probe_error,
+            )
+        )
+    if kimi_cli.found and kimi_cli.version_probe_error:
+        diagnostics.append(
+            _provider_version_probe_error(
+                KIMI_CLI_BINARY,
+                "Kimi CLI",
+                kimi_cli.version_probe_error,
+                probe_command=f"{KIMI_CLI_BINARY} info",
+            )
+        )
+    return tuple(diagnostics)
+
+
+def _register_claude_plugin() -> InstallError | None:
+    claude = shutil.which(CLAUDE_PLUGIN_BINARY)
+    if not claude:
+        return _plugin_registration_error("`claude` was not found on PATH.")
+
+    try:
+        completed = subprocess.run(
+            [claude, "plugin", "install", "JonathanRosado/claude-anyteam"],
+            capture_output=True,
+            text=True,
+            timeout=CLAUDE_PLUGIN_INSTALL_TIMEOUT_S,
+            check=False,
+        )
+    except (OSError, subprocess.SubprocessError) as exc:
+        return _plugin_registration_error(f"{type(exc).__name__}: {exc}")
+
+    if completed.returncode == 0:
+        return None
+
+    details = "\n".join(
+        part
+        for part in (
+            f"`{CLAUDE_PLUGIN_INSTALL_COMMAND}` exited with code {completed.returncode}.",
+            (completed.stdout or "").strip(),
+            (completed.stderr or "").strip(),
+        )
+        if part
+    )
+    return _plugin_registration_error(details)
+
+
 # ---------------------------------------------------------------------------
 # teammateMode install/uninstall
 # ---------------------------------------------------------------------------
@@ -1425,8 +1856,9 @@ def install_teammate_mode(
     claude_json_created_by_anyteam = not existed
 
     if current is not None and not isinstance(current, str):
-        raise InstallError(
-            f"{claude_json_path} has a non-string {TEAMMATE_MODE_KEY!r} value; refusing to touch it."
+        raise _claude_json_corrupt_error(
+            claude_json_path,
+            f"{claude_json_path} has a non-string {TEAMMATE_MODE_KEY!r} value; refusing to touch it.",
         )
 
     def _build_state(original: str | None, set_by: bool) -> dict[str, Any]:
@@ -1492,13 +1924,19 @@ def install_teammate_mode(
 
     # Case 3: something else. Prompt before overwriting.
     if not prompt_fn(current):
-        err = InstallError(
-            f"Install aborted: existing {TEAMMATE_MODE_KEY}={current!r} in {claude_json_path}\n"
-            "  claude-anyteam needs teammateMode=\"tmux\" to route teammates through the pane backend.\n"
-            "  Re-run with --assume-yes to accept, or manually set teammateMode=\"tmux\" in ~/.claude.json."
+        raise InstallError(
+            title="Install stopped before changing teammate mode",
+            explanation=(
+                f"{_display_path(claude_json_path)} already has {TEAMMATE_MODE_KEY}={current!r}. "
+                "claude-anyteam needs teammateMode=\"tmux\" to route teammates through the pane backend."
+            ),
+            action="Re-run `claude-anyteam install --assume-yes` or manually set teammateMode=\"tmux\" in ~/.claude.json.",
+            severity="hard-stop",
+            details=(
+                f"Install aborted: existing {TEAMMATE_MODE_KEY}={current!r} in {claude_json_path}"
+            ),
+            cli_exit_code=INSTALL_ERROR_EXIT_PROMPT_DECLINED,
         )
-        err.cli_exit_code = INSTALL_ERROR_EXIT_PROMPT_DECLINED  # type: ignore[attr-defined]
-        raise err
 
     claude_json[TEAMMATE_MODE_KEY] = TEAMMATE_MODE_TARGET_VALUE
     _write_claude_json(claude_json_path, claude_json)
@@ -1557,13 +1995,12 @@ def uninstall_teammate_mode(
     if original is not None and not isinstance(original, str):
         # Corrupted state: refuse to touch anything, keep state file on disk for
         # the user to inspect. Bail with exit code 4 so scripts can differentiate.
-        err = InstallError(
+        raise _state_error(
+            state_path,
             f"{state_path} has a malformed 'teammateMode_original' value "
-            f"({type(original).__name__}: {original!r}); refusing to touch config.\n"
-            f"Inspect or delete the state file manually, then re-run uninstall."
+            f"({type(original).__name__}: {original!r}); refusing to touch config.",
+            cli_exit_code=INSTALL_ERROR_EXIT_CORRUPTED_STATE,
         )
-        err.cli_exit_code = INSTALL_ERROR_EXIT_CORRUPTED_STATE  # type: ignore[attr-defined]
-        raise err
 
     if not managed:
         # We didn't own the value — leave claude.json alone, delete state.
@@ -1603,6 +2040,16 @@ def uninstall_teammate_mode(
             except FileNotFoundError:
                 # Race with an external delete; treat as already-gone.
                 claude_json_removed = True
+            except OSError as exc:
+                raise InstallError(
+                    title="Couldn't remove your Claude Code config file",
+                    explanation=(
+                        f"The uninstaller tried to remove {_display_path(claude_json_path)} because claude-anyteam created it and it is now empty."
+                    ),
+                    action="Check file permissions, then run `claude-anyteam uninstall` again.",
+                    severity="hard-stop",
+                    details=f"{type(exc).__name__}: {exc}",
+                ) from exc
             # touched remains True — the file WAS modified (by deletion).
         else:
             _write_claude_json(claude_json_path, claude_json)
@@ -1656,9 +2103,11 @@ def install(
     codex_auth_check_fn: Callable[[], AuthCheck] | None = None,
     gemini_auth_check_fn: Callable[[], AuthCheck] | None = None,
     kimi_auth_check_fn: Callable[[], AuthCheck] | None = None,
+    plugin_registration_fn: Callable[[], InstallError | None] | None = None,
     provider_status_callback: Callable[[str], None] | None = None,
     force_empty: bool = False,
     no_allowlist: bool = False,
+    register_plugin: bool = False,
 ) -> InstallResult:
     """Full install: prereq check → env block write → teammateMode update.
 
@@ -1738,7 +2187,15 @@ def install(
         kimi_warning = _kimi_cli_warning(kimi_cli)
         if kimi_warning is not None:
             message = f"{message}\n\nAdditionally:\n{kimi_warning}"
-        raise InstallError(message)
+        raise InstallError(
+            title="A required terminal tool is missing",
+            explanation=(
+                "claude-anyteam needs tmux on Linux/macOS so teammates can appear in Claude Code panes."
+            ),
+            action=f"Install tmux for your OS, then run `claude-anyteam install` again.\n{_install_instructions(prereq.platform)}",
+            severity="blocker",
+            details=message,
+        )
 
     provider_preamble_rendered = False
     if provider_status_callback is not None:
@@ -1758,9 +2215,16 @@ def install(
             if provider_preamble_rendered
             else _format_no_provider_ready_message(codex_status, gemini_status, kimi_status)
         )
-        err = InstallError(message)
-        err.cli_exit_code = INSTALL_ERROR_EXIT_NO_PROVIDER  # type: ignore[attr-defined]
-        raise err
+        raise InstallError(
+            title="No provider CLI is signed in",
+            explanation=(
+                "claude-anyteam routes teammates through provider CLIs, and none of the detected providers are ready yet."
+            ),
+            action="Run `codex login`, `gemini login`, or `kimi login`, then run `claude-anyteam install` again.",
+            severity="blocker",
+            details=message,
+            cli_exit_code=INSTALL_ERROR_EXIT_NO_PROVIDER,
+        )
 
     paths = discover_managed_paths(
         settings_path=settings_path,
@@ -1860,6 +2324,16 @@ def install(
         )
         raise
 
+    diagnostics = _collect_soft_diagnostics(codex_cli, gemini_cli, kimi_cli)
+    if register_plugin:
+        registrar = plugin_registration_fn or _register_claude_plugin
+        try:
+            plugin_diagnostic = registrar()
+        except Exception as exc:
+            plugin_diagnostic = _plugin_registration_error(f"{type(exc).__name__}: {exc}")
+        if plugin_diagnostic is not None:
+            diagnostics = (*diagnostics, plugin_diagnostic)
+
     return InstallResult(
         paths=paths,
         created_file=not existed,
@@ -1876,6 +2350,7 @@ def install(
         codex_status=codex_status,
         gemini_status=gemini_status,
         kimi_status=kimi_status,
+        diagnostics=diagnostics,
         force_empty_used=force_empty,
         permissions_allow_added=permissions_allow_added,
         permissions_allow_managed=permissions_allow_managed,
@@ -1900,6 +2375,8 @@ def _rollback_settings_file(
             path.unlink()
         except FileNotFoundError:
             pass
+        except OSError as exc:
+            raise _settings_write_error(path, exc) from exc
         return
 
     _write_settings(path, pre_settings_snapshot)
@@ -2039,6 +2516,8 @@ def uninstall(
                 settings_file_removed = True
             except FileNotFoundError:
                 settings_file_removed = True
+            except OSError as exc:
+                raise _settings_write_error(path, exc) from exc
         else:
             _write_settings(path, settings)
 
@@ -2148,13 +2627,13 @@ def _format_provider_status_rows(
 ) -> str:
     statuses = _coerce_provider_statuses(first, *rest)
     return "\n".join(
-        [
+        (
             "Provider status",
             PROVIDER_STATUS_RULE,
             f"{'':<14}{'Installed?':<18}{'Signed in?'}",
             *(_provider_row(status) for status in statuses),
             PROVIDER_STATUS_RULE,
-        ]
+        )
     )
 
 
@@ -2334,6 +2813,17 @@ def _format_no_provider_ready_message(
     return "\n\n".join(block for block in blocks if block)
 
 
+def _format_soft_diagnostic(diagnostic: InstallError) -> str:
+    return "\n".join(
+        [
+            f"Warning: {diagnostic.title}",
+            diagnostic.explanation,
+            f"Next step: {diagnostic.action}",
+            f"Severity: {diagnostic.severity}",
+        ]
+    )
+
+
 def format_install_message(result: InstallResult, *, include_provider_status: bool = True) -> str:
     lines: list[str] = []
 
@@ -2349,17 +2839,25 @@ def format_install_message(result: InstallResult, *, include_provider_status: bo
         result.kimi_cli or KimiCliCheck(found=False, path=None, version=None, raw_output=None),
         result.kimi_auth or AuthCheck(signed_in=False),
     )
-
-    if codex_status is not None and gemini_status is not None and kimi_status is not None:
-        if include_provider_status:
-            lines.append(
-                _format_provider_preamble(
-                    codex_status,
-                    gemini_status,
-                    kimi_status,
-                    force_empty=result.force_empty_used,
-                )
+    if include_provider_status:
+        lines.append(
+            _format_provider_preamble(
+                codex_status,
+                gemini_status,
+                kimi_status,
+                force_empty=result.force_empty_used,
             )
+        )
+
+    if result.diagnostics:
+        lines.append(
+            "\n\n".join(_format_soft_diagnostic(diagnostic) for diagnostic in result.diagnostics)
+        )
+
+    if result.prereq is not None and result.prereq.platform == "windows":
+        lines.append(
+            "Windows note: tmux is skipped on Windows; Agent Teams works in single-terminal mode."
+        )
 
     receipt_lines = [
         f"Updated {result.paths.settings_path}",

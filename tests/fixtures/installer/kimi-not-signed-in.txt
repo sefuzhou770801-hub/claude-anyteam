@@ -1,0 +1,2 @@
+# synthesized: Kimi CLI auth failure when local credentials/session are unavailable.
+error: Kimi credentials not found at ~/.kimi/credentials/kimi-code.json. Run `kimi login`.

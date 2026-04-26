@@ -1,0 +1,5 @@
+# synthesized: uv cache directory permission failure during `uv tool install claude-anyteam`.
+error: failed to create directory `/home/alice/.cache/uv/archive-v0/.tmpQy4t9A`
+  Caused by: Permission denied (os error 13)
+
+hint: Check the owner and permissions of `/home/alice/.cache/uv`.

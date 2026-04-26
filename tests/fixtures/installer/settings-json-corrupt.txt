@@ -1,0 +1,11 @@
+# synthesized: Python installer traceback when ~/.claude/settings.json is malformed before install.
+Traceback (most recent call last):
+  File "C:\Users\Alice\AppData\Roaming\uv\tools\claude-anyteam\Lib\site-packages\claude_anyteam\installer.py", line 358, in _read_json_file
+    return json.loads(path.read_text(encoding="utf-8"))
+           ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+  File "C:\Program Files\Python312\Lib\json\__init__.py", line 346, in loads
+    return _default_decoder.decode(s)
+           ^^^^^^^^^^^^^^^^^^^^^^^^^^
+json.decoder.JSONDecodeError: Expecting property name enclosed in double quotes: line 4 column 3 (char 68)
+
+claude_anyteam.installer.InstallError: C:\Users\Alice\.claude\settings.json is not valid JSON. Fix the file, then rerun `claude-anyteam install`.

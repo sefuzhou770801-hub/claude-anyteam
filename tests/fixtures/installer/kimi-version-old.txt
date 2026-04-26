@@ -1,0 +1,2 @@
+# synthesized: stale `kimi info` version output from an installed but unsupported Kimi CLI.
+kimi-cli version: 0.9.5

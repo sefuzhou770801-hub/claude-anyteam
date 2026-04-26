@@ -1,0 +1,4 @@
+# synthesized: uv interpreter resolution failure for the Python version requested by setup.js.
+error: No interpreter found for Python 3.13 in managed installations or search path
+
+hint: A managed Python download is available, but Python downloads are disabled for this invocation.

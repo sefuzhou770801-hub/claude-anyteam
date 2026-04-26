@@ -1,0 +1,4 @@
+# synthesized: shell/Node stderr when the Claude Code CLI binary is missing during plugin registration.
+/bin/sh: 1: claude: not found
+error: Command failed: claude plugin marketplace add JonathanRosado/claude-anyteam
+Claude Code CLI was not found on PATH, so the plugin install step was skipped.
