@@ -98,6 +98,8 @@ def _backend_run(
     s = state.settings
     if s.backend == "acp":
         raise NotImplementedError("Plan B deferred to follow-up PR")
+    if ephemeral:
+        resume_session_id = None
     kwargs = {
         "cwd": s.cwd,
         "schema": schema,
@@ -136,6 +138,7 @@ def _main_loop(state: KimiLoopState) -> None:
                 try:
                     pio.send_idle_notification(s.team_name, s.agent_name)
                     idle_last_sent_at = now
+                    logger.info("kimi.idle.sent")
                 except Exception as e:
                     logger.warn("kimi.idle.send_fail", error=str(e))
         time.sleep(s.poll_interval_s)
@@ -225,14 +228,23 @@ def _steer_prefix_for_task(state: KimiLoopState, task: Any) -> str:
 def _handle_prose(state: KimiLoopState, msg: Any) -> None:
     s = state.settings
     sender = getattr(msg, "from_", "unknown")
+    logger.info("kimi.inbox.prose", sender=sender, summary=getattr(msg, "summary", None))
     prompt = prompts.prose_reply_prompt(sender=sender, body=msg.text, agent_name=s.agent_name, team_name=s.team_name)
     reply: str | None = None
+    result = None
     try:
         result = _backend_run(state, prompt, ephemeral=True)
         if result.exit_code == 0 and result.last_message:
             reply = result.last_message
     except Exception as e:
         logger.warn("kimi.prose.crash", sender=sender, error=str(e))
+    # Skip the canned fallback when the model already delivered the reply
+    # via the send_message MCP tool — Kimi often returns no final text in
+    # that case (last_message=""), and a second message would contradict
+    # the real one.
+    if reply is None and result is not None and result.exit_code == 0 and getattr(result, "tool_call_events", 0) > 0:
+        logger.info("kimi.prose.delivered_via_tool", sender=sender, tool_calls=result.tool_call_events)
+        return
     if reply is None:
         reply = "I received your message, but the Kimi adapter could not generate a reply."
     try:
@@ -248,12 +260,14 @@ def _handle_shutdown(state: KimiLoopState, payload: ShutdownRequestIn) -> None:
         return
     state.seen_shutdown_request_ids.add(req_id)
     if state.in_flight_task is not None:
+        logger.info("kimi.shutdown.reject", request_id=req_id, in_flight=state.in_flight_task)
         try:
             pio.send_shutdown_response(s.team_name, s.agent_name, req_id, approve=False, feedback=f"in-flight task #{state.in_flight_task}")
         except Exception as e:
             logger.warn("kimi.shutdown.response_fail", error=str(e))
         state.shutdown_requested = True
         return
+    logger.info("kimi.shutdown.approve", request_id=req_id)
     try:
         pio.send_shutdown_response(s.team_name, s.agent_name, req_id, approve=True)
     except Exception as e:
@@ -369,6 +383,7 @@ def _find_and_claim(state: KimiLoopState):
         try:
             claimed = pio.claim_task(s.team_name, t.id, s.agent_name, active_form=f"Running kimi on task #{t.id}")
             state.in_flight_task = claimed.id
+            logger.info("kimi.task.claimed", task_id=claimed.id, subject=claimed.subject)
             return claimed
         except ValueError:
             continue
@@ -395,20 +410,6 @@ def _blocked(all_tasks: list, t) -> bool:
     return any((by_id.get(bid) is not None and by_id[bid].status not in ("completed", "deleted")) for bid in t.blocked_by)
 
 
-def _is_permission_blocked(result: Any) -> bool:
-    return any(
-        isinstance(ev, dict) and ev.get("type") == "permission_blocked"
-        for ev in getattr(result, "events", []) or []
-    )
-
-
-def _should_drop_session_after_failure(result: Any) -> bool:
-    if getattr(result, "exit_code", None) == 124:
-        return True
-    error = getattr(result, "error", None)
-    return isinstance(error, str) and "stopReason 'cancelled'" in error
-
-
 def _execute_task(state: KimiLoopState, task) -> None:
     s = state.settings
     schema = load_schema(headless_invoke.TASK_COMPLETE_SCHEMA)
@@ -421,29 +422,21 @@ def _execute_task(state: KimiLoopState, task) -> None:
         prompt += "\n\n# Output contract\n" + inline_schema_prompt_fragment(schema)
         if attempt == 2:
             prompt += "\n\nPRIOR ATTEMPT FAILED: return ONLY the JSON object matching the schema."
-        result = _backend_run(state, prompt, schema=headless_invoke.TASK_COMPLETE_SCHEMA, resume_session_id=state.kimi_session_id, ephemeral=False, task_id=str(task.id))
+        try:
+            result = _backend_run(state, prompt, schema=headless_invoke.TASK_COMPLETE_SCHEMA, resume_session_id=state.kimi_session_id, ephemeral=False, task_id=str(task.id))
+        except Exception as exc:
+            # Mirrors codex/loop.py:672-680 — a subprocess crash inside the
+            # adapter (OSError, FileNotFoundError, anything from invoke) must
+            # not propagate to the main loop and kill the adapter process.
+            logger.warn("kimi.task.crash", task_id=task.id, attempt=attempt, error=str(exc))
+            _mark_blocked(state, task, reason=f"Kimi invocation crashed: {exc}")
+            state.in_flight_task = None
+            return
         if result.exit_code == 0 and result.structured is not None:
+            if result.session_id and state.kimi_session_id is None:
+                logger.info("kimi.task.session_captured", session_id=result.session_id)
             if result.session_id:
                 state.kimi_session_id = result.session_id
-            break
-        if _is_permission_blocked(result):
-            logger.warn(
-                "kimi.task.permission_blocked",
-                task_id=task.id,
-                session_id=state.kimi_session_id or result.session_id,
-                error=result.error,
-            )
-            state.kimi_session_id = None
-            break
-        if _should_drop_session_after_failure(result):
-            logger.warn(
-                "kimi.task.session_dropped_after_cancel",
-                task_id=task.id,
-                session_id=state.kimi_session_id or result.session_id,
-                exit_code=result.exit_code,
-                error=result.error,
-            )
-            state.kimi_session_id = None
             break
         if result.session_id:
             state.kimi_session_id = result.session_id
@@ -455,17 +448,46 @@ def _execute_task(state: KimiLoopState, task) -> None:
     summary_text = result.structured.get("summary") or "(no summary)"
     try:
         pio.update_task(s.team_name, task.id, status="completed")
+    except Exception as e:
+        logger.warn("kimi.task.complete_fail", task_id=task.id, error=str(e))
+        state.in_flight_task = None
+        return
+    try:
         # Backwards-compatible protocol field name; see limitations doc.
         pio.send_task_complete(s.team_name, s.agent_name, task_id=task.id, files_changed=files_changed, summary_text=summary_text, codex_exit_code=result.exit_code)
     except Exception as e:
-        logger.warn("kimi.task.complete_fail", task_id=task.id, error=str(e))
+        logger.warn("kimi.task.complete_msg_fail", task_id=task.id, error=str(e))
+    logger.info("kimi.task.completed", task_id=task.id, files=len(files_changed))
     state.in_flight_task = None
 
 
 def _mark_blocked(state: KimiLoopState, task, reason: str) -> None:
     s = state.settings
     try:
-        pio.update_task(s.team_name, task.id, active_form=f"blocked: {reason[:80]}", metadata={"blocked_reason": reason, "blocked_by": s.agent_name})
+        current = pio.get_task(s.team_name, task.id)
+        if getattr(current, "status", None) == "completed":
+            logger.info(
+                "kimi.task.block_skip_already_completed",
+                task_id=task.id,
+                reason_would_have_been=reason[:120],
+            )
+            return
+    except Exception as e:
+        logger.warn("kimi.task.block_precheck_fail", task_id=task.id, error=str(e))
+        # Fall through to the mutation; precheck failing is not reason enough
+        # to silently abandon a real failure report.
+
+    try:
+        pio.update_task(
+            s.team_name,
+            task.id,
+            active_form=f"blocked: {reason[:80]}",
+            metadata={"blocked_reason": reason, "blocked_by": s.agent_name},
+        )
+    except Exception as e:
+        logger.warn("kimi.task.block_update_fail", task_id=task.id, error=str(e))
+
+    try:
         pio.send_task_blocked(s.team_name, s.agent_name, task_id=task.id, reason=reason)
     except Exception as e:
-        logger.warn("kimi.task.block_fail", task_id=task.id, error=str(e))
+        logger.warn("kimi.task.block_msg_fail", task_id=task.id, error=str(e))
