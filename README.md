@@ -56,7 +56,7 @@ alice            → native Claude (unchanged)
 
 Codex-, Gemini-, and Kimi-prefixed names appear in your TUI presence line exactly like native teammates. Single-terminal mode or tmux — both work.
 
-Provider CLIs are runtime prerequisites for their prefixes: install/authenticate Codex for `codex-*`, Gemini for `gemini-*`, and Kimi for `kimi-*` (`pip install kimi-cli` or the upstream installer, then `kimi login`). The probed Kimi default user-facing model slug is `kimi-code/kimi-for-coding` (`Kimi-k2.6`, 262k context).
+Provider CLIs are runtime prerequisites for their prefixes: install/authenticate Codex for `codex-*`, Gemini for `gemini-*`, and Kimi for `kimi-*` (`uv tool install --python 3.13 kimi-cli` or the upstream installer, then `kimi login`). The probed Kimi default user-facing model slug is `kimi-code/kimi-for-coding` (`Kimi-k2.6`, 262k context).
 
 ## Why it feels native
 
@@ -128,7 +128,7 @@ Codex, Gemini, and Kimi are shipping. Everything in "coming next" is on the same
 - Node 18+ (for the npm installer; not required at runtime)
 - OpenAI Codex CLI 0.120+ on PATH for `codex-*` teammates
 - Gemini CLI on PATH for `gemini-*` teammates
-- Kimi CLI on PATH for `kimi-*` teammates (`pip install kimi-cli` or upstream installer + `kimi login`)
+- Kimi CLI on PATH for `kimi-*` teammates (`uv tool install --python 3.13 kimi-cli` or upstream installer + `kimi login`)
 - Claude Code 2.1+ with Agent Teams mode
 - Terminal multiplexer on PATH (tmux or psmux) — see [configuration.md](docs/configuration.md#teammate-display-mode)
 

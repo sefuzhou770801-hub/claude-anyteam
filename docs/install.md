@@ -2,7 +2,7 @@
 
 `claude-anyteam install` writes the shared spawn shim once. After restart, `codex-*` teammate names route to Codex, `gemini-*` names route to Gemini CLI, and `kimi-*` names route to Kimi CLI. The installer checks terminal-multiplexer support as a hard prerequisite and reports Codex/Gemini/Kimi CLI availability as non-blocking warnings.
 
-Install/authenticate Codex for `codex-*` teammates, Gemini CLI for `gemini-*` teammates (`gemini` once for OAuth, or use `GEMINI_API_KEY`/Vertex auth for unattended runs), and Kimi CLI for `kimi-*` teammates (`pip install kimi-cli` or the upstream installer, then `kimi login`).
+Install/authenticate Codex for `codex-*` teammates, Gemini CLI for `gemini-*` teammates (`gemini` once for OAuth, or use `GEMINI_API_KEY`/Vertex auth for unattended runs), and Kimi CLI for `kimi-*` teammates (`uv tool install --python 3.13 kimi-cli` or the upstream installer, then `kimi login`).
 
 # Install
 
