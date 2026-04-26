@@ -1,6 +1,6 @@
 # Architecture
 
-claude-anyteam is now a multi-backend spawn-shim adapter. The same Claude Code teammate pane path provides TUI presence; backend routing is selected by teammate name (`codex-*` or `gemini-*`). Codex retains its app-server path for mid-turn steering. Gemini currently uses headless CLI Plan A and documents non-parity in `docs/gemini-adapter-limitations.md`.
+claude-anyteam is now a multi-backend spawn-shim adapter. The same Claude Code teammate pane path provides TUI presence; backend routing is selected by teammate name (`codex-*`, `gemini-*`, or `kimi-*`). Codex retains its app-server path for mid-turn steering. Gemini and Kimi both use CLI-native transports with documented non-parity where their CLIs differ from Codex.
 
 # Architecture
 
@@ -28,6 +28,7 @@ claude-anyteam speaks the contract directly. It reads your inbox, claims tasks, 
 │  • inspects agent name                  │
 │  • routes `codex-*` → Codex adapter     │
 │  • routes `gemini-*` → Gemini adapter   │
+│  • routes `kimi-*` → Kimi adapter       │
 │  • forwards anything else → native claude
 └──────────────┬──────────────────────────┘
                │
@@ -45,11 +46,12 @@ claude-anyteam speaks the contract directly. It reads your inbox, claims tasks, 
 │  Backend CLI                            │
 │  • Codex: app-server or exec resume     │
 │  • Gemini: headless stream-json CLI     │
+│  • Kimi: headless stream-json CLI       │
 │  • shared MCP wrapper for team tools    │
 └─────────────────────────────────────────┘
 ```
 
-Each layer has one job. The shim is a dispatcher. The adapter is the protocol implementation. Codex or Gemini handles the backend reasoning based on the teammate name prefix.
+Each layer has one job. The shim is a dispatcher. The adapter is the protocol implementation. Codex, Gemini, or Kimi handles the backend reasoning based on the teammate name prefix.
 
 ## Backend invocation paths
 
@@ -65,14 +67,27 @@ Gemini teammates currently run through the Gemini CLI in headless mode: `gemini 
 
 Gemini does not yet have Codex App Server parity: ACP / mid-turn steering and `thread/fork`-style cross-task memory are documented limitations. See [Gemini adapter limitations](gemini-adapter-limitations.md).
 
+### Kimi path (headless stream-json)
+
+Kimi teammates run through the Kimi CLI in print mode: `kimi --print --output-format stream-json -p ...`. The adapter prepares an isolated Kimi HOME, copies the user's OAuth token bundle from `~/.kimi/credentials/kimi-code.json` when present, writes an adapter-owned MCP config file for the shared anyteam wrapper, and invokes Kimi with `--mcp-config-file`.
+
+Kimi's default user-facing model slug from the probed runtime is `kimi-code/kimi-for-coding` (`Kimi-k2.6`, 262k context). Kimi is a strong fit for large-context architecture review and tasks that can benefit from Kimi's native skills and internal swarm/subagent primitives while still presenting as one anyteam teammate.
+
+Kimi v1 intentionally does not use ACP or a Codex App Server equivalent. Limitations:
+
+- no live mid-turn `turn/steer`; steer messages are queued and injected into the next prompt boundary
+- no CLI `--output-schema`; structured task and plan outputs are enforced by prompt-embedded schemas plus Python validation/retry
+- Kimi stream-json is per-message NDJSON (`assistant` / `tool`) rather than Codex or Gemini event taxonomies
+- MCP tools are addressed by their bare declared names (`send_message`, `task_update`), not Gemini-style `mcp_anyteam_*` names
+
 ## How teammates become visible
 
-The TUI presence line (`@main @codex-alice @gemini-bob`) renders from the leader's in-memory state, not from `config.json`. That state is only populated when Claude Code's own spawn flow is what launched the teammate.
+The TUI presence line (`@main @codex-alice @gemini-bob @kimi-cora`) renders from the leader's in-memory state, not from `config.json`. That state is only populated when Claude Code's own spawn flow is what launched the teammate.
 
 claude-anyteam hooks into that spawn flow via `CLAUDE_CODE_TEAMMATE_COMMAND`. When Agent Teams mode spawns a teammate:
 
 1. Claude Code invokes `$CLAUDE_CODE_TEAMMATE_COMMAND` (our shim) instead of the default `claude` binary
-2. The shim checks the agent name. Matches `^codex-` dispatch to the Codex adapter; matches `^gemini-` dispatch to the Gemini adapter; anything else forwards to native Claude.
+2. The shim checks the agent name. Matches `^codex-` dispatch to the Codex adapter; matches `^gemini-` dispatch to the Gemini adapter; matches `^kimi-` dispatch to the Kimi adapter; anything else forwards to native Claude.
 3. Claude Code's internal spawn-completion callback registers a mirror task in its state — this is what the TUI renders
 4. The adapter self-registers in `config.json` with `backendType: "in-process"` so its entry matches what the leader expects
 
@@ -83,12 +98,12 @@ Both pieces (leader mirror + adapter entry) are required. The shim enables step 
 1. Lead creates a task via Claude Code's task list
 2. Adapter picks it up in its poll loop (1.5s default)
 3. Adapter claims it via compare-and-set under a file lock
-4. Adapter sends the task description to the selected backend: Codex via App Server or fresh `codex exec`; Gemini via headless `gemini --prompt ... --output-format stream-json`
+4. Adapter sends the task description to the selected backend: Codex via App Server or fresh `codex exec`; Gemini via headless `gemini --prompt ... --output-format stream-json`; Kimi via headless `kimi --print --output-format stream-json`
 5. The backend executes: reads files, writes files, runs commands, calls wrapper MCP tools to update task status / send messages to peers
 6. Task completes; adapter writes `task_complete` to lead's inbox
-7. Codex App Server teammates can incorporate peer messages mid-execution via `turn/steer`; Gemini teammates currently receive peer messages on the next poll / task boundary rather than ACP steering.
+7. Codex App Server teammates can incorporate peer messages mid-execution via `turn/steer`; Gemini and Kimi teammates currently receive peer messages on the next poll / prompt boundary rather than live App Server steering.
 
-The wrapper MCP server exposes a narrowed 6-tool surface to external backends (`send_message`, `task_update`, `task_create`, `read_inbox`, `task_list`, `read_config`). Destructive tools like `team_delete` and `force_kill_teammate` are deliberately blocked — Codex or Gemini has full coding access but cannot break the team.
+The wrapper MCP server exposes a narrowed 6-tool surface to external backends (`send_message`, `task_update`, `task_create`, `read_inbox`, `task_list`, `read_config`). Destructive tools like `team_delete` and `force_kill_teammate` are deliberately blocked — Codex, Gemini, or Kimi has full coding access but cannot break the team.
 
 ## Extending to new models
 

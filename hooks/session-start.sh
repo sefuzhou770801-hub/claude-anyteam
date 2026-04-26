@@ -2,7 +2,7 @@
 set -eu
 
 SETTINGS_PATH=${HOME}/.claude/settings.json
-ORIENTATION_MESSAGE="claude-anyteam is installed; Agent Teams teammates named codex-* route to Codex and gemini-* route to Gemini CLI. Use \`claude-anyteam team-agent|team-patch|team-roster\` for team config (preferred over hand-edits). Docs: https://github.com/JonathanRosado/claude-anyteam"
+ORIENTATION_MESSAGE="claude-anyteam is installed; Agent Teams teammates named codex-* route to Codex, gemini-* to Gemini, kimi-* to Kimi. Use \`claude-anyteam team-agent|team-patch|team-roster\` for team config (preferred over hand-edits). Docs: https://github.com/JonathanRosado/claude-anyteam"
 DRIFT_WARNING='claude-anyteam: settings drifted — run `claude-anyteam install` to repair'
 
 settings_has_required_env() {
@@ -34,6 +34,7 @@ required_paths = [
     env.get("CLAUDE_CODE_TEAMMATE_COMMAND", ""),
     env.get("CLAUDE_ANYTEAM_BINARY", ""),
     env.get("CLAUDE_ANYTEAM_GEMINI_BINARY", ""),
+    env.get("CLAUDE_ANYTEAM_KIMI_BINARY", ""),
 ]
 
 for value in required_paths:
@@ -63,7 +64,8 @@ PY
 
   settings_env_path_ok "CLAUDE_CODE_TEAMMATE_COMMAND" \
     && settings_env_path_ok "CLAUDE_ANYTEAM_BINARY" \
-    && settings_env_path_ok "CLAUDE_ANYTEAM_GEMINI_BINARY"
+    && settings_env_path_ok "CLAUDE_ANYTEAM_GEMINI_BINARY" \
+    && settings_env_path_ok "CLAUDE_ANYTEAM_KIMI_BINARY"
 }
 
 if settings_has_required_env; then

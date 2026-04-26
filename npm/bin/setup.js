@@ -19,6 +19,7 @@ import {
   isCI,
   isInteractive,
   manualInstallLines,
+  providerPrereqLines,
   runCommand,
   uvToolEnv,
   windowsInstallAdvice,
@@ -66,8 +67,8 @@ function usage() {
   const settingsPath = process.platform === 'win32' ? '~\\.claude\\settings.json' : '~/.claude/settings.json';
   const claudeJsonPath = process.platform === 'win32' ? '~\\.claude.json' : '~/.claude.json';
   const prereqSummary = process.platform === 'win32'
-    ? 'uses Windows single-terminal mode when tmux/psmux is unavailable, probes for the Codex CLI 0.120+ and Gemini CLI'
-    : 'verifies tmux/psmux on PATH and probes for the Codex CLI 0.120+ and Gemini CLI';
+    ? 'uses Windows single-terminal mode when tmux/psmux is unavailable, probes for the Codex CLI 0.120+, Gemini CLI, and Kimi CLI'
+    : 'verifies tmux/psmux on PATH and probes for the Codex CLI 0.120+, Gemini CLI, and Kimi CLI';
   return [
     'Usage: npx --yes claude-anyteam [--settings-path <path>] [--postinstall]',
     '',
@@ -474,8 +475,8 @@ async function main() {
   if (!silent) {
     console.log('');
     const pythonInstallerSummary = process.platform === 'win32'
-      ? `— Windows single-terminal compatibility, Codex/Gemini CLI prereq checks, ${settingsDisplayPath()}, ${claudeJsonDisplayPath()}, install-state.json`
-      : `— tmux + Codex/Gemini CLI prereq checks, ${settingsDisplayPath()}, ${claudeJsonDisplayPath()}, install-state.json`;
+      ? `— Windows single-terminal compatibility, Codex/Gemini/Kimi CLI prereq checks, ${settingsDisplayPath()}, ${claudeJsonDisplayPath()}, install-state.json`
+      : `— tmux + Codex/Gemini/Kimi CLI prereq checks, ${settingsDisplayPath()}, ${claudeJsonDisplayPath()}, install-state.json`;
     console.log(`${theme.symbols.info} ${theme.heading('Running claude-anyteam install (Python)')} ${theme.muted(pythonInstallerSummary)}`);
   }
   let installerResult;
@@ -551,8 +552,9 @@ async function main() {
   // to stdout. Success box avoids duplicating that — it covers only what Python
   // doesn't know about (plugin registration status, launch template, restart
   // reminder) so there's no noise.
-  const launchTemplate = `${formatCommand(tool.binaryPath, ['--team', 'my-team', '--name', 'codex-alice', '--cwd', workspaceExamplePath()])}  # or --name gemini-alice --cwd ${workspaceExamplePath()}`;
+  const launchTemplate = `${formatCommand(tool.binaryPath, ['--team', 'my-team', '--name', 'codex-alice', '--cwd', workspaceExamplePath()])}  # or --name gemini-alice / kimi-architect`;
   const toolVerb = tool.installMode === 'existing' ? 'reused existing install' : 'installed with uv tool install';
+  const providerLines = providerPrereqLines().map((line) => `${theme.symbols.info} ${line}`);
   printSuccess([
     `${theme.symbols.success} Tool status = ${theme.accent(toolVerb)}`,
     `${theme.symbols.info} Claude Code plugin: ${theme.accent(claudePlugin.summary)}`,
@@ -561,9 +563,11 @@ async function main() {
     `${theme.symbols.info} Launch template:`,
     `    ${theme.accent(launchTemplate)}`,
     '',
+    ...providerLines,
+    '',
     `${theme.symbols.warn} Restart Claude Code so it reloads ${theme.accent(settingsDisplayPath())}.`,
   ]);
-  console.log(`${theme.symbols.success} ${theme.heading('Your claude-anyteam launcher is live.')} Codex/Gemini-powered teammates use the ${theme.accent('codex-')} or ${theme.accent('gemini-')} prefix today in Claude Code's external spawn flow.`);
+  console.log(`${theme.symbols.success} ${theme.heading('Your claude-anyteam launcher is live.')} Codex/Gemini/Kimi-powered teammates use the ${theme.accent('codex-')}, ${theme.accent('gemini-')}, or ${theme.accent('kimi-')} prefix today in Claude Code's external spawn flow.`);
   return 0;
 }
 
