@@ -10,7 +10,7 @@ Source prompt that produced the current `assets/diagrams/architecture.png` (the 
 4. Save output to `assets/diagrams/architecture.png` (same filename — the README references it)
 5. Commit the new PNG + the updated prompt in the same commit so they don't drift
 
-## Current prompt (used 2026-04-25 to generate the v0.6.0 diagram)
+## Current prompt (used 2026-04-26 to generate the v0.6.0 diagram)
 
 > A cinematic, ultra-modern software architecture diagram rendered as a wide landscape illustration (16:9 aspect ratio). Dark premium background: a deep charcoal-to-midnight gradient (from `#0b1220` in the top-left to `#1e293b` in the bottom-right), with a subtle starfield of tiny blue-white particles and a faint dot-grid overlay for a technical feel. Soft volumetric glow emanates from the center.
 >
