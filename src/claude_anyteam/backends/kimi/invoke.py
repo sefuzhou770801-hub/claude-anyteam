@@ -514,8 +514,17 @@ def run(
     kimi_home: Path | None = None,
     thinking: str = "auto",
 ) -> CodexResult:
+    """Single Kimi invocation.
+
+    Schema-validation retries are owned by the loop layer (mirroring Codex's
+    separation of concerns at codex.py:run() — never retries; loop owns
+    retry policy). Earlier versions of this function ran a second
+    invocation on schema failure; combined with the loop's own attempt
+    pair, that produced up to 4 Kimi CLI runs per task. The loop now
+    issues attempt 2 itself with a tightened prompt.
+    """
     schema_obj = load_schema(schema) if schema is not None else None
-    first = _run_once(
+    return _run_once(
         prompt,
         cwd=cwd,
         schema_obj=schema_obj,
@@ -529,21 +538,3 @@ def run(
         kimi_home=kimi_home,
         thinking=thinking,
     )
-    if schema_obj is None or first.structured is not None or first.exit_code != 0:
-        return first
-    second = _run_once(
-        prompt,
-        cwd=cwd,
-        schema_obj=schema_obj,
-        schema_path=schema,
-        kimi_binary=kimi_binary,
-        timeout_s=timeout_s,
-        wrapper_identity=wrapper_identity,
-        resume_session_id=first.session_id or resume_session_id,
-        model=model,
-        effort=effort,
-        kimi_home=kimi_home,
-        thinking=thinking,
-        retry_error=first.error,
-    )
-    return second

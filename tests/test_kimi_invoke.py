@@ -299,7 +299,16 @@ def test_run_exit_one_failure_keeps_parsed_events_and_error(tmp_path, monkeypatc
     assert any(ev.get("type") == "non_json_stdout" for ev in result.events)
 
 
-def test_schema_validation_retry_uses_invalid_then_task_complete_fixture(tmp_path, monkeypatch):
+def test_schema_validation_failure_returns_one_invocation_for_loop_to_retry(tmp_path, monkeypatch):
+    """invoke.run() must NOT retry internally on schema failure.
+
+    The loop layer owns retry policy (mirroring Codex's separation of
+    concerns). A previous version retried inside invoke.run(), which combined
+    with the loop's own attempt pair produced up to 4 Kimi invocations per
+    task. After the single-source-retry fix, invoke.run() should return the
+    schema-invalid result after exactly one invocation and let the loop's
+    second attempt drive the retry with a tightened prompt.
+    """
     calls = _patch_kimi_run(
         monkeypatch,
         tmp_path,
@@ -309,23 +318,17 @@ def test_schema_validation_retry_uses_invalid_then_task_complete_fixture(tmp_pat
                 "stderr": "To resume this session: kimi -r retry-session\n",
                 "returncode": 0,
             },
-            {
-                "stdout": _read("schema_task_complete.jsonl"),
-                "stderr": "To resume this session: kimi -r retry-session\n",
-                "returncode": 0,
-            },
         ],
     )
-    monkeypatch.setattr(invoke, "_known_session", lambda *_args: True)
 
     result = invoke.run("do work", cwd=tmp_path, schema=TASK_COMPLETE_SCHEMA, kimi_home=tmp_path / "home")
 
+    # Exactly one CLI invocation — no internal retry.
+    assert len(calls) == 1
+    # exit_code stays 0 (Kimi succeeded), but structured is None and error is
+    # set so the loop knows to drive the retry.
     assert result.exit_code == 0
-    assert result.error is None
-    assert result.structured == {"files_changed": [], "summary": "schema fixture complete"}
-    assert result.last_message == '{"files_changed":[],"summary":"schema fixture complete"}'
-    assert len(calls) == 2
-    second_argv = calls[1][0]
-    assert second_argv[second_argv.index("--session") + 1] == "retry-session"
-    assert "PRIOR ATTEMPT FAILED schema validation:" in second_argv[-1]
-    assert "not valid JSON" in second_argv[-1]
+    assert result.structured is None
+    assert result.error and "not valid JSON" in result.error
+    # session_id captured so the loop's second attempt can pass it through.
+    assert result.session_id == "retry-session"
