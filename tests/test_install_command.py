@@ -10,6 +10,13 @@ from claude_anyteam import cli as cli_mod
 from claude_anyteam import installer as installer_mod
 
 
+@pytest.fixture(autouse=True)
+def _skip_real_plugin_registration(monkeypatch: pytest.MonkeyPatch) -> None:
+    """Unit tests should not invoke a real `claude plugin install`."""
+
+    monkeypatch.setattr(installer_mod, "_register_claude_plugin", lambda: None)
+
+
 def _make_executable(path: Path) -> Path:
     path.parent.mkdir(parents=True, exist_ok=True)
     path.write_text("#!/bin/sh\nexit 0\n", encoding="utf-8")
@@ -63,6 +70,24 @@ def _gemini_cli_missing() -> installer_mod.GeminiCliCheck:
     return installer_mod.GeminiCliCheck(found=False, path=None, version=None, raw_output=None)
 
 
+def _kimi_cli_ready(
+    version: str | None = "1.2.3",
+    *,
+    signed_in: bool = False,
+) -> installer_mod.KimiCliCheck:
+    return installer_mod.KimiCliCheck(
+        found=True,
+        path=Path("/usr/local/bin/kimi"),
+        version=version,
+        raw_output=f"kimi {version}" if version else "kimi unknown",
+        signed_in=signed_in,
+    )
+
+
+def _kimi_cli_missing() -> installer_mod.KimiCliCheck:
+    return installer_mod.KimiCliCheck(found=False, path=None, version=None, raw_output=None)
+
+
 def _auth(signed_in: bool) -> installer_mod.AuthCheck:
     return installer_mod.AuthCheck(signed_in=signed_in)
 
@@ -74,11 +99,15 @@ def _stub_provider_checks(
     codex_signed_in: bool = True,
     gemini_cli: installer_mod.GeminiCliCheck | None = None,
     gemini_signed_in: bool = False,
+    kimi_cli: installer_mod.KimiCliCheck | None = None,
+    kimi_signed_in: bool = False,
 ) -> None:
     monkeypatch.setattr(installer_mod, "_check_codex_cli", lambda: codex_cli or _codex_cli_ready())
     monkeypatch.setattr(installer_mod, "_check_codex_auth", lambda: _auth(codex_signed_in))
     monkeypatch.setattr(installer_mod, "_check_gemini_cli", lambda: gemini_cli or _gemini_cli_missing())
     monkeypatch.setattr(installer_mod, "_check_gemini_auth", lambda: _auth(gemini_signed_in))
+    monkeypatch.setattr(installer_mod, "_check_kimi_cli", lambda: kimi_cli or _kimi_cli_missing())
+    monkeypatch.setattr(installer_mod, "_check_kimi_auth", lambda: _auth(kimi_signed_in))
 
 
 def _stub_prereq_found(
@@ -156,6 +185,15 @@ def _uninstall_argv(
         "--state-path",
         str(state_path),
     ]
+
+
+def _ready_install_paths(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> tuple[Path, Path, Path, Path]:
+    settings_path, claude_json_path, state_path, bin_dir = _fresh_paths(tmp_path)
+    _make_executable(bin_dir / "claude-anyteam")
+    _make_executable(bin_dir / "claude-anyteam-spawn-shim")
+    _stub_prereq_found(monkeypatch)
+    monkeypatch.setattr(installer_mod.shutil, "which", lambda name: None)
+    return settings_path, claude_json_path, state_path, bin_dir
 
 
 # ---------------------------------------------------------------------------
@@ -266,7 +304,7 @@ def test_render_provider_walkthrough_buckets():
         [
             "Gemini CLI:",
             "  1. Install:  npm install -g @google/gemini-cli",
-            "  2. Sign in:  gemini    (or set GEMINI_API_KEY, or configure Vertex)",
+            "  2. Sign in:  gemini login    (or set GEMINI_API_KEY, or configure Vertex)",
             "  Docs: https://github.com/google-gemini/gemini-cli",
         ]
     )
@@ -279,14 +317,14 @@ def test_render_provider_walkthrough_buckets():
             "\n".join(
                 [
                     "Codex CLI:",
-                    "  1. Sign in:  codex     (opens an OAuth flow on first run)",
+                    "  1. Sign in:  codex login",
                     "  Docs: https://github.com/openai/codex#getting-started",
                 ]
             ),
             "\n".join(
                 [
                     "Gemini CLI:",
-                    "  1. Sign in:  gemini    (or set GEMINI_API_KEY, or configure Vertex)",
+                    "  1. Sign in:  gemini login    (or set GEMINI_API_KEY, or configure Vertex)",
                     "  Docs: https://github.com/google-gemini/gemini-cli",
                 ]
             ),
@@ -539,8 +577,8 @@ def test_install_with_both_installed_but_not_signed_in_refuses(
     stdout = capsys.readouterr().out
     assert exit_code == installer_mod.INSTALL_ERROR_EXIT_NO_PROVIDER
     assert "Almost ready: Codex (needs sign-in) · Gemini (needs sign-in)." in stdout
-    assert "  1. Sign in:  codex     (opens an OAuth flow on first run)" in stdout
-    assert "  1. Sign in:  gemini    (or set GEMINI_API_KEY, or configure Vertex)" in stdout
+    assert "  1. Sign in:  codex login" in stdout
+    assert "  1. Sign in:  gemini login    (or set GEMINI_API_KEY, or configure Vertex)" in stdout
     assert "Refusing to install — no provider is ready." in stdout
     assert "Updated " not in stdout
     assert not settings_path.exists()
@@ -740,22 +778,24 @@ def test_install_fails_when_multiplexer_missing(
     assert not state_path.exists()
 
 
-def test_install_fails_lists_psmux_on_windows(
+def test_install_skips_multiplexer_check_on_windows(
     tmp_path: Path,
     monkeypatch,
     capsys,
 ):
     settings_path, claude_json_path, state_path, bin_dir = _fresh_paths(tmp_path)
-    _make_executable(bin_dir / "claude-anyteam")
+    codex_binary = _make_executable(bin_dir / "claude-anyteam")
     _make_executable(bin_dir / "claude-anyteam-spawn-shim")
 
-    _stub_prereq_missing(monkeypatch, platform="windows")
+    monkeypatch.setattr(installer_mod, "_platform_name", lambda: "windows")
+    _stub_provider_checks(monkeypatch)
     monkeypatch.setattr(installer_mod.shutil, "which", lambda name: None)
-    monkeypatch.setattr(cli_mod.sys, "argv", [str(bin_dir / "claude-anyteam")])
+    monkeypatch.setattr(cli_mod.sys, "argv", [str(codex_binary)])
 
     exit_code = cli_mod.main(_install_argv(settings_path, claude_json_path, state_path))
-    assert exit_code != 0
-    assert "winget install psmux" in capsys.readouterr().err
+    assert exit_code == 0
+    assert "winget install psmux" not in capsys.readouterr().err
+    assert settings_path.exists()
 
 
 # ---------------------------------------------------------------------------
@@ -1590,12 +1630,13 @@ def test_install_warns_when_codex_cli_missing_but_still_succeeds(
 
 
 def test_install_handles_codex_version_parse_failure(tmp_path: Path, monkeypatch):
-    """Parse-fail falls back to presence-only — no warning, don't block on a parse miss."""
+    """Parse-fail warns in plain English but does not block install."""
     codex_cli = installer_mod.CodexCliCheck(
         found=True,
         path=Path("/usr/local/bin/codex"),
         version=None,
         raw_output="weird unexpected output",
+        version_probe_error="`codex --version` output was not recognizable: weird unexpected output",
     )
     result, _claude_json_path, state_path = _install_with_codex_stub(tmp_path, monkeypatch, codex_cli)
 
@@ -1607,7 +1648,8 @@ def test_install_handles_codex_version_parse_failure(tmp_path: Path, monkeypatch
     assert "Codex CLI     ✅" in message
     assert "Ready: Codex · Gemini (not installed)." in message
     assert "Detected Codex CLI" not in message
-    assert "Warning: detected Codex" not in message, "parse-fail must not emit a scary warning"
+    assert "Warning: Found `codex` but couldn't read its version" in message
+    assert "The installer will warn but continue" in message
 
     state = json.loads(state_path.read_text(encoding="utf-8"))
     assert state["codex_cli_found"] is True

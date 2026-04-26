@@ -173,6 +173,10 @@ export function uvToolEnv(baseEnv = process.env) {
   if (UV_TOOL_DIR) {
     env.UV_TOOL_DIR = UV_TOOL_DIR;
   }
+  if (process.platform === 'win32') {
+    env.PYTHONUTF8 = baseEnv.PYTHONUTF8 || '1';
+    env.PYTHONIOENCODING = baseEnv.PYTHONIOENCODING || 'utf-8';
+  }
   return env;
 }
 
@@ -469,7 +473,8 @@ export function windowsInstallAdvice(error, { binDir = UV_TOOL_BIN_DIR } = {}) {
   const details = `${error?.code || ''}\n${error?.message || ''}\n${error?.details || ''}`;
   const lines = [];
 
-  if (/WINDOWS_SYMLINK_PERMISSION|EPERM.*symlink|privilege.*symbolic|symbolic link/i.test(details)) {
+  const symlinkBlocked = /WINDOWS_SYMLINK_PERMISSION|EPERM.*symlink|privilege.*symbolic|symbolic link/i.test(details);
+  if (symlinkBlocked) {
     lines.push('Windows blocked symlink creation. Enable Developer Mode (Settings > System > For developers) or rerun from an Administrator PowerShell session.');
   }
 
@@ -478,9 +483,11 @@ export function windowsInstallAdvice(error, { binDir = UV_TOOL_BIN_DIR } = {}) {
     lines.push('Then close and reopen your terminal before rerunning npx --yes claude-anyteam.');
   }
 
-  if (/EBUSY|EPERM|EACCES|being used by another process|resource busy|locked|access is denied/i.test(details)) {
-    lines.push(`Antivirus or Windows Defender may be locking a uv tool file. Retry once; if it persists, add ${formatDisplayPath(binDir)} to your AV exclusion list.`);
-    lines.push(`Windows Defender PowerShell (Admin): Add-MpPreference -ExclusionPath '${String(binDir).replace(/'/g, "''")}'`);
+  if (!symlinkBlocked && /EBUSY|EPERM|EACCES|permission denied|being used by another process|resource busy|locked|access is denied/i.test(details)) {
+    const exclusionTargets = [...new Set([binDir, UV_TOOL_DIR].filter(Boolean).map(formatDisplayPath))];
+    const exclusionArgs = exclusionTargets.map((target) => `'${String(target).replace(/'/g, "''")}'`).join(', ');
+    lines.push(`Antivirus or Windows Defender may be locking a uv tool file. Retry once; if it persists, add ${exclusionTargets.join(' and ')} to your AV exclusion list.`);
+    lines.push(`Windows Defender PowerShell (Admin): Add-MpPreference -ExclusionPath ${exclusionArgs}`);
   }
 
   return [...new Set(lines)];

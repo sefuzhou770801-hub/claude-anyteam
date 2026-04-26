@@ -108,6 +108,7 @@ class GeminiCliCheck:
     missing_capabilities: tuple[str, ...] = ()
     signed_in: bool = False
     signed_in_detail: str | None = None
+    version_probe_error: str | None = None
 
 
 @dataclass(frozen=True)
@@ -338,8 +339,15 @@ class InstallError(ValueError):
 
 def _quote_command_path(path: Path) -> str:
     text = _display_path(path)
+    if _is_windows_platform():
+        escaped = text.replace("'", "''")
+        return f"'{escaped}'"
     escaped = text.replace("'", "'\"'\"'")
     return f"'{escaped}'"
+
+
+def _is_windows_platform() -> bool:
+    return sys.platform in ("win32", "cygwin")
 
 
 def _display_path(path: Path) -> str:
@@ -347,9 +355,12 @@ def _display_path(path: Path) -> str:
         resolved = path.expanduser().resolve()
         home = Path.home().expanduser().resolve()
         rel = resolved.relative_to(home)
+        if _is_windows_platform():
+            return "~\\" + "\\".join(rel.parts)
         return f"~/{rel.as_posix()}"
     except Exception:
-        return str(path)
+        text = str(path)
+        return text.replace("/", "\\") if _is_windows_platform() else text
 
 
 def _path_for_action(path: Path) -> str:
@@ -358,6 +369,11 @@ def _path_for_action(path: Path) -> str:
 
 def _rename_action(path: Path, *, command: str) -> str:
     backup = path.with_name(f"{path.name}.broken")
+    if _is_windows_platform():
+        return (
+            "From PowerShell, run "
+            f"`Move-Item -LiteralPath {_path_for_action(path)} -Destination {_path_for_action(backup)}; {command}`."
+        )
     return f"Run `mv {_path_for_action(path)} {_path_for_action(backup)}` then `{command}`."
 
 
@@ -382,6 +398,18 @@ def _settings_corrupt_error(path: Path, details: str, *, not_json: bool = False)
     )
 
 
+def _settings_read_error(path: Path, exc: BaseException) -> InstallError:
+    return InstallError(
+        title="Can't read your Claude Code settings file",
+        explanation=(
+            f"The installer could not read {_display_path(path)}, so it stopped before making changes."
+        ),
+        action="Check file ownership and permissions, then run `claude-anyteam install` again.",
+        severity="hard-stop",
+        details=f"{type(exc).__name__}: {exc}",
+    )
+
+
 def _settings_write_error(path: Path, exc: BaseException) -> InstallError:
     is_locked = isinstance(exc, OSError) and exc.errno in {
         errno.EACCES,
@@ -389,6 +417,19 @@ def _settings_write_error(path: Path, exc: BaseException) -> InstallError:
         getattr(errno, "EBUSY", 16),
     }
     if is_locked:
+        if _is_windows_platform():
+            return InstallError(
+                title="Can't write your Claude Code settings file",
+                explanation=(
+                    f"Can't write to {_display_path(path)} — Claude Code, OneDrive, or antivirus may be locking it."
+                ),
+                action=(
+                    "Close Claude Code and retry from PowerShell with `claude-anyteam install`. "
+                    "If it keeps happening, add your `.claude` folder to Windows Defender exclusions."
+                ),
+                severity="hard-stop",
+                details=f"{type(exc).__name__}: {exc}",
+            )
         return InstallError(
             title="Can't write your Claude Code settings file",
             explanation=(
@@ -428,7 +469,33 @@ def _claude_json_corrupt_error(path: Path, details: str, *, not_json: bool = Fal
     )
 
 
+def _claude_json_read_error(path: Path, exc: BaseException) -> InstallError:
+    return InstallError(
+        title="Can't read your Claude Code config file",
+        explanation=(
+            f"The installer could not read {_display_path(path)}, so teammateMode was not changed."
+        ),
+        action="Check file ownership and permissions, then run `claude-anyteam install` again.",
+        severity="hard-stop",
+        details=f"{type(exc).__name__}: {exc}",
+    )
+
+
 def _claude_json_write_error(path: Path, exc: BaseException) -> InstallError:
+    if _is_windows_platform():
+        return InstallError(
+            title="Couldn't write your Claude Code config file",
+            explanation=(
+                f"The installer could not save {_display_path(path)}, so teammateMode was not changed. "
+                "Claude Code, OneDrive, or antivirus may be locking the file."
+            ),
+            action=(
+                "Close Claude Code and retry from PowerShell with `claude-anyteam install`. "
+                "If it keeps happening, add your Claude config directory to Windows Defender exclusions."
+            ),
+            severity="hard-stop",
+            details=f"{type(exc).__name__}: {exc}",
+        )
     return InstallError(
         title="Couldn't write your Claude Code config file",
         explanation=(
@@ -454,14 +521,29 @@ def _state_error(path: Path, details: str, *, cli_exit_code: int | None = None) 
     )
 
 
-def _provider_version_probe_error(binary: str, provider_name: str, details: str) -> InstallError:
+def _state_read_error(path: Path, exc: BaseException) -> InstallError:
+    return _state_error(
+        path,
+        f"Could not read {path}: {type(exc).__name__}: {exc}",
+        cli_exit_code=INSTALL_ERROR_EXIT_CORRUPTED_STATE,
+    )
+
+
+def _provider_version_probe_error(
+    binary: str,
+    provider_name: str,
+    details: str,
+    *,
+    probe_command: str | None = None,
+) -> InstallError:
+    command = probe_command or f"{binary} --version"
     return InstallError(
         title=f"Found `{binary}` but couldn't read its version",
         explanation=(
             f"Found `{binary}` on PATH but it didn't return a recognizable version. "
             "The installer will warn but continue — you may need to upgrade or reinstall the provider CLI."
         ),
-        action=f"Upgrade or reinstall {provider_name}, then run `{binary} --version` again.",
+        action=f"Upgrade or reinstall {provider_name}, then run `{command}` again.",
         severity="soft",
         details=details,
     )
@@ -601,6 +683,8 @@ def _load_settings(path: Path) -> tuple[dict[str, Any], bool]:
         raw = json.loads(path.read_text(encoding="utf-8"))
     except json.JSONDecodeError as exc:
         raise _settings_corrupt_error(path, f"{path} is not valid JSON: {exc}", not_json=True) from exc
+    except OSError as exc:
+        raise _settings_read_error(path, exc) from exc
 
     if not isinstance(raw, dict):
         raise _settings_corrupt_error(
@@ -847,6 +931,8 @@ def _load_claude_json(path: Path) -> tuple[dict[str, Any], bool]:
         raw = json.loads(path.read_text(encoding="utf-8"))
     except json.JSONDecodeError as exc:
         raise _claude_json_corrupt_error(path, f"{path} is not valid JSON: {exc}", not_json=True) from exc
+    except OSError as exc:
+        raise _claude_json_read_error(path, exc) from exc
 
     if not isinstance(raw, dict):
         raise _claude_json_corrupt_error(
@@ -884,6 +970,8 @@ def _load_state(path: Path) -> dict[str, Any] | None:
         raw = json.loads(path.read_text(encoding="utf-8"))
     except json.JSONDecodeError as exc:
         raise _state_error(path, f"{path} is not valid JSON: {exc}", cli_exit_code=INSTALL_ERROR_EXIT_CORRUPTED_STATE) from exc
+    except OSError as exc:
+        raise _state_read_error(path, exc) from exc
 
     if not isinstance(raw, dict):
         raise _state_error(
@@ -945,23 +1033,19 @@ def _platform_name() -> str:
 
 
 def _check_terminal_multiplexer() -> PrereqCheck:
-    """Checks PATH for tmux (Linux/mac) or psmux/tmux (Windows).
+    """Checks PATH for tmux on Linux/macOS.
 
-    Windows prefers ``psmux`` (handles Claude Code's POSIX-shaped teammate-spawn
-    command via a PowerShell translator), but accepts a plain ``tmux`` binary if
-    the user installed one via Cygwin / MSYS2 / WSL-interop.
-
-    Linux and macOS require ``tmux`` on PATH — there is no reason to look for
-    psmux there.
+    Windows has no equivalent multiplexer requirement in the Python installer:
+    the install proceeds and Claude Code/plugin behavior decides how to spawn
+    panes there. This keeps Windows users from being blocked by a Unix-only
+    prerequisite.
     """
     platform = _platform_name()
 
     if platform == "windows":
-        candidates = ("psmux", "tmux")
-    else:
-        candidates = ("tmux",)
+        return PrereqCheck(found=True, binary=None, path=None, platform=platform)
 
-    for name in candidates:
+    for name in ("tmux",):
         found_path = shutil.which(name)
         if found_path:
             return PrereqCheck(
@@ -985,8 +1069,7 @@ def _install_instructions(platform: str) -> str:
         return "  macOS (Homebrew): brew install tmux"
     if platform == "windows":
         return (
-            "  Recommended: winget install psmux\n"
-            "  Also supported: choco install psmux / scoop install psmux"
+            "  Windows: no tmux install is required. Agent Teams uses single-terminal mode."
         )
     return "  Install tmux via your platform's package manager."
 
@@ -1005,6 +1088,13 @@ GEMINI_CLI_BINARY = "gemini"
 GEMINI_CLI_INSTALL_COMMAND = "npm install -g @google/gemini-cli"
 GEMINI_CLI_DOCS_URL = "https://github.com/google-gemini/gemini-cli"
 GEMINI_CLI_VERSION_TIMEOUT_S = 5
+KIMI_CLI_BINARY = "kimi"
+KIMI_CLI_DOCS_URL = "https://platform.moonshot.ai/"
+KIMI_CLI_VERSION_TIMEOUT_S = 5
+KIMI_CREDENTIALS_PATH = Path(".kimi") / "credentials" / "kimi-code.json"
+CLAUDE_PLUGIN_BINARY = "claude"
+CLAUDE_PLUGIN_INSTALL_COMMAND = "claude plugin install JonathanRosado/claude-anyteam"
+CLAUDE_PLUGIN_INSTALL_TIMEOUT_S = 20
 CODEX_AUTH_PATH = Path(".codex") / "auth.json"
 GEMINI_OAUTH_CREDS_PATH = Path(".gemini") / "oauth_creds.json"
 GEMINI_GOOGLE_ACCOUNTS_PATH = Path(".gemini") / "google_accounts.json"
@@ -1066,6 +1156,7 @@ def _check_codex_cli() -> CodexCliCheck:
     resolved = Path(found_path).resolve()
     raw: str | None = None
     version: str | None = None
+    version_probe_error: str | None = None
     try:
         completed = subprocess.run(
             [str(resolved), "--version"],
@@ -1074,13 +1165,24 @@ def _check_codex_cli() -> CodexCliCheck:
             timeout=CODEX_CLI_VERSION_TIMEOUT_S,
             check=False,
         )
-    except (OSError, subprocess.SubprocessError):
+    except (OSError, subprocess.SubprocessError) as exc:
         completed = None
+        version_probe_error = f"`{CODEX_CLI_BINARY} --version` failed to run: {exc}"
 
-    if completed is not None and completed.returncode == 0:
-        raw = (completed.stdout or "").strip() or None
-        if raw:
+    if completed is not None:
+        raw = ((completed.stdout or "") or (completed.stderr or "")).strip() or None
+        if completed.returncode != 0:
+            version_probe_error = (
+                f"`{CODEX_CLI_BINARY} --version` exited with code {completed.returncode}."
+            )
+        elif raw:
             version = _parse_cli_version(raw)
+            if version is None:
+                version_probe_error = (
+                    f"`{CODEX_CLI_BINARY} --version` output was not recognizable: {raw}"
+                )
+        else:
+            version_probe_error = f"`{CODEX_CLI_BINARY} --version` printed no version."
 
     try:
         signed_in, signed_in_detail = _check_codex_signin(resolved)
@@ -1094,6 +1196,7 @@ def _check_codex_cli() -> CodexCliCheck:
         raw_output=raw,
         signed_in=signed_in,
         signed_in_detail=signed_in_detail,
+        version_probe_error=version_probe_error,
     )
 
 
@@ -1265,7 +1368,7 @@ def _codex_cli_warning(check: CodexCliCheck) -> str | None:
     actually confirm the floor was violated.
     """
     min_version = _min_version_str()
-    signin_hint = f"  After installing, run `{CODEX_CLI_BINARY}` once to sign in."
+    signin_hint = f"  After installing, run `{CODEX_CLI_BINARY} login` to sign in."
     docs_line = f"  Setup guide: {CODEX_CLI_DOCS_URL}"
 
     if not check.found:
@@ -1335,6 +1438,7 @@ def _check_gemini_cli() -> GeminiCliCheck:
     resolved = Path(found_path).resolve()
     raw = None
     version = None
+    version_probe_error: str | None = None
     try:
         completed = subprocess.run(
             [str(resolved), "--version"],
@@ -1343,11 +1447,23 @@ def _check_gemini_cli() -> GeminiCliCheck:
             timeout=GEMINI_CLI_VERSION_TIMEOUT_S,
             check=False,
         )
-    except (OSError, subprocess.SubprocessError):
+    except (OSError, subprocess.SubprocessError) as exc:
         completed = None
-    if completed is not None and completed.returncode == 0:
+        version_probe_error = f"`{GEMINI_CLI_BINARY} --version` failed to run: {exc}"
+    if completed is not None:
         raw = ((completed.stdout or "") or (completed.stderr or "")).strip() or None
-        version = _parse_cli_version(raw or "")
+        if completed.returncode != 0:
+            version_probe_error = (
+                f"`{GEMINI_CLI_BINARY} --version` exited with code {completed.returncode}."
+            )
+        elif raw:
+            version = _parse_cli_version(raw or "")
+            if version is None:
+                version_probe_error = (
+                    f"`{GEMINI_CLI_BINARY} --version` output was not recognizable: {raw}"
+                )
+        else:
+            version_probe_error = f"`{GEMINI_CLI_BINARY} --version` printed no version."
 
     help_text = ""
     try:
@@ -1377,6 +1493,7 @@ def _check_gemini_cli() -> GeminiCliCheck:
         missing_capabilities=missing,
         signed_in=signed_in,
         signed_in_detail=signed_in_detail,
+        version_probe_error=version_probe_error,
     )
 
 
@@ -1395,6 +1512,83 @@ def _check_gemini_auth(
     return AuthCheck(signed_in=signed_in, signed_in_detail=detail)
 
 
+def _check_kimi_signin(
+    found_path: Path | str | None,
+    credentials_path: Path | str | None = None,
+) -> tuple[bool, str | None]:
+    """Detect whether Kimi has usable local credentials without exposing secrets."""
+    del found_path
+    path = (
+        Path(credentials_path).expanduser()
+        if credentials_path is not None
+        else Path.home() / KIMI_CREDENTIALS_PATH
+    )
+    try:
+        if not path.exists():
+            return False, f"Kimi credentials missing: {path}"
+        if path.stat().st_size <= 0:
+            return False, f"Kimi credentials file empty: {path}"
+        return True, None
+    except OSError as exc:
+        return False, f"Kimi credentials check failed: {exc}"
+
+
+def _check_kimi_cli() -> KimiCliCheck:
+    found_path = shutil.which(KIMI_CLI_BINARY)
+    if not found_path:
+        return KimiCliCheck(
+            found=False,
+            path=None,
+            version=None,
+            raw_output=None,
+            signed_in=False,
+            signed_in_detail="Kimi CLI not found on PATH",
+        )
+
+    resolved = Path(found_path).resolve()
+    raw: str | None = None
+    version: str | None = None
+    version_probe_error: str | None = None
+    try:
+        completed = subprocess.run(
+            [str(resolved), "info"],
+            capture_output=True,
+            text=True,
+            timeout=KIMI_CLI_VERSION_TIMEOUT_S,
+            check=False,
+        )
+    except (OSError, subprocess.SubprocessError) as exc:
+        completed = None
+        version_probe_error = f"`{KIMI_CLI_BINARY} info` failed to run: {exc}"
+
+    if completed is not None:
+        raw = ((completed.stdout or "") or (completed.stderr or "")).strip() or None
+        if completed.returncode != 0:
+            version_probe_error = f"`{KIMI_CLI_BINARY} info` exited with code {completed.returncode}."
+        elif raw:
+            version = _parse_cli_version(raw)
+            if version is None:
+                version_probe_error = f"`{KIMI_CLI_BINARY} info` output was not recognizable: {raw}"
+        else:
+            version_probe_error = f"`{KIMI_CLI_BINARY} info` printed no version."
+
+    signed_in, signed_in_detail = _check_kimi_signin(resolved)
+    return KimiCliCheck(
+        found=True,
+        path=resolved,
+        version=version,
+        raw_output=raw,
+        signed_in=signed_in,
+        signed_in_detail=signed_in_detail,
+        version_probe_error=version_probe_error,
+    )
+
+
+def _check_kimi_auth(credentials_path: Path | str | None = None) -> AuthCheck:
+    signed_in, detail = _check_kimi_signin(KIMI_CLI_BINARY, credentials_path=credentials_path)
+    return AuthCheck(signed_in=signed_in, signed_in_detail=detail)
+
+
 def _gemini_cli_warning(check: GeminiCliCheck) -> str | None:
     if not check.found:
         return (
@@ -1402,7 +1596,7 @@ def _gemini_cli_warning(check: GeminiCliCheck) -> str | None:
             f"  claude-anyteam is installed, but gemini-* teammates will fail to launch\n"
             f"  until Gemini CLI is installed and authenticated. Add it with:\n"
             f"    {GEMINI_CLI_INSTALL_COMMAND}\n"
-            f"  After installing, run `{GEMINI_CLI_BINARY}` once to sign in, or configure GEMINI_API_KEY/Vertex auth.\n"
+            f"  After installing, run `{GEMINI_CLI_BINARY} login` to sign in, or configure GEMINI_API_KEY/Vertex auth.\n"
             f"  Setup guide: {GEMINI_CLI_DOCS_URL}"
         )
     if check.missing_capabilities:
@@ -1474,8 +1668,89 @@ def _gemini_provider_status(cli: GeminiCliCheck, auth: AuthCheck) -> ProviderSta
     )
 
 
+def _kimi_provider_status(cli: KimiCliCheck, auth: AuthCheck) -> ProviderStatus:
+    if not cli.found:
+        state: ProviderState = "MISSING"
+    elif auth.signed_in:
+        state = "READY"
+    else:
+        state = "NEEDS_SIGNIN"
+    return ProviderStatus(
+        provider_key="kimi",
+        display_name="Kimi CLI",
+        summary_name="Kimi",
+        state=state,
+        version=cli.version,
+    )
+
+
 def _any_provider_ready(*statuses: ProviderStatus) -> bool:
     return any(status.ready for status in statuses)
+
+
+def _collect_soft_diagnostics(
+    codex_cli: CodexCliCheck,
+    gemini_cli: GeminiCliCheck,
+    kimi_cli: KimiCliCheck,
+) -> tuple[InstallError, ...]:
+    diagnostics: list[InstallError] = []
+    if codex_cli.found and codex_cli.version_probe_error:
+        diagnostics.append(
+            _provider_version_probe_error(
+                CODEX_CLI_BINARY,
+                "Codex CLI",
+                codex_cli.version_probe_error,
+            )
+        )
+    if gemini_cli.found and gemini_cli.version_probe_error:
+        diagnostics.append(
+            _provider_version_probe_error(
+                GEMINI_CLI_BINARY,
+                "Gemini CLI",
+                gemini_cli.version_probe_error,
+            )
+        )
+    if kimi_cli.found and kimi_cli.version_probe_error:
+        diagnostics.append(
+            _provider_version_probe_error(
+                KIMI_CLI_BINARY,
+                "Kimi CLI",
+                kimi_cli.version_probe_error,
+                probe_command=f"{KIMI_CLI_BINARY} info",
+            )
+        )
+    return tuple(diagnostics)
+
+
+def _register_claude_plugin() -> InstallError | None:
+    claude = shutil.which(CLAUDE_PLUGIN_BINARY)
+    if not claude:
+        return _plugin_registration_error("`claude` was not found on PATH.")
+
+    try:
+        completed = subprocess.run(
+            [claude, "plugin", "install", "JonathanRosado/claude-anyteam"],
+            capture_output=True,
+            text=True,
+            timeout=CLAUDE_PLUGIN_INSTALL_TIMEOUT_S,
+            check=False,
+        )
+    except (OSError, subprocess.SubprocessError) as exc:
+        return _plugin_registration_error(f"{type(exc).__name__}: {exc}")
+
+    if completed.returncode == 0:
+        return None
+
+    details = "\n".join(
+        part
+        for part in (
+            f"`{CLAUDE_PLUGIN_INSTALL_COMMAND}` exited with code {completed.returncode}.",
+            (completed.stdout or "").strip(),
+            (completed.stderr or "").strip(),
+        )
+        if part
+    )
+    return _plugin_registration_error(details)
 
 
 # ---------------------------------------------------------------------------
@@ -1490,8 +1765,10 @@ def install_teammate_mode(
     settings_file_created_by_anyteam: bool = False,
     codex_cli: CodexCliCheck | None = None,
     gemini_cli: GeminiCliCheck | None = None,
+    kimi_cli: KimiCliCheck | None = None,
     codex_auth: AuthCheck | None = None,
     gemini_auth: AuthCheck | None = None,
+    kimi_auth: AuthCheck | None = None,
     force_empty_used: bool = False,
     permissions_allow_added_by_anyteam: tuple[str, ...] = (),
     permissions_allowlist_skipped: bool = False,
@@ -1515,8 +1792,9 @@ def install_teammate_mode(
     claude_json_created_by_anyteam = not existed
 
     if current is not None and not isinstance(current, str):
-        raise InstallError(
-            f"{claude_json_path} has a non-string {TEAMMATE_MODE_KEY!r} value; refusing to touch it."
+        raise _claude_json_corrupt_error(
+            claude_json_path,
+            f"{claude_json_path} has a non-string {TEAMMATE_MODE_KEY!r} value; refusing to touch it.",
         )
 
     def _build_state(original: str | None, set_by: bool) -> dict[str, Any]:
@@ -1545,6 +1823,11 @@ def install_teammate_mode(
             state["gemini_cli_capabilities"] = dict(gemini_cli.capabilities)
         if gemini_auth is not None:
             state["gemini_signed_in"] = bool(gemini_auth.signed_in)
+        if kimi_cli is not None:
+            state["kimi_cli_found"] = bool(kimi_cli.found)
+            state["kimi_cli_version"] = kimi_cli.version
+        if kimi_auth is not None:
+            state["kimi_signed_in"] = bool(kimi_auth.signed_in)
         return state
 
     # Case 1: absent.
@@ -1577,13 +1860,19 @@ def install_teammate_mode(
 
     # Case 3: something else. Prompt before overwriting.
     if not prompt_fn(current):
-        err = InstallError(
-            f"Install aborted: existing {TEAMMATE_MODE_KEY}={current!r} in {claude_json_path}\n"
-            "  claude-anyteam needs teammateMode=\"tmux\" to route teammates through the pane backend.\n"
-            "  Re-run with --assume-yes to accept, or manually set teammateMode=\"tmux\" in ~/.claude.json."
+        raise InstallError(
+            title="Install stopped before changing teammate mode",
+            explanation=(
+                f"{_display_path(claude_json_path)} already has {TEAMMATE_MODE_KEY}={current!r}. "
+                "claude-anyteam needs teammateMode=\"tmux\" to route teammates through the pane backend."
+            ),
+            action="Re-run `claude-anyteam install --assume-yes` or manually set teammateMode=\"tmux\" in ~/.claude.json.",
+            severity="hard-stop",
+            details=(
+                f"Install aborted: existing {TEAMMATE_MODE_KEY}={current!r} in {claude_json_path}"
+            ),
+            cli_exit_code=INSTALL_ERROR_EXIT_PROMPT_DECLINED,
         )
-        err.cli_exit_code = INSTALL_ERROR_EXIT_PROMPT_DECLINED  # type: ignore[attr-defined]
-        raise err
 
     claude_json[TEAMMATE_MODE_KEY] = TEAMMATE_MODE_TARGET_VALUE
     _write_claude_json(claude_json_path, claude_json)
@@ -1642,13 +1931,12 @@ def uninstall_teammate_mode(
     if original is not None and not isinstance(original, str):
         # Corrupted state: refuse to touch anything, keep state file on disk for
         # the user to inspect. Bail with exit code 4 so scripts can differentiate.
-        err = InstallError(
+        raise _state_error(
+            state_path,
             f"{state_path} has a malformed 'teammateMode_original' value "
-            f"({type(original).__name__}: {original!r}); refusing to touch config.\n"
-            f"Inspect or delete the state file manually, then re-run uninstall."
+            f"({type(original).__name__}: {original!r}); refusing to touch config.",
+            cli_exit_code=INSTALL_ERROR_EXIT_CORRUPTED_STATE,
         )
-        err.cli_exit_code = INSTALL_ERROR_EXIT_CORRUPTED_STATE  # type: ignore[attr-defined]
-        raise err
 
     if not managed:
         # We didn't own the value — leave claude.json alone, delete state.
@@ -1688,6 +1976,16 @@ def uninstall_teammate_mode(
             except FileNotFoundError:
                 # Race with an external delete; treat as already-gone.
                 claude_json_removed = True
+            except OSError as exc:
+                raise InstallError(
+                    title="Couldn't remove your Claude Code config file",
+                    explanation=(
+                        f"The uninstaller tried to remove {_display_path(claude_json_path)} because claude-anyteam created it and it is now empty."
+                    ),
+                    action="Check file permissions, then run `claude-anyteam uninstall` again.",
+                    severity="hard-stop",
+                    details=f"{type(exc).__name__}: {exc}",
+                ) from exc
             # touched remains True — the file WAS modified (by deletion).
         else:
             _write_claude_json(claude_json_path, claude_json)
@@ -1737,11 +2035,15 @@ def install(
     prereq_check_fn: Callable[[], PrereqCheck] | None = None,
     codex_cli_check_fn: Callable[[], CodexCliCheck] | None = None,
     gemini_cli_check_fn: Callable[[], GeminiCliCheck] | None = None,
+    kimi_cli_check_fn: Callable[[], KimiCliCheck] | None = None,
     codex_auth_check_fn: Callable[[], AuthCheck] | None = None,
     gemini_auth_check_fn: Callable[[], AuthCheck] | None = None,
+    kimi_auth_check_fn: Callable[[], AuthCheck] | None = None,
+    plugin_registration_fn: Callable[[], InstallError | None] | None = None,
     provider_status_callback: Callable[[str], None] | None = None,
     force_empty: bool = False,
     no_allowlist: bool = False,
+    register_plugin: bool = False,
 ) -> InstallResult:
     """Full install: prereq check → env block write → teammateMode update.
 
@@ -1761,9 +2063,11 @@ def install(
     checker = prereq_check_fn if prereq_check_fn is not None else _check_terminal_multiplexer
     codex_checker = codex_cli_check_fn if codex_cli_check_fn is not None else _check_codex_cli
     gemini_checker = gemini_cli_check_fn if gemini_cli_check_fn is not None else _check_gemini_cli
+    kimi_checker = kimi_cli_check_fn if kimi_cli_check_fn is not None else _check_kimi_cli
     prereq = checker()
     codex_cli = codex_checker()
     gemini_cli = gemini_checker()
+    kimi_cli = kimi_checker()
     if not codex_cli.found:
         codex_auth = AuthCheck(signed_in=False, signed_in_detail=codex_cli.signed_in_detail)
     elif codex_auth_check_fn is not None:
@@ -1787,8 +2091,21 @@ def install(
         )
     else:
         gemini_auth = _check_gemini_auth()
+    if not kimi_cli.found:
+        kimi_auth = AuthCheck(signed_in=False, signed_in_detail=kimi_cli.signed_in_detail)
+    elif kimi_auth_check_fn is not None:
+        kimi_auth = kimi_auth_check_fn()
+    elif kimi_cli.signed_in or kimi_cli.signed_in_detail is not None:
+        kimi_auth = AuthCheck(
+            signed_in=kimi_cli.signed_in,
+            signed_in_detail=kimi_cli.signed_in_detail,
+        )
+    else:
+        kimi_auth = _check_kimi_auth()
     codex_status = _codex_provider_status(codex_cli, codex_auth)
     gemini_status = _gemini_provider_status(gemini_cli, gemini_auth)
+    kimi_status = _kimi_provider_status(kimi_cli, kimi_auth)
+    provider_statuses = _provider_statuses_for_display(codex_status, gemini_status, kimi_status)
 
     if not prereq.found:
         message = (
@@ -1803,28 +2120,42 @@ def install(
         gemini_warning = _gemini_cli_warning(gemini_cli)
         if gemini_warning is not None:
             message = f"{message}\n\nAdditionally:\n{gemini_warning}"
-        raise InstallError(message)
+        raise InstallError(
+            title="A required terminal tool is missing",
+            explanation=(
+                "claude-anyteam needs tmux on Linux/macOS so teammates can appear in Claude Code panes."
+            ),
+            action=f"Install tmux for your OS, then run `claude-anyteam install` again.\n{_install_instructions(prereq.platform)}",
+            severity="blocker",
+            details=message,
+        )
 
     provider_preamble_rendered = False
     if provider_status_callback is not None:
         provider_status_callback(
             _format_provider_preamble(
-                codex_status,
-                gemini_status,
+                *provider_statuses,
                 force_empty=force_empty,
             )
         )
         provider_preamble_rendered = True
 
-    if not _any_provider_ready(codex_status, gemini_status) and not force_empty:
+    if not _any_provider_ready(codex_status, gemini_status, kimi_status) and not force_empty:
         message = (
             _format_no_provider_refusal_message()
             if provider_preamble_rendered
-            else _format_no_provider_ready_message(codex_status, gemini_status)
+            else _format_no_provider_ready_message(*provider_statuses)
         )
-        err = InstallError(message)
-        err.cli_exit_code = INSTALL_ERROR_EXIT_NO_PROVIDER  # type: ignore[attr-defined]
-        raise err
+        raise InstallError(
+            title="No provider CLI is signed in",
+            explanation=(
+                "claude-anyteam routes teammates through provider CLIs, and none of the detected providers are ready yet."
+            ),
+            action="Run `codex login`, `gemini login`, or `kimi login`, then run `claude-anyteam install` again.",
+            severity="blocker",
+            details=message,
+            cli_exit_code=INSTALL_ERROR_EXIT_NO_PROVIDER,
+        )
 
     paths = discover_managed_paths(
         settings_path=settings_path,
@@ -1905,8 +2236,10 @@ def install(
             settings_file_created_by_anyteam=not existed,
             codex_cli=codex_cli,
             gemini_cli=gemini_cli,
+            kimi_cli=kimi_cli if kimi_cli.found else None,
             codex_auth=codex_auth,
             gemini_auth=gemini_auth,
+            kimi_auth=kimi_auth if kimi_cli.found else None,
             force_empty_used=force_empty,
             permissions_allow_added_by_anyteam=permissions_allow_managed,
             permissions_allowlist_skipped=no_allowlist,
@@ -1921,6 +2254,16 @@ def install(
         )
         raise
 
+    diagnostics = _collect_soft_diagnostics(codex_cli, gemini_cli, kimi_cli)
+    if register_plugin:
+        registrar = plugin_registration_fn or _register_claude_plugin
+        try:
+            plugin_diagnostic = registrar()
+        except Exception as exc:
+            plugin_diagnostic = _plugin_registration_error(f"{type(exc).__name__}: {exc}")
+        if plugin_diagnostic is not None:
+            diagnostics = (*diagnostics, plugin_diagnostic)
+
     return InstallResult(
         paths=paths,
         created_file=not existed,
@@ -1930,10 +2273,14 @@ def install(
         teammate_mode=mode_result,
         codex_cli=codex_cli,
         gemini_cli=gemini_cli,
+        kimi_cli=kimi_cli,
         codex_auth=codex_auth,
         gemini_auth=gemini_auth,
+        kimi_auth=kimi_auth,
         codex_status=codex_status,
         gemini_status=gemini_status,
+        kimi_status=kimi_status,
+        diagnostics=diagnostics,
         force_empty_used=force_empty,
         permissions_allow_added=permissions_allow_added,
         permissions_allow_managed=permissions_allow_managed,
@@ -1958,6 +2305,8 @@ def _rollback_settings_file(
             path.unlink()
         except FileNotFoundError:
             pass
+        except OSError as exc:
+            raise _settings_write_error(path, exc) from exc
         return
 
     _write_settings(path, pre_settings_snapshot)
@@ -2091,6 +2440,8 @@ def uninstall(
                 settings_file_removed = True
             except FileNotFoundError:
                 settings_file_removed = True
+            except OSError as exc:
+                raise _settings_write_error(path, exc) from exc
         else:
             _write_settings(path, settings)
 
@@ -2145,6 +2496,22 @@ def _gemini_render_status(gemini: GeminiCliCheck) -> ProviderStatus:
     )
 
 
+def _kimi_render_status(kimi: KimiCliCheck) -> ProviderStatus:
+    if not kimi.found:
+        state: ProviderState = "MISSING"
+    elif kimi.signed_in:
+        state = "READY"
+    else:
+        state = "NEEDS_SIGNIN"
+    return ProviderStatus(
+        provider_key="kimi",
+        display_name="Kimi CLI",
+        summary_name="Kimi",
+        state=state,
+        version=kimi.version,
+    )
+
+
 def _provider_row(status: ProviderStatus) -> str:
     return f"{status.display_name:<14}{status.installed_cell():<18}{status.signin_cell()}"
 
@@ -2153,26 +2520,36 @@ def _provider_summary_entry(status: ProviderStatus) -> str:
     return status.summary_entry()
 
 
-def _aggregate_summary_line(codex: ProviderStatus, gemini: ProviderStatus) -> str:
-    if _any_provider_ready(codex, gemini):
+def _provider_statuses_for_display(*statuses: ProviderStatus) -> tuple[ProviderStatus, ...]:
+    # Kimi is currently optional/next-up in many installs. Keep the legacy
+    # Codex/Gemini-only display unless Kimi is actually detected, while still
+    # allowing Kimi to make the install pass when it is ready.
+    return tuple(
+        status
+        for status in statuses
+        if status.provider_key != "kimi" or status.state != "MISSING"
+    )
+
+
+def _aggregate_summary_line(*statuses: ProviderStatus) -> str:
+    if _any_provider_ready(*statuses):
         lead = "Ready"
-    elif codex.state == "NEEDS_SIGNIN" or gemini.state == "NEEDS_SIGNIN":
+    elif any(status.state == "NEEDS_SIGNIN" for status in statuses):
         lead = "Almost ready"
     else:
         lead = "Not ready"
-    return f"{lead}: {_provider_summary_entry(codex)} · {_provider_summary_entry(gemini)}."
+    return f"{lead}: {' · '.join(_provider_summary_entry(status) for status in statuses)}."
 
 
-def _format_provider_status_rows(codex: ProviderStatus, gemini: ProviderStatus) -> str:
+def _format_provider_status_rows(*statuses: ProviderStatus) -> str:
     return "\n".join(
-        [
+        (
             "Provider status",
             PROVIDER_STATUS_RULE,
             f"{'':<14}{'Installed?':<18}{'Signed in?'}",
-            _provider_row(codex),
-            _provider_row(gemini),
+            *(_provider_row(status) for status in statuses),
             PROVIDER_STATUS_RULE,
-        ]
+        )
     )
 
 
@@ -2197,11 +2574,11 @@ def _render_provider_walkthrough(codex: CodexCliCheck, gemini: GeminiCliCheck) -
     )
 
 
-def _format_provider_status_table(codex: ProviderStatus, gemini: ProviderStatus) -> str:
+def _format_provider_status_table(*statuses: ProviderStatus) -> str:
     return "\n".join(
         [
-            _format_provider_status_rows(codex, gemini),
-            _aggregate_summary_line(codex, gemini),
+            _format_provider_status_rows(*statuses),
+            _aggregate_summary_line(*statuses),
         ]
     )
 
@@ -2209,7 +2586,7 @@ def _format_provider_status_table(codex: ProviderStatus, gemini: ProviderStatus)
 def _format_no_provider_explainer() -> str:
     return "\n".join(
         [
-            "claude-anyteam routes some Claude Code teammates to external AI CLIs (Codex, Gemini).",
+            "claude-anyteam routes some Claude Code teammates to external AI CLIs (Codex, Gemini, Kimi).",
             "You need at least one signed-in CLI for it to do anything useful.",
             "Pick whichever you have access to.",
         ]
@@ -2233,7 +2610,7 @@ def _format_codex_walkthrough(status: ProviderStatus) -> str:
         step += 1
 
     if status.state in ("MISSING", "NEEDS_SIGNIN"):
-        lines.append(f"  {step}. Sign in:  {CODEX_CLI_BINARY}     (opens an OAuth flow on first run)")
+        lines.append(f"  {step}. Sign in:  {CODEX_CLI_BINARY} login")
     lines.append(f"  Docs: {CODEX_CLI_DOCS_URL}")
     return "\n".join(lines)
 
@@ -2254,17 +2631,38 @@ def _format_gemini_walkthrough(status: ProviderStatus) -> str:
 
     if status.state in ("MISSING", "NEEDS_SIGNIN"):
         lines.append(
-            f"  {step}. Sign in:  {GEMINI_CLI_BINARY}    "
+            f"  {step}. Sign in:  {GEMINI_CLI_BINARY} login    "
             "(or set GEMINI_API_KEY, or configure Vertex)"
         )
     lines.append(f"  Docs: {GEMINI_CLI_DOCS_URL}")
     return "\n".join(lines)
 
 
-def _format_provider_walkthroughs(codex: ProviderStatus, gemini: ProviderStatus) -> str:
+def _format_kimi_walkthrough(status: ProviderStatus) -> str:
+    if status.state == "READY" or status.state == "MISSING":
+        return ""
+
+    lines = ["Kimi CLI:"]
+    if status.state == "NEEDS_SIGNIN":
+        lines.append(f"  1. Sign in:  {KIMI_CLI_BINARY} login")
+    lines.append(f"  Docs: {KIMI_CLI_DOCS_URL}")
+    return "\n".join(lines)
+
+
+def _format_provider_walkthrough(status: ProviderStatus) -> str:
+    if status.provider_key == "codex":
+        return _format_codex_walkthrough(status)
+    if status.provider_key == "gemini":
+        return _format_gemini_walkthrough(status)
+    if status.provider_key == "kimi":
+        return _format_kimi_walkthrough(status)
+    return ""
+
+
+def _format_provider_walkthroughs(*statuses: ProviderStatus) -> str:
     blocks = [
         block
-        for block in (_format_codex_walkthrough(codex), _format_gemini_walkthrough(gemini))
+        for block in (_format_provider_walkthrough(status) for status in statuses)
         if block
     ]
     return "\n\n".join(blocks)
@@ -2280,16 +2678,14 @@ def _format_no_provider_refusal_message() -> str:
 
 
 def _format_provider_preamble(
-    codex: ProviderStatus,
-    gemini: ProviderStatus,
-    *,
+    *statuses: ProviderStatus,
     force_empty: bool = False,
 ) -> str:
-    blocks = [_format_provider_status_table(codex, gemini)]
-    no_provider_ready = not _any_provider_ready(codex, gemini)
+    blocks = [_format_provider_status_table(*statuses)]
+    no_provider_ready = not _any_provider_ready(*statuses)
     if no_provider_ready:
         blocks.append(_format_no_provider_explainer())
-    walkthrough = _format_provider_walkthroughs(codex, gemini)
+    walkthrough = _format_provider_walkthroughs(*statuses)
     if walkthrough:
         blocks.append(walkthrough)
     if force_empty and no_provider_ready:
@@ -2299,14 +2695,25 @@ def _format_provider_preamble(
     return "\n\n".join(blocks)
 
 
-def _format_no_provider_ready_message(codex: ProviderStatus, gemini: ProviderStatus) -> str:
+def _format_no_provider_ready_message(*statuses: ProviderStatus) -> str:
     blocks = [
-        _format_provider_status_table(codex, gemini),
+        _format_provider_status_table(*statuses),
         _format_no_provider_explainer(),
-        _format_provider_walkthroughs(codex, gemini),
+        _format_provider_walkthroughs(*statuses),
         _format_no_provider_refusal_message(),
     ]
     return "\n\n".join(block for block in blocks if block)
+
+
+def _format_soft_diagnostic(diagnostic: InstallError) -> str:
+    return "\n".join(
+        [
+            f"Warning: {diagnostic.title}",
+            diagnostic.explanation,
+            f"Next step: {diagnostic.action}",
+            f"Severity: {diagnostic.severity}",
+        ]
+    )
 
 
 def format_install_message(result: InstallResult, *, include_provider_status: bool = True) -> str:
@@ -2320,16 +2727,29 @@ def format_install_message(result: InstallResult, *, include_provider_status: bo
         result.gemini_cli or GeminiCliCheck(found=False, path=None, version=None, raw_output=None),
         result.gemini_auth or AuthCheck(signed_in=False),
     )
+    kimi_status = result.kimi_status or _kimi_provider_status(
+        result.kimi_cli or KimiCliCheck(found=False, path=None, version=None, raw_output=None),
+        result.kimi_auth or AuthCheck(signed_in=False),
+    )
+    statuses = _provider_statuses_for_display(codex_status, gemini_status, kimi_status)
 
-    if codex_status is not None and gemini_status is not None:
-        if include_provider_status:
-            lines.append(
-                _format_provider_preamble(
-                    codex_status,
-                    gemini_status,
-                    force_empty=result.force_empty_used,
-                )
+    if include_provider_status:
+        lines.append(
+            _format_provider_preamble(
+                *statuses,
+                force_empty=result.force_empty_used,
             )
+        )
+
+    if result.diagnostics:
+        lines.append(
+            "\n\n".join(_format_soft_diagnostic(diagnostic) for diagnostic in result.diagnostics)
+        )
+
+    if result.prereq is not None and result.prereq.platform == "windows":
+        lines.append(
+            "Windows note: tmux is skipped on Windows; Agent Teams works in single-terminal mode."
+        )
 
     receipt_lines = [
         f"Updated {result.paths.settings_path}",

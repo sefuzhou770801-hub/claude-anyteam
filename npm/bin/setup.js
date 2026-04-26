@@ -7,9 +7,12 @@ import yoctoSpinner from 'yocto-spinner';
 import {
   TOOL_NAME,
   UV_INSTALL_DIR,
+  UV_TOOL_BIN_DIR,
   detectPython,
   detectUv,
+  ensureWindowsLongPaths,
   findInstalledTool,
+  formatDisplayPath,
   formatCommand,
   installTool,
   installUv,
@@ -17,6 +20,8 @@ import {
   isInteractive,
   manualInstallLines,
   runCommand,
+  uvToolEnv,
+  windowsInstallAdvice,
   which,
 } from '../lib/detect.js';
 import { renderBanner, renderBox, theme } from '../lib/art.js';
@@ -58,12 +63,17 @@ function parseArgs(argv) {
 }
 
 function usage() {
+  const settingsPath = process.platform === 'win32' ? '~\\.claude\\settings.json' : '~/.claude/settings.json';
+  const claudeJsonPath = process.platform === 'win32' ? '~\\.claude.json' : '~/.claude.json';
+  const prereqSummary = process.platform === 'win32'
+    ? 'uses Windows single-terminal mode when tmux/psmux is unavailable, probes for the Codex CLI 0.120+ and Gemini CLI'
+    : 'verifies tmux/psmux on PATH and probes for the Codex CLI 0.120+ and Gemini CLI';
   return [
     'Usage: npx --yes claude-anyteam [--settings-path <path>] [--postinstall]',
     '',
     'Installs uv if needed, installs the Python claude-anyteam tool, delegates',
-    'the ~/.claude/settings.json + ~/.claude.json writes to the Python installer',
-    '(which verifies tmux/psmux on PATH and probes for the Codex CLI 0.120+ and Gemini CLI),',
+    `the ${settingsPath} + ${claudeJsonPath} writes to the Python installer`,
+    `(which ${prereqSummary}),`,
     'and registers the Claude Code plugin when the claude CLI is available on PATH.',
   ].join('\n');
 }
@@ -142,6 +152,48 @@ function trimmedDetails(error) {
   return String(error?.details || error?.message || '').trim();
 }
 
+function pythonLabel() {
+  return process.platform === 'win32' ? 'Python 3' : 'python3';
+}
+
+function settingsDisplayPath() {
+  return process.platform === 'win32' ? '~\\.claude\\settings.json' : '~/.claude/settings.json';
+}
+
+function claudeJsonDisplayPath() {
+  return process.platform === 'win32' ? '~\\.claude.json' : '~/.claude.json';
+}
+
+function workspaceExamplePath() {
+  return process.platform === 'win32' ? 'C:\\path\\to\\workspace' : '/path/to/workspace';
+}
+
+function powershellLongPathsCommand() {
+  return 'New-ItemProperty -Path "HKLM:\\SYSTEM\\CurrentControlSet\\Control\\FileSystem" -Name LongPathsEnabled -Value 1 -PropertyType DWord -Force';
+}
+
+function pythonMissingTranslation(issue) {
+  if (issue?.kind === 'windows-store-python-stub') {
+    return {
+      id: 'uv-windows-store-python',
+      title: 'Windows Store Python shim detected',
+      explanation: 'Windows resolved python.exe to the Microsoft Store app execution alias, not a working Python interpreter.',
+      action: 'From PowerShell run `winget install Python.Python.3.12`; if Windows still opens the Store, disable python.exe and python3.exe under Settings > Apps > Advanced app settings > App execution aliases.',
+      severity: 'hard',
+      raw: `Microsoft Store Python app execution alias at ${formatDisplayPath(issue.path)}: ${issue.details}`,
+    };
+  }
+  return translate('no python interpreter found');
+}
+
+function windowsAdvice(error, options = {}) {
+  return windowsInstallAdvice(error, options);
+}
+
+function windowsAdviceLines(advice) {
+  return advice.map((line) => `${theme.symbols.info} ${line}`);
+}
+
 function postinstallHint(error) {
   const reason = trimmedDetails(error) || error.message;
   console.warn(`claude-anyteam: automatic setup skipped (${reason.split(/\r?\n/, 1)[0]}). Run npx --yes claude-anyteam to finish.`);
@@ -183,7 +235,7 @@ function failedClaudePluginResult(error) {
 
 // Delegate the three-file install (~/.claude/settings.json, ~/.claude.json,
 // install-state.json + plugin-data dir) to the Python installer. The Python
-// installer is the single source of truth for prereq check, tmux/psmux
+// installer is the single source of truth for prereq checks, display-mode
 // install instructions, teammateMode handling, and state-file writes.
 //
 // Primary invocation is `uv tool run --from claude-anyteam claude-anyteam
@@ -191,8 +243,7 @@ function failedClaudePluginResult(error) {
 // the user's shell PATH being refreshed post-`uv tool install`.
 //
 // stdio is fully inherited so the Python installer's platform-aware
-// instructions ("sudo apt install tmux", "winget install psmux", etc.)
-// reach the user verbatim. We do not re-wrap Python's errors; its messages
+// instructions reach the user verbatim. We do not re-wrap Python's errors; its messages
 // are more actionable than any JS prose we could layer on top.
 //
 // The caller is expected to pass --settings-path only when explicitly
@@ -213,7 +264,7 @@ function runPythonInstaller({ uvPath, settingsPath, stdio = 'inherit' }) {
   }
   return new Promise((resolve, reject) => {
     const child = spawn(uvPath, args, {
-      env: process.env,
+      env: uvToolEnv(process.env),
       stdio,
     });
     child.on('error', reject);
@@ -284,13 +335,14 @@ async function main() {
     console.log('');
   }
 
-  const python = await detectPython();
+  const pythonCheck = await detectPython({ diagnostics: true });
+  const python = pythonCheck.python;
   if (!python) {
     if (silent) {
-      postinstallHint(new Error('python3 was not found'));
+      postinstallHint(new Error(`${pythonLabel()} was not found`));
       return 0;
     }
-    const translated = translate('no python interpreter found');
+    const translated = pythonMissingTranslation(pythonCheck.issue);
     printFailure('PYTHON 3.12+ NOT FOUND', [
       ...translatedDiagnosticLines(translated),
       '',
@@ -300,7 +352,7 @@ async function main() {
   }
 
   if (!silent) {
-    console.log(`${theme.symbols.success} ${theme.heading('python3 detected')} ${theme.muted(`(${python.version})`)} ${theme.accent(python.path)}`);
+    console.log(`${theme.symbols.success} ${theme.heading(`${pythonLabel()} detected`)} ${theme.muted(`(${python.version})`)} ${theme.accent(formatDisplayPath(python.path))}`);
   }
 
   if (isPythonVersionTooOld(python.version)) {
@@ -309,7 +361,7 @@ async function main() {
       return 0;
     }
     const translated = translate({
-      raw: `Detected Python ${python.version} at ${python.path}`,
+      raw: `Detected Python ${python.version} at ${formatDisplayPath(python.path)}`,
       pythonVersion: python.version,
     });
     printFailure('PYTHON VERSION TOO OLD', translatedDiagnosticLines(translated));
@@ -318,6 +370,19 @@ async function main() {
 
   let uv = await detectUv();
   if (!uv) {
+    if (process.platform === 'win32') {
+      if (silent) {
+        postinstallHint(new Error('uv is not installed'));
+        return 0;
+      }
+      printFailure('UV NOT INSTALLED', [
+        `${theme.symbols.warn} ${theme.heading('uv is required to install the Python claude-anyteam tool.')}`,
+        `${theme.symbols.info} Install it from PowerShell, then rerun ${theme.accent('npx --yes claude-anyteam')}.`,
+        '',
+        ...manualInstallLines().map((line) => `${theme.symbols.info} ${line}`),
+      ]);
+      return 1;
+    }
     const autoInstall = postinstall || !interactive || (await confirmInstallUv());
     if (!autoInstall) {
       if (silent) {
@@ -351,7 +416,24 @@ async function main() {
   }
 
   if (!silent) {
-    console.log(`${theme.symbols.success} ${theme.heading('uv ready')} ${theme.muted(uv.version)} ${theme.accent(uv.path)}`);
+    console.log(`${theme.symbols.success} ${theme.heading('uv ready')} ${theme.muted(uv.version)} ${theme.accent(formatDisplayPath(uv.path))}`);
+  }
+
+  if (process.platform === 'win32') {
+    const longPaths = await ensureWindowsLongPaths();
+    if (!silent && longPaths.changed) {
+      printWarning('WINDOWS LONG PATHS ENABLED', [
+        `${theme.symbols.success} ${theme.heading('Enabled LongPathsEnabled in the Windows registry for uv tool installs.')}`,
+        `${theme.symbols.info} If uv still reports path-too-long errors, close and reopen PowerShell or reboot Windows, then rerun ${theme.accent('npx --yes claude-anyteam')}.`,
+      ]);
+    } else if (!silent && longPaths.supported && !longPaths.enabled) {
+      printWarning('WINDOWS LONG PATHS MAY BE DISABLED', [
+        `${theme.symbols.warn} ${theme.heading('uv tool install can exceed the default 260-character Windows path limit.')}`,
+        `${theme.symbols.info} Automatic registry update did not succeed: ${trimmedDetails(longPaths) || 'No extra diagnostics.'}`,
+        `${theme.symbols.info} Next step: open PowerShell as Administrator and run:`,
+        `    ${theme.accent(powershellLongPathsCommand())}`,
+      ]);
+    }
   }
 
   let tool;
@@ -359,7 +441,7 @@ async function main() {
   if (existingTool) {
     tool = existingTool;
     if (!silent) {
-      console.log(`${theme.symbols.success} ${theme.heading('existing claude-anyteam tool detected')} ${theme.accent(tool.binaryPath)}`);
+      console.log(`${theme.symbols.success} ${theme.heading('existing claude-anyteam tool detected')} ${theme.accent(formatDisplayPath(tool.binaryPath))}`);
     }
   } else {
     try {
@@ -374,7 +456,14 @@ async function main() {
         platform: process.platform,
         pythonVersion: python.version,
       });
-      printFailure('TOOL INSTALL FAILED', translatedDiagnosticLines(translated, { command }));
+      const advice = windowsAdvice(error, { binDir: UV_TOOL_BIN_DIR });
+      const translatedForDisplay = process.platform === 'win32' && translated.id === 'uv-permission-denied' && advice.length
+        ? { ...translated, action: advice.join(' ') }
+        : translated;
+      printFailure('TOOL INSTALL FAILED', [
+        ...translatedDiagnosticLines(translatedForDisplay, { command }),
+        ...(advice.length ? ['', ...windowsAdviceLines(advice)] : []),
+      ]);
       return 1;
     }
   }
@@ -384,7 +473,10 @@ async function main() {
   // status lines to stdout, and overlaying a spinner would fight with that output.
   if (!silent) {
     console.log('');
-    console.log(`${theme.symbols.info} ${theme.heading('Running claude-anyteam install (Python)')} ${theme.muted('— tmux + Codex/Gemini CLI prereq checks, ~/.claude/settings.json, ~/.claude.json, install-state.json')}`);
+    const pythonInstallerSummary = process.platform === 'win32'
+      ? `— Windows single-terminal compatibility, Codex/Gemini CLI prereq checks, ${settingsDisplayPath()}, ${claudeJsonDisplayPath()}, install-state.json`
+      : `— tmux + Codex/Gemini CLI prereq checks, ${settingsDisplayPath()}, ${claudeJsonDisplayPath()}, install-state.json`;
+    console.log(`${theme.symbols.info} ${theme.heading('Running claude-anyteam install (Python)')} ${theme.muted(pythonInstallerSummary)}`);
   }
   let installerResult;
   try {
@@ -405,6 +497,7 @@ async function main() {
       `${theme.symbols.error} ${theme.heading('Could not invoke the Python installer through uv.')}`,
       `${theme.symbols.info} Details: ${trimmedDetails(error) || error.message}`,
       `${theme.symbols.info} Retry with ${theme.accent(formatCommand(tool.binaryPath, ['install', '--assume-yes']))} after ensuring uv is on PATH.`,
+      ...windowsAdviceLines(windowsAdvice(error, { binDir: tool.binDir })),
     ]);
     return 1;
   }
@@ -458,17 +551,17 @@ async function main() {
   // to stdout. Success box avoids duplicating that — it covers only what Python
   // doesn't know about (plugin registration status, launch template, restart
   // reminder) so there's no noise.
-  const launchTemplate = `${tool.binaryPath} --team my-team --name codex-alice --cwd /path/to/workspace  # or --name gemini-alice --cwd /path/to/workspace`;
+  const launchTemplate = `${formatCommand(tool.binaryPath, ['--team', 'my-team', '--name', 'codex-alice', '--cwd', workspaceExamplePath()])}  # or --name gemini-alice --cwd ${workspaceExamplePath()}`;
   const toolVerb = tool.installMode === 'existing' ? 'reused existing install' : 'installed with uv tool install';
   printSuccess([
     `${theme.symbols.success} Tool status = ${theme.accent(toolVerb)}`,
     `${theme.symbols.info} Claude Code plugin: ${theme.accent(claudePlugin.summary)}`,
-    `${theme.symbols.info} uv tool bin directory = ${theme.accent(tool.binDir)}`,
+    `${theme.symbols.info} uv tool bin directory = ${theme.accent(formatDisplayPath(tool.binDir))}`,
     '',
     `${theme.symbols.info} Launch template:`,
     `    ${theme.accent(launchTemplate)}`,
     '',
-    `${theme.symbols.warn} Restart Claude Code so it reloads ${theme.accent('~/.claude/settings.json')}.`,
+    `${theme.symbols.warn} Restart Claude Code so it reloads ${theme.accent(settingsDisplayPath())}.`,
   ]);
   console.log(`${theme.symbols.success} ${theme.heading('Your claude-anyteam launcher is live.')} Codex/Gemini-powered teammates use the ${theme.accent('codex-')} or ${theme.accent('gemini-')} prefix today in Claude Code's external spawn flow.`);
   return 0;
