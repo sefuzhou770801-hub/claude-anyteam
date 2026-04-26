@@ -1,8 +1,8 @@
 # Configuration
 
-claude-anyteam now supports two routed backend prefixes by default: `codex-*` for Codex and `gemini-*` for Gemini CLI. Shared settings such as `CLAUDE_ANYTEAM_TEAM`, `CLAUDE_ANYTEAM_NAME`, `CLAUDE_ANYTEAM_CWD`, `CLAUDE_ANYTEAM_MODEL`, and per-agent `model` config apply to both. Codex-only settings include `CODEX_BINARY`, `CLAUDE_ANYTEAM_APP_SERVER`, and `CLAUDE_ANYTEAM_EFFORT`. Gemini-only settings include `CLAUDE_ANYTEAM_GEMINI_BINARY`, `CLAUDE_ANYTEAM_GEMINI_HOME`, `CLAUDE_ANYTEAM_GEMINI_BACKEND`, `CLAUDE_ANYTEAM_GEMINI_EFFORT`, `CLAUDE_ANYTEAM_GEMINI_TRUST`, and `CLAUDE_ANYTEAM_GEMINI_APPROVAL_TIMEOUT`; Gemini effort is mapped through adapter-owned `modelConfigs.customAliases` when a Gemini model is configured.
+claude-anyteam supports three routed backend prefixes by default: `codex-*` for Codex, `gemini-*` for Gemini CLI, and `kimi-*` for Kimi CLI. Shared settings such as `CLAUDE_ANYTEAM_TEAM`, `CLAUDE_ANYTEAM_NAME`, `CLAUDE_ANYTEAM_CWD`, `CLAUDE_ANYTEAM_MODEL`, and per-agent `model` config apply across backends. Codex-only settings include `CODEX_BINARY`, `CLAUDE_ANYTEAM_APP_SERVER`, and `CLAUDE_ANYTEAM_EFFORT`. Gemini-only settings include `CLAUDE_ANYTEAM_GEMINI_BINARY`, `CLAUDE_ANYTEAM_GEMINI_HOME`, `CLAUDE_ANYTEAM_GEMINI_BACKEND`, `CLAUDE_ANYTEAM_GEMINI_EFFORT`, `CLAUDE_ANYTEAM_GEMINI_TRUST`, and `CLAUDE_ANYTEAM_GEMINI_APPROVAL_TIMEOUT`; Gemini effort is mapped through adapter-owned `modelConfigs.customAliases` when a Gemini model is configured. Kimi-only settings include `CLAUDE_ANYTEAM_KIMI_BINARY`, `CLAUDE_ANYTEAM_KIMI_HOME`, `CLAUDE_ANYTEAM_KIMI_BACKEND`, and `CLAUDE_ANYTEAM_KIMI_THINKING`; Kimi effort maps coarsely to thinking on/off.
 
-Gemini teammates use adapter-owned Gemini config/session state and do not mutate the user's real `~/.gemini/settings.json`. See `docs/gemini-adapter-limitations.md` for auth and app-server parity notes.
+Gemini and Kimi teammates use adapter-owned config/session state and do not mutate the user's real `~/.gemini/settings.json` or `~/.kimi/mcp.json`. See `docs/gemini-adapter-limitations.md` for Gemini auth and app-server parity notes.
 
 # Configuration
 
@@ -46,6 +46,22 @@ The adapter passes `--model` through verbatim as `-c model="…"` (fresh-exec) o
 
 When `--model` or `--effort` is unset the adapter emits no override and Codex falls back to the model's own default from `~/.codex/config.toml`. You can mix model and effort per teammate — a `codex-tester` at `gpt-5.5 xhigh` and a `codex-alice` at `gpt-5.4-mini medium` is a supported setup.
 
+## Kimi models and thinking
+
+Kimi model slugs use provider/model form from Kimi's own config. The probed default user-facing slug is:
+
+| Slug | Display | Notes |
+|---|---|---|
+| `kimi-code/kimi-for-coding` | `Kimi-k2.6` | Default Kimi coding model on the probed runtime, OAuth-backed via `managed:kimi-code`, 262k context, thinking/image/video capabilities. |
+
+Kimi has no graded Codex-style reasoning effort or Gemini-style thinking budget in the tested CLI. claude-anyteam maps effort as:
+
+- `minimal` / `low` → pass `--no-thinking`
+- `medium` / `high` / `xhigh` → leave thinking enabled (Kimi default)
+- `CLAUDE_ANYTEAM_KIMI_THINKING=off` forces `--no-thinking`; `on` forces thinking; unset/`auto` follows the effort mapping
+
+Kimi v1 uses headless print mode (`kimi --print --output-format stream-json`) only. It has no Codex App Server `turn/steer`, no CLI `--output-schema`, and its MCP tools are addressed by bare names (`send_message`, `task_update`) rather than Gemini's `mcp_anyteam_*` naming.
+
 ## Environment variables
 
 Every flag has an equivalent env var:
@@ -69,6 +85,10 @@ Every flag has an equivalent env var:
 | `CLAUDE_ANYTEAM_GEMINI_EFFORT` | Gemini thinking effort: `minimal`, `low`, `medium`, `high`, or `xhigh` |
 | `CLAUDE_ANYTEAM_GEMINI_TRUST` | ACP trust policy: `trusted` (default/backward compatible), `default`, or `plan`; non-trusted modes forward permission requests to team-lead via inbox and block only on `deny` decisions or timeout |
 | `CLAUDE_ANYTEAM_GEMINI_APPROVAL_TIMEOUT` | Seconds ACP non-trusted modes wait for a team-lead approval response before failing closed (default: `300`) |
+| `CLAUDE_ANYTEAM_KIMI_BINARY` | path to the `kimi` CLI binary used by `kimi-anyteam` (default: `kimi` on PATH) |
+| `CLAUDE_ANYTEAM_KIMI_HOME` | adapter-owned Kimi home for isolated config/session state |
+| `CLAUDE_ANYTEAM_KIMI_BACKEND` | Kimi transport: `headless` (default) or `acp` (reserved; v1 raises until ACP is wired) |
+| `CLAUDE_ANYTEAM_KIMI_THINKING` | Kimi thinking mode: `auto` (default), `on`, or `off` |
 
 ## Per-teammate configuration (shim path)
 
@@ -90,12 +110,12 @@ The CLI writes atomically, validates the agent/team names against path-traversal
 
 ```json
 {
-  "model": "gpt-5.5",
+  "model": "kimi-code/kimi-for-coding",
   "effort": "xhigh"
 }
 ```
 
-When the shim dispatches a `codex-*` or `gemini-*` teammate, it reads this file (if present) and appends `--model` / `--effort` to the adapter invocation. For Codex, the effect is identical to typing those flags on the command line — both App Server and fresh-exec modes pick them up through the shared `Settings` object. For Gemini, `--effort` maps through adapter-owned model aliases when supported by the selected Gemini model family.
+When the shim dispatches a `codex-*`, `gemini-*`, or `kimi-*` teammate, it reads this file (if present) and appends `--model` / `--effort` to the adapter invocation. For Codex, the effect is identical to typing those flags on the command line — both App Server and fresh-exec modes pick them up through the shared `Settings` object. For Gemini, `--effort` maps through adapter-owned model aliases when supported by the selected Gemini model family. For Kimi, `--model` is passed as `--model <slug>` and effort controls thinking on/off as above.
 
 Behavior:
 
@@ -104,7 +124,19 @@ Behavior:
 - Unknown keys — ignored. Only `model` and `effort` are forwarded today; more keys may be added later.
 - Native (`claude-*`) teammates — the file is not consulted; native dispatch is always pass-through.
 
-Precedence (highest wins): per-agent config file → env vars (`CLAUDE_ANYTEAM_MODEL`, `CLAUDE_ANYTEAM_EFFORT` for Codex, `CLAUDE_ANYTEAM_GEMINI_EFFORT` / `CLAUDE_ANYTEAM_GEMINI_TRUST` for Gemini) → adapter defaults → backend CLI defaults.
+Precedence (highest wins): per-agent config file → env vars (`CLAUDE_ANYTEAM_MODEL`, `CLAUDE_ANYTEAM_EFFORT` for Codex/Kimi, `CLAUDE_ANYTEAM_GEMINI_EFFORT` / `CLAUDE_ANYTEAM_GEMINI_TRUST` for Gemini, `CLAUDE_ANYTEAM_KIMI_THINKING` for Kimi thinking override) → adapter defaults → backend CLI defaults.
+
+## Kimi auth and isolated state
+
+Install Kimi CLI with the upstream package (`pip install kimi-cli` or the current upstream installer), then run:
+
+```bash
+kimi login
+```
+
+The installer detects sign-in by checking the real user home for `~/.kimi/credentials/kimi-code.json`. The runtime copies that OAuth token bundle into the adapter-owned Kimi home on first use; it does not symlink the file, so concurrent `kimi-*` teammates do not race token refreshes. Sessions and Kimi's `kimi.json` work-dir map live under `CLAUDE_ANYTEAM_KIMI_HOME` (default: `~/.cache/claude-anyteam/kimi/<team>/<agent>`), keeping each teammate's Kimi history separate.
+
+The adapter passes the anyteam MCP wrapper through an ephemeral `--mcp-config-file` and leaves the user's persistent `~/.kimi/mcp.json` untouched.
 
 ## Team management CLI
 
@@ -124,7 +156,9 @@ All three commands fail with exit 1 (or 2 for argparse errors) on missing teams,
 |---|---|
 | `CLAUDE_CODE_TEAMMATE_COMMAND` | Set by the installer to the shim binary path. Claude Code reads this to route teammate spawns. |
 | `CLAUDE_ANYTEAM_BINARY` | Set by the installer to the adapter binary path. The shim uses this to know where to dispatch `codex-*` spawns. |
-| `CODEX_TEAMMATE_SHIM_MATCH` | Regex for agent names to route to the Codex adapter. Default `^codex-`. Override if you want a different convention. |
+| `CLAUDE_ANYTEAM_GEMINI_BINARY` | Set by the installer to the Gemini adapter binary path. The shim uses this for `gemini-*` spawns. |
+| `CLAUDE_ANYTEAM_KIMI_BINARY` | Set by the installer to the Kimi adapter binary path. The shim uses this for `kimi-*` spawns. |
+| `CLAUDE_ANYTEAM_SHIM_MATCH` / `CLAUDE_ANYTEAM_GEMINI_SHIM_MATCH` / `CLAUDE_ANYTEAM_KIMI_SHIM_MATCH` | Regexes for `codex-*`, `gemini-*`, and `kimi-*` routing. Defaults: `^codex-`, `^gemini-`, `^kimi-`. |
 | `CODEX_TEAMMATE_NATIVE_CLAUDE` | Path to the native `claude` binary. Auto-detected; only set if the shim picks the wrong one. |
 
 ## Teammate display mode
@@ -133,9 +167,9 @@ Claude Code's `teammateMode` key (in `~/.claude.json`, not settings.json) contro
 
 | Value | Behavior |
 |---|---|
-| `"tmux"` | Spawn teammates as real subprocesses inside a tmux/psmux session. **Required for Codex teammates** — the pane backend is what triggers the TUI presence line registration and lets `claude-anyteam` run as a full process with its own Codex session. |
-| `"auto"` | Choose based on environment. On a non-tmux terminal this typically falls back to in-process, which does not fire the shim → Codex teammates would never launch. |
-| `"in-process"` | Spawn teammates as coroutines inside the main Claude Code process. Valid for native Claude teammates only — the shim is never invoked, so `codex-*` names cannot route to this adapter. |
+| `"tmux"` | Spawn teammates as real subprocesses inside a tmux/psmux session. **Required for external CLI teammates** — the pane backend is what triggers the TUI presence line registration and lets `claude-anyteam`, `gemini-anyteam`, or `kimi-anyteam` run as full processes with their own backend sessions. |
+| `"auto"` | Choose based on environment. On a non-tmux terminal this typically falls back to in-process, which does not fire the shim → external CLI teammates would never launch. |
+| `"in-process"` | Spawn teammates as coroutines inside the main Claude Code process. Valid for native Claude teammates only — the shim is never invoked, so `codex-*`, `gemini-*`, and `kimi-*` names cannot route to this adapter. |
 
 ### Installing a multiplexer
 
@@ -169,7 +203,7 @@ If you launch Claude Code from inside a tmux session, teammates split your curre
 
 ## Plan mode
 
-Launch with `--plan-mode` (or `CLAUDE_ANYTEAM_PLAN_MODE=true`) to register with `planModeRequired: true`. The adapter will then respond to inbound `plan_approval_request` messages by invoking Codex once with `--output-schema plan.schema.json` and replying with a structured plan.
+Launch with `--plan-mode` (or `CLAUDE_ANYTEAM_PLAN_MODE=true`) to register with `planModeRequired: true`. The adapter will then respond to inbound `plan_approval_request` messages with a structured plan. Codex can use `--output-schema`; Gemini and Kimi embed the schema in the prompt and validate the final message in Python.
 
 ```bash
 setsid nohup claude-anyteam \
@@ -209,7 +243,7 @@ Codex's own help text describes the bypass flag as "intended solely for running 
 claude-anyteam uninstall
 ```
 
-Removes the two env keys from `~/.claude/settings.json`. Preserves everything else.
+Removes the managed env keys from `~/.claude/settings.json` (`CLAUDE_CODE_TEAMMATE_COMMAND`, `CLAUDE_ANYTEAM_BINARY`, `CLAUDE_ANYTEAM_GEMINI_BINARY`, and `CLAUDE_ANYTEAM_KIMI_BINARY`). Preserves everything else.
 
 Or, to fully remove:
 

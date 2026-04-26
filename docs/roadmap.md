@@ -1,6 +1,6 @@
 # Roadmap
 
-Shipped/partial: multi-backend routing now supports Codex (`codex-*`) and Gemini CLI (`gemini-*`). Remaining Gemini work is ACP exploration and closing documented parity gaps in `docs/gemini-adapter-limitations.md`.
+Shipped/partial: multi-backend routing now supports Codex (`codex-*`), Gemini CLI (`gemini-*`), and Kimi CLI (`kimi-*`). Remaining Gemini work is ACP hardening and closing documented parity gaps in `docs/gemini-adapter-limitations.md`; remaining Kimi work is ACP/turn-steer research beyond the v1 headless adapter.
 
 # Roadmap
 
@@ -10,24 +10,25 @@ Shipped/partial: multi-backend routing now supports Codex (`codex-*`) and Gemini
 
 **Gemini adapter** — Gemini CLI teammates through the `gemini-*` prefix. Shipped with documented limitations: headless `gemini --prompt ... --output-format stream-json` execution is supported, while ACP / mid-turn steering and Codex-style `thread/fork` parity remain tracked in [Gemini adapter limitations](gemini-adapter-limitations.md).
 
+**Kimi adapter** — Kimi CLI teammates through the `kimi-*` prefix. Shipped with headless `kimi --print --output-format stream-json`, adapter-owned HOME isolation, OAuth token copy from `~/.kimi/credentials/kimi-code.json`, bare-name MCP wrapper tools, and the default user-facing model slug `kimi-code/kimi-for-coding` (`Kimi-k2.6`, 262k context). Best for architectural-stretch tasks, large-context review, and Kimi-native skills/swarm workflows.
+
 **Install surfaces** — npm (`npx --yes --package claude-anyteam claude-anyteam-setup`), direct (`uv tool install`), and Claude Code plugin (marketplace install + self-healing SessionStart hook). All three write the same settings and interop.
 
-**TUI parity** — Codex and Gemini teammates appear in Claude Code's Agent Teams presence line exactly like native teammates. Works in tmux and single-terminal modes. Task claiming, idle signaling, and shutdown lifecycle share the same protocol path; Gemini peer-message steering has the documented limitations above.
+**TUI parity** — Codex, Gemini, and Kimi teammates appear in Claude Code's Agent Teams presence line exactly like native teammates. Works in tmux and single-terminal modes. Task claiming, idle signaling, and shutdown lifecycle share the same protocol path; Gemini/Kimi peer-message steering has the documented limitations above.
 
 **Plan mode** — opt-in structured plan approval with JSON-schema-validated plan artifacts.
 
 ## Coming next
 
-These are the adapters planned on the same architecture. Each one is a Python adapter module + a line in the spawn shim's routing table. Gemini has moved out of planned status and is shipping with [documented limitations](gemini-adapter-limitations.md).
+These are the adapters planned on the same architecture. Each one is a Python adapter module + a line in the spawn shim's routing table. Gemini and Kimi have moved out of planned status and are shipping with documented limitations.
 
 | Adapter | Model(s) | Backend CLI | Status |
 |---|---|---|---|
-| **Kimi** | Kimi K2 family | Moonshot's CLI (first-class swarm primitives, native skills, ACP, MCP) | Next — see [rationale](internal/kimi-rationale.md) |
 | **GLM** | GLM-4.x family | Zhipu's CLI | Planned (after Kimi) |
 | **DeepSeek** | DeepSeek V3 / R1 | DeepSeek's CLI or API-direct | Planned (after Kimi) |
 | **Generic API adapter** | Any OpenAI-compatible endpoint | Direct HTTP | Planned — covers OpenRouter, LM Studio, local vLLM, etc. |
 
-Kimi is sequenced first deliberately: it's the most architecturally distinct mainstream coding CLI, with its own multi-agent model, and resolving how `claude-anyteam`'s team layer composes with that is the most important architectural decision left to make. GLM / DeepSeek / Qwen become trivially easy after Kimi. See [`docs/internal/kimi-rationale.md`](internal/kimi-rationale.md) for the full reasoning.
+Kimi was sequenced first deliberately: it's the most architecturally distinct mainstream coding CLI, with its own multi-agent model. The v1 decision is now shipped: one anyteam teammate maps to one root Kimi session, while Kimi's internal skills/swarm remain private implementation details unless a future protocol extension bridges them. GLM / DeepSeek / Qwen become easier after this. See [`docs/internal/kimi-rationale.md`](internal/kimi-rationale.md) for the full reasoning.
 
 ## Contributing a new adapter
 
@@ -49,6 +50,7 @@ If you're thinking of adding an adapter, open an issue first — we can scope th
 - **Custom rendering in the Claude Code TUI beyond presence line.** Claude Code's TUI renders agent types uniformly; we don't fight that.
 - **Multi-team coordination.** One adapter instance serves one team. Multi-team overlays belong in a higher-level orchestration tool, not here.
 - **LLM wrapping.** We don't wrap external models inside a Claude instance. That's the anti-pattern this project exists to avoid.
+- **Kimi ACP / live steering in v1.** Kimi ACP exists but is deferred until stdout flushing and method semantics are proven. Kimi v1 uses headless print mode and next-prompt steer only.
 
 ## Longer term
 

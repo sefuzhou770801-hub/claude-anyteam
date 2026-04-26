@@ -1,0 +1,4 @@
+{"role":"assistant","content":[],"tool_calls":[{"type":"function","id":"tool_SLtq9KD1m830rcCooSgyJTSS","function":{"name":"Shell","arguments":"{\"command\": \"pwd\"}"}},{"type":"function","id":"tool_gVWLUgKMrDCbzOlzITlOJPV2","function":{"name":"Shell","arguments":"{\"command"}}]}
+{"role":"tool","content":[{"type":"text","text":"<system>Command executed successfully.</system>"},{"type":"text","text":"/REDACTED/tests/fixtures/kimi/workspaces/empty\n"}],"tool_call_id":"tool_SLtq9KD1m830rcCooSgyJTSS"}
+{"role":"tool","content":[{"type":"text","text":"<system>Command executed successfully.</system>"},{"type":"text","text":"REDACTED\n"}],"tool_call_id":"tool_gVWLUgKMrDCbzOlzITlOJPV2"}
+Max number of steps reached: 1

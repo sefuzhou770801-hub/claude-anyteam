@@ -17,6 +17,8 @@ from .env import (
     LEGACY_BINARY_ENV,
     GEMINI_BINARY_ENV,
     GEMINI_SHIM_MATCH_ENV,
+    KIMI_BINARY_ENV,
+    KIMI_SHIM_MATCH_ENV,
     LEGACY_NATIVE_CLAUDE_ENV,
     LEGACY_SHIM_MATCH_ENV,
     NATIVE_CLAUDE_ENV,
@@ -26,9 +28,11 @@ from .env import (
 
 DEFAULT_CODEX_MATCH = r"^codex-"
 DEFAULT_GEMINI_MATCH = r"^gemini-"
+DEFAULT_KIMI_MATCH = r"^kimi-"
 PRIMARY_BINARY = "claude-anyteam"
 LEGACY_BINARY = "codex-teammate"
 GEMINI_BINARY = "gemini-anyteam"
+KIMI_BINARY = "kimi-anyteam"
 
 
 @dataclass
@@ -210,6 +214,10 @@ def _gemini_route(parsed: ParsedArgs) -> bool:
     return _route_match(parsed, env_name=GEMINI_SHIM_MATCH_ENV, legacy_env_name=None, default=DEFAULT_GEMINI_MATCH)
 
 
+def _kimi_route(parsed: ParsedArgs) -> bool:
+    return _route_match(parsed, env_name=KIMI_SHIM_MATCH_ENV, legacy_env_name=None, default=DEFAULT_KIMI_MATCH)
+
+
 
 def _log_dispatch(
     route: str,
@@ -284,6 +292,13 @@ def main(argv: list[str] | None = None) -> int:
         binary = _require_binary(_resolve_binary(GEMINI_BINARY, GEMINI_BINARY_ENV), GEMINI_BINARY)
         adapter_argv, agent_config = _adapter_argv(binary, parsed, include_effort=True)
         _log_dispatch("gemini", parsed.agent_name, binary, agent_config or None)
+        os.execv(binary, adapter_argv)
+        return 0
+
+    if _kimi_route(parsed):
+        binary = _require_binary(_resolve_binary(KIMI_BINARY, KIMI_BINARY_ENV), KIMI_BINARY)
+        adapter_argv, agent_config = _adapter_argv(binary, parsed, include_effort=True)
+        _log_dispatch("kimi", parsed.agent_name, binary, agent_config or None)
         os.execv(binary, adapter_argv)
         return 0
 
