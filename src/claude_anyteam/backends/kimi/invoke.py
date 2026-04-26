@@ -223,6 +223,12 @@ def feature_test(kimi_binary: str = "kimi") -> None:
     resolved = shutil.which(kimi_binary)
     if not resolved:
         raise RuntimeError(f"kimi binary not found on PATH (expected {kimi_binary!r}). Install and authenticate Kimi CLI.")
+    resolved_wrapper = shutil.which("claude-anyteam-wrapper")
+    if not resolved_wrapper:
+        raise RuntimeError(
+            "claude-anyteam-wrapper not on PATH. Ensure the adapter is installed "
+            "in this environment (e.g. `uv sync` or `pip install -e .`)."
+        )
     try:
         info = subprocess.run([kimi_binary, "info"], capture_output=True, text=True, timeout=10, check=True)
         # Kimi's typer/rich help truncates long flag names with "…" at narrow
@@ -248,39 +254,12 @@ def feature_test(kimi_binary: str = "kimi") -> None:
     signed_in, detail = _check_kimi_signin(Path.home())
     if not signed_in:
         logger.warn("kimi.signin.missing", detail=detail)
-    logger.info("kimi.version", binary=str(Path(resolved).resolve()), info=(info.stdout or info.stderr).strip())
-
-    # Lightweight end-to-end headless smoke: verifies auth, print mode, and JSONL.
-    with tempfile.TemporaryDirectory(prefix="claude-anyteam-kimi-feature-") as td:
-        env = dict(os.environ)
-        env.setdefault("KIMI_CLI_NO_AUTO_UPDATE", "1")
-        try:
-            smoke = subprocess.run(
-                [
-                    kimi_binary,
-                    "--print",
-                    "--output-format=stream-json",
-                    "--work-dir",
-                    td,
-                    "--no-thinking",
-                    "--max-steps-per-turn",
-                    "1",
-                    "-p",
-                    "Reply exactly: KIMI_FEATURE_OK",
-                ],
-                capture_output=True,
-                text=True,
-                timeout=60,
-                check=False,
-                env=env,
-                stdin=subprocess.DEVNULL,
-            )
-        except (subprocess.SubprocessError, OSError) as exc:
-            raise RuntimeError(f"could not run Kimi headless smoke test: {exc}") from exc
-    if smoke.returncode != 0:
-        raise RuntimeError(f"Kimi headless smoke failed with exit {smoke.returncode}: {(smoke.stderr or smoke.stdout)[:500]}")
-    if not any(_loads_json_line(line) is not None for line in smoke.stdout.splitlines()):
-        raise RuntimeError("Kimi headless smoke produced no JSON stdout lines")
+    logger.info(
+        "kimi.version",
+        binary=str(Path(resolved).resolve()),
+        wrapper_binary=str(Path(resolved_wrapper).resolve()),
+        info=(info.stdout or info.stderr).strip(),
+    )
 
 
 def _loads_json_line(line: str) -> dict[str, Any] | None:

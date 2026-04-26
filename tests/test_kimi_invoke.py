@@ -10,6 +10,8 @@ import subprocess
 from pathlib import Path
 from typing import Any
 
+import pytest
+
 from claude_anyteam.codex import TASK_COMPLETE_SCHEMA
 from claude_anyteam.backends.kimi import invoke
 
@@ -49,6 +51,55 @@ def _patch_kimi_run(
     return calls
 
 
+def test_feature_test_raises_when_wrapper_binary_missing(monkeypatch):
+    calls: list[list[str]] = []
+
+    def fake_which(binary: str) -> str | None:
+        if binary == "kimi":
+            return "/usr/bin/kimi"
+        if binary == "claude-anyteam-wrapper":
+            return None
+        raise AssertionError(f"unexpected binary probe: {binary}")
+
+    def fake_run(args: list[str], **_kwargs: Any) -> subprocess.CompletedProcess[str]:
+        calls.append(args)
+        return subprocess.CompletedProcess(args, 0, stdout="", stderr="")
+
+    monkeypatch.setattr(invoke.shutil, "which", fake_which)
+    monkeypatch.setattr(invoke.subprocess, "run", fake_run)
+
+    with pytest.raises(RuntimeError, match="claude-anyteam-wrapper not on PATH"):
+        invoke.feature_test("kimi")
+
+    assert calls == []
+
+
+def test_feature_test_does_not_invoke_kimi_print_at_startup(monkeypatch):
+    calls: list[list[str]] = []
+
+    def fake_run(args: list[str], **kwargs: Any) -> subprocess.CompletedProcess[str]:
+        calls.append(args)
+        if args == ["kimi", "info"]:
+            return subprocess.CompletedProcess(args, 0, stdout="kimi-cli version: 1.39.0\n", stderr="")
+        if args == ["kimi", "--help"]:
+            assert kwargs.get("env", {}).get("COLUMNS") == "2000"
+            return subprocess.CompletedProcess(
+                args,
+                0,
+                stdout="--print --output-format --mcp-config-file --no-thinking",
+                stderr="",
+            )
+        raise AssertionError(f"unexpected subprocess.run call: {args}")
+
+    monkeypatch.setattr(invoke.subprocess, "run", fake_run)
+    monkeypatch.setattr(invoke.shutil, "which", lambda b: f"/usr/bin/{b}")
+
+    invoke.feature_test("kimi")
+
+    assert calls == [["kimi", "info"], ["kimi", "--help"]]
+    assert not any("--print" in args for args in calls)
+
+
 def test_feature_test_forces_wide_columns_so_help_flags_render_intact(monkeypatch, tmp_path):
     """Regression: kimi --help truncates `--mcp-config-file` to `--mcp-config-fi…`
     at narrow terminal widths, breaking the substring probe. feature_test must
@@ -71,8 +122,7 @@ def test_feature_test_forces_wide_columns_so_help_flags_render_intact(monkeypatc
             return subprocess.CompletedProcess(
                 args, 0, stdout="kimi-cli version: 1.39.0\n", stderr=""
             )
-        # Smoke run
-        return subprocess.CompletedProcess(args, 0, stdout='{"role":"assistant","content":"KIMI_FEATURE_OK"}\n', stderr="")
+        raise AssertionError(f"unexpected subprocess.run call: {args}")
 
     monkeypatch.setattr(invoke.subprocess, "run", fake_run)
     monkeypatch.setattr(invoke.shutil, "which", lambda b: f"/usr/bin/{b}")
