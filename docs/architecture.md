@@ -95,10 +95,33 @@ The wrapper MCP server exposes a narrowed 6-tool surface to external backends (`
 The same architecture supports any CLI-native model. Each new adapter is:
 
 1. A Python module that implements the shared protocol interface (inbox polling, task claiming, result writing — most of this is already shared code)
-2. A model-specific invocation path (e.g. headless `gemini --prompt ...`, `kimi run`)
+2. A model-specific invocation path (e.g. headless `gemini --prompt ...`, `kimi --print --output-format stream-json ...`)
 3. One entry in the spawn shim's routing table (e.g. `gemini-*` → gemini adapter)
 
 The protocol layer doesn't care which model is backing a teammate. The shim routes by name prefix. Each adapter gets its own binary but shares the same team-protocol semantics.
+
+## Design principle: protocol-first, lossy backend mappings are acceptable
+
+The `--model` and `--effort` knobs are **protocol surfaces**, not backend leak-throughs. Every adapter accepts the same five-tier effort enum (`minimal`, `low`, `medium`, `high`, `xhigh`) and a `--model <slug>` pass-through. Each backend then maps those values to whatever its own CLI exposes — and that mapping is allowed to be lossy.
+
+Examples already in the tree:
+
+- **Codex** has graded `model_reasoning_effort` and accepts the five-tier enum natively, so the mapping is identity.
+- **Gemini** maps the five tiers to adapter-owned `customAliases` thinking budgets (`minimal=0`, `low=512`, `medium=2048`, `high=4096`, `xhigh=8192`). Lossy on Gemini 3 (only three real thinking levels), faithful on Gemini 2.5.
+- **Kimi** has only binary `--thinking` / `--no-thinking` — no graded effort. The adapter maps `minimal`/`low` → `--no-thinking` and `medium`/`high`/`xhigh` → thinking on. So `xhigh` and `medium` collapse to the same internal Kimi state. Lossy and intentional.
+
+The right tradeoff for a multi-backend protocol is **standardize the surface, accept the lossy mapping at the edge.** The alternative — per-backend effort vocabularies — would force coordinating leads to know "Codex effort tiers" vs "Gemini thinking budgets" vs "Kimi thinking on/off" vs whatever GLM/DeepSeek/Qwen will ship next. That's the wrong direction.
+
+Apply the same principle to future adapters and to any new protocol knob:
+
+1. **Define the protocol-side enum once, in the broadest reasonable shape.** (Five tiers for effort because that's what Codex's range covers; that becomes the contract.)
+2. **Map at the adapter boundary, not at call sites.** The control loop and team-cli both pass `--effort xhigh` blindly; only the per-backend `invoke.py` knows that for Kimi this means "no flag, use thinking-on default".
+3. **Document the lossy mapping** in `docs/configuration.md` and the help skill so users understand `xhigh` is a request, not a guarantee.
+4. **Don't leak backend-specific enums into the user surface.** No `--gemini-thinking-budget`, no `--kimi-thinking`. The five-tier `--effort` is enough.
+
+The same applies to model slugs: every adapter accepts `--model <slug>` pass-through. claude-anyteam keeps no allowlist of its own — whatever the backend CLI accepts works. Documentation lists current defaults per backend without enforcing them.
+
+When you add the next adapter (GLM, DeepSeek, generic API), default to this pattern. Reach for a backend-specific knob only when the protocol enum genuinely cannot represent the capability — and even then, prefer extending the protocol over adding a one-off escape hatch.
 
 ## Why no LLM wrapper
 
