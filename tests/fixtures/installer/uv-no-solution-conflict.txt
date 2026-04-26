@@ -1,0 +1,7 @@
+# synthesized: uv/pubgrub-style dependency conflict from `uv tool install --with acme-corp-tools claude-anyteam`.
+× No solution found when resolving dependencies:
+  ╰─▶ Because claude-anyteam==0.5.0 depends on fastmcp==3.0.0b1 and
+      acme-corp-tools==1.4.0 depends on fastmcp>=2.11,<3.0, we can conclude
+      that claude-anyteam==0.5.0 and acme-corp-tools==1.4.0 are incompatible.
+      And because you require claude-anyteam==0.5.0 and acme-corp-tools==1.4.0,
+      we can conclude that your requirements are unsatisfiable.

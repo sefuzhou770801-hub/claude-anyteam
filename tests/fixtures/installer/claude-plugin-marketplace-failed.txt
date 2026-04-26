@@ -1,0 +1,4 @@
+# synthesized: Claude Code plugin marketplace failure returned by `claude plugin marketplace add`.
+error: failed to add plugin marketplace JonathanRosado/claude-anyteam
+  Caused by: could not fetch marketplace manifest from https://github.com/JonathanRosado/claude-anyteam
+  Caused by: authentication required or repository not reachable

@@ -1,0 +1,4 @@
+# synthesized: uv wheel install failure on Windows when long paths are disabled.
+error: failed to install wheel: claude-anyteam-0.5.0-py3-none-any.whl
+  Caused by: failed to copy file from C:\Users\Alice\AppData\Local\uv\cache\archive-v0\3kRzzjsQe13Dme2Yh5Y9m\claude_anyteam\plugins\cache\openai-curated\canva\421657af0e7e94573f3a5f2c51091df43668da94\skills\canva-branded-presentation\references\presentation-outline-review-workflow.md to C:\Users\Alice\AppData\Roaming\uv\tools\claude-anyteam\Lib\site-packages\claude_anyteam\plugins\cache\openai-curated\canva\421657af0e7e94573f3a5f2c51091df43668da94\skills\canva-branded-presentation\references\presentation-outline-review-workflow.md
+  Caused by: The filename or extension is too long. (os error 206)
