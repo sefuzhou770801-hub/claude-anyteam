@@ -11,6 +11,7 @@ from __future__ import annotations
 
 import contextlib
 import copy
+import errno
 import json
 import os
 import re
@@ -70,6 +71,7 @@ INSTALL_ERROR_EXIT_CORRUPTED_STATE = 4
 INSTALL_ERROR_EXIT_NO_PROVIDER = 5
 
 ProviderState = Literal["READY", "NEEDS_SIGNIN", "NEEDS_UPGRADE", "MISSING"]
+InstallSeverity = Literal["blocker", "hard-stop", "soft"]
 
 
 @dataclass(frozen=True)
@@ -122,6 +124,7 @@ class CodexCliCheck:
     raw_output: str | None  # raw `codex --version` stdout, retained for debugging
     signed_in: bool = False
     signed_in_detail: str | None = None
+    version_probe_error: str | None = None
 
 
 @dataclass(frozen=True)
@@ -133,10 +136,23 @@ class AuthCheck:
 
 
 @dataclass(frozen=True)
+class KimiCliCheck:
+    """Result of probing for the Kimi CLI on PATH."""
+
+    found: bool
+    path: Path | None
+    version: str | None
+    raw_output: str | None
+    signed_in: bool = False
+    signed_in_detail: str | None = None
+    version_probe_error: str | None = None
+
+
+@dataclass(frozen=True)
 class ProviderStatus:
     """Display-ready aggregate of a provider's install + sign-in state."""
 
-    provider_key: Literal["codex", "gemini"]
+    provider_key: Literal["codex", "gemini", "kimi"]
     display_name: str
     summary_name: str
     state: ProviderState
@@ -215,10 +231,14 @@ class InstallResult:
     teammate_mode: TeammateModeResult | None = None
     codex_cli: CodexCliCheck | None = None
     gemini_cli: GeminiCliCheck | None = None
+    kimi_cli: KimiCliCheck | None = None
     codex_auth: AuthCheck | None = None
     gemini_auth: AuthCheck | None = None
+    kimi_auth: AuthCheck | None = None
     codex_status: ProviderStatus | None = None
     gemini_status: ProviderStatus | None = None
+    kimi_status: ProviderStatus | None = None
+    diagnostics: tuple["InstallError", ...] = ()
     force_empty_used: bool = False
     permissions_allow_added: tuple[str, ...] = ()
     permissions_allow_managed: tuple[str, ...] = ()
@@ -257,12 +277,207 @@ class UninstallResult:
 
 
 class InstallError(ValueError):
-    """Raised when install/uninstall cannot safely update Claude settings.
+    """Structured installer diagnostic.
+
+    Most instances are raised, but soft diagnostics may also be attached to a
+    successful :class:`InstallResult` so the CLI can warn and keep going.
 
     Some install failures warrant a distinct CLI exit code (e.g. user declining
     the teammateMode overwrite prompt). Callers may attach a ``cli_exit_code``
     attribute on the exception instance to steer the CLI; default is 2.
     """
+
+    title: str
+    explanation: str
+    action: str
+    severity: InstallSeverity
+    details: str | None
+
+    def __init__(
+        self,
+        message: str | None = None,
+        *,
+        title: str | None = None,
+        explanation: str | None = None,
+        action: str | None = None,
+        severity: InstallSeverity = "hard-stop",
+        details: str | None = None,
+        cli_exit_code: int | None = None,
+    ) -> None:
+        legacy = (message or "").strip()
+        if title is None:
+            title = legacy.splitlines()[0] if legacy else "Install failed"
+        if explanation is None:
+            rest = "\n".join(legacy.splitlines()[1:]).strip()
+            explanation = rest or legacy or "The installer could not finish safely."
+        if action is None:
+            action = "Re-run `claude-anyteam install` after fixing the problem."
+        self.title = title
+        self.explanation = explanation
+        self.action = action
+        self.severity = severity
+        self.details = details if details is not None else (legacy or None)
+        if cli_exit_code is not None:
+            self.cli_exit_code = cli_exit_code  # type: ignore[attr-defined]
+        super().__init__(self.as_plain_text())
+
+    def as_plain_text(self, *, include_details: bool = True) -> str:
+        lines = [
+            self.title,
+            self.explanation,
+            f"Next step: {self.action}",
+            f"Severity: {self.severity}",
+        ]
+        if include_details and self.details:
+            lines.extend(["Raw details:", self.details])
+        return "\n".join(lines)
+
+    def __str__(self) -> str:
+        return self.as_plain_text()
+
+
+def _quote_command_path(path: Path) -> str:
+    text = _display_path(path)
+    escaped = text.replace("'", "'\"'\"'")
+    return f"'{escaped}'"
+
+
+def _display_path(path: Path) -> str:
+    try:
+        resolved = path.expanduser().resolve()
+        home = Path.home().expanduser().resolve()
+        rel = resolved.relative_to(home)
+        return f"~/{rel.as_posix()}"
+    except Exception:
+        return str(path)
+
+
+def _path_for_action(path: Path) -> str:
+    return _quote_command_path(path)
+
+
+def _rename_action(path: Path, *, command: str) -> str:
+    backup = path.with_name(f"{path.name}.broken")
+    return f"Run `mv {_path_for_action(path)} {_path_for_action(backup)}` then `{command}`."
+
+
+def _settings_corrupt_error(path: Path, details: str, *, not_json: bool = False) -> InstallError:
+    if not_json:
+        explanation = (
+            "Your Claude Code settings file is corrupted (not valid JSON). "
+            "Quick fix: rename it to settings.json.broken so the installer can write a fresh one. "
+            "We'll preserve your old file so you can copy-paste anything you need."
+        )
+    else:
+        explanation = (
+            "Your Claude Code settings file has an unexpected shape, so the installer will not edit it. "
+            "Rename it to settings.json.broken so the installer can write a fresh one, then copy back anything you need."
+        )
+    return InstallError(
+        title="Your Claude Code settings file is corrupted",
+        explanation=explanation,
+        action=_rename_action(path, command="claude-anyteam install"),
+        severity="hard-stop",
+        details=details,
+    )
+
+
+def _settings_write_error(path: Path, exc: BaseException) -> InstallError:
+    is_locked = isinstance(exc, OSError) and exc.errno in {
+        errno.EACCES,
+        errno.EPERM,
+        getattr(errno, "EBUSY", 16),
+    }
+    if is_locked:
+        return InstallError(
+            title="Can't write your Claude Code settings file",
+            explanation=(
+                f"Can't write to {_display_path(path)} — likely Claude Code is running. "
+                "Quit Claude Code and re-run."
+            ),
+            action="Quit Claude Code, then run `claude-anyteam install` again.",
+            severity="hard-stop",
+            details=f"{type(exc).__name__}: {exc}",
+        )
+    return InstallError(
+        title="Couldn't write your Claude Code settings file",
+        explanation="The installer could not save your Claude Code settings, so it stopped before making unsafe changes.",
+        action="Check file permissions, then run `claude-anyteam install` again.",
+        severity="hard-stop",
+        details=f"{type(exc).__name__}: {exc}",
+    )
+
+
+def _claude_json_corrupt_error(path: Path, details: str, *, not_json: bool = False) -> InstallError:
+    if not_json:
+        explanation = (
+            f"Your Claude Code config ({_display_path(path)}) is corrupted. "
+            "Same recovery as settings: rename and let the installer write a fresh one."
+        )
+    else:
+        explanation = (
+            f"Your Claude Code config ({_display_path(path)}) has an unexpected shape, so the installer will not edit it. "
+            "Rename it and let the installer write a fresh one."
+        )
+    return InstallError(
+        title="Your Claude Code config file is corrupted",
+        explanation=explanation,
+        action=_rename_action(path, command="claude-anyteam install"),
+        severity="hard-stop",
+        details=details,
+    )
+
+
+def _claude_json_write_error(path: Path, exc: BaseException) -> InstallError:
+    return InstallError(
+        title="Couldn't write your Claude Code config file",
+        explanation=(
+            f"The installer could not save {_display_path(path)}, so teammateMode was not changed."
+        ),
+        action="Quit Claude Code, then run `claude-anyteam install` again.",
+        severity="hard-stop",
+        details=f"{type(exc).__name__}: {exc}",
+    )
+
+
+def _state_error(path: Path, details: str, *, cli_exit_code: int | None = None) -> InstallError:
+    return InstallError(
+        title="claude-anyteam's install receipt is corrupted",
+        explanation=(
+            "The installer could not read the receipt it uses to safely undo changes. "
+            "It stopped rather than guessing what to remove."
+        ),
+        action=f"Inspect or delete `{_display_path(path)}`, then run `claude-anyteam uninstall` again.",
+        severity="hard-stop",
+        details=details,
+        cli_exit_code=cli_exit_code,
+    )
+
+
+def _provider_version_probe_error(binary: str, provider_name: str, details: str) -> InstallError:
+    return InstallError(
+        title=f"Found `{binary}` but couldn't read its version",
+        explanation=(
+            f"Found `{binary}` on PATH but it didn't return a recognizable version. "
+            "The installer will warn but continue — you may need to upgrade or reinstall the provider CLI."
+        ),
+        action=f"Upgrade or reinstall {provider_name}, then run `{binary} --version` again.",
+        severity="soft",
+        details=details,
+    )
+
+
+def _plugin_registration_error(details: str) -> InstallError:
+    return InstallError(
+        title="Couldn't register the Claude Code plugin",
+        explanation=(
+            "Couldn't register the claude-anyteam plugin with Claude Code. "
+            "The installer will continue — the spawn shim still works without plugin registration."
+        ),
+        action="To install manually later: `claude plugin install JonathanRosado/claude-anyteam`.",
+        severity="soft",
+        details=details,
+    )
 
 
 
@@ -347,13 +562,23 @@ def discover_managed_paths(
 
     if resolved_binary is None:
         raise InstallError(
-            "Unable to resolve the claude-anyteam binary. Ensure the package is "
-            "installed and the console script is on PATH."
+            title="claude-anyteam is not on PATH",
+            explanation=(
+                "The installer could not find the claude-anyteam command it needs to write into Claude Code settings."
+            ),
+            action="Run `uv tool install --reinstall claude-anyteam`, then run `claude-anyteam install` again.",
+            severity="blocker",
+            details="Unable to resolve the claude-anyteam binary.",
         )
     if resolved_shim is None:
         raise InstallError(
-            "Unable to resolve the claude-anyteam-spawn-shim binary. Ensure the "
-            "package is installed and the console script is on PATH."
+            title="claude-anyteam's spawn shim is not on PATH",
+            explanation=(
+                "The installer could not find the spawn shim that Claude Code uses to launch routed teammates."
+            ),
+            action="Run `uv tool install --reinstall claude-anyteam`, then run `claude-anyteam install` again.",
+            severity="blocker",
+            details="Unable to resolve the claude-anyteam-spawn-shim binary.",
         )
 
     return ManagedPaths(
@@ -375,10 +600,13 @@ def _load_settings(path: Path) -> tuple[dict[str, Any], bool]:
     try:
         raw = json.loads(path.read_text(encoding="utf-8"))
     except json.JSONDecodeError as exc:
-        raise InstallError(f"{path} is not valid JSON: {exc}") from exc
+        raise _settings_corrupt_error(path, f"{path} is not valid JSON: {exc}", not_json=True) from exc
 
     if not isinstance(raw, dict):
-        raise InstallError(f"{path} must contain a JSON object at the top level.")
+        raise _settings_corrupt_error(
+            path,
+            f"{path} must contain a JSON object at the top level.",
+        )
 
     return raw, True
 
@@ -393,12 +621,16 @@ def _env_block(settings: dict[str, Any], *, path: Path, create: bool) -> dict[st
         settings["env"] = env
 
     if not isinstance(env, dict):
-        raise InstallError(f"{path} has an 'env' entry, but it is not a JSON object.")
+        raise _settings_corrupt_error(
+            path,
+            f"{path} has an 'env' entry, but it is not a JSON object.",
+        )
 
     for key, value in env.items():
         if not isinstance(key, str) or not isinstance(value, str):
-            raise InstallError(
-                f"{path} has a non-string entry under 'env'; refusing to overwrite it."
+            raise _settings_corrupt_error(
+                path,
+                f"{path} has a non-string entry under 'env'; refusing to overwrite it.",
             )
 
     return env
@@ -418,8 +650,9 @@ def _permissions_block(
         settings["permissions"] = permissions
 
     if not isinstance(permissions, dict):
-        raise InstallError(
-            f"{path} has a 'permissions' entry, but it is not a JSON object."
+        raise _settings_corrupt_error(
+            path,
+            f"{path} has a 'permissions' entry, but it is not a JSON object.",
         )
 
     return permissions
@@ -443,13 +676,15 @@ def _permissions_allow_list(
         permissions["allow"] = allow
 
     if not isinstance(allow, list):
-        raise InstallError(
-            f"{path} has a 'permissions.allow' entry, but it is not a JSON array."
+        raise _settings_corrupt_error(
+            path,
+            f"{path} has a 'permissions.allow' entry, but it is not a JSON array.",
         )
 
     if not all(isinstance(entry, str) for entry in allow):
-        raise InstallError(
-            f"{path} has a non-string entry under 'permissions.allow'; refusing to overwrite it."
+        raise _settings_corrupt_error(
+            path,
+            f"{path} has a non-string entry under 'permissions.allow'; refusing to overwrite it.",
         )
 
     return allow
@@ -485,13 +720,12 @@ def _state_permissions_allow_added_strict(
         return ()
     raw = state.get("permissions_allow_added_by_anyteam")
     if not isinstance(raw, list) or not all(isinstance(entry, str) for entry in raw):
-        err = InstallError(
+        raise _state_error(
+            state_path,
             f"{state_path} has a malformed 'permissions_allow_added_by_anyteam' value; "
-            "refusing to touch permissions.allow.\n"
-            f"Inspect or delete the state file manually, then re-run uninstall."
+            "refusing to touch permissions.allow.",
+            cli_exit_code=INSTALL_ERROR_EXIT_CORRUPTED_STATE,
         )
-        err.cli_exit_code = INSTALL_ERROR_EXIT_CORRUPTED_STATE  # type: ignore[attr-defined]
-        raise err
     recommended = set(RECOMMENDED_ALLOWLIST_ENTRIES)
     return tuple(entry for entry in raw if entry in recommended)
 
@@ -596,7 +830,12 @@ def _atomic_write_json(path: Path, payload: dict[str, Any]) -> None:
 
 
 def _write_settings(path: Path, settings: dict[str, Any]) -> None:
-    _atomic_write_json(path, settings)
+    try:
+        _atomic_write_json(path, settings)
+    except InstallError:
+        raise
+    except Exception as exc:
+        raise _settings_write_error(path, exc) from exc
 
 
 def _load_claude_json(path: Path) -> tuple[dict[str, Any], bool]:
@@ -607,16 +846,24 @@ def _load_claude_json(path: Path) -> tuple[dict[str, Any], bool]:
     try:
         raw = json.loads(path.read_text(encoding="utf-8"))
     except json.JSONDecodeError as exc:
-        raise InstallError(f"{path} is not valid JSON: {exc}") from exc
+        raise _claude_json_corrupt_error(path, f"{path} is not valid JSON: {exc}", not_json=True) from exc
 
     if not isinstance(raw, dict):
-        raise InstallError(f"{path} must contain a JSON object at the top level.")
+        raise _claude_json_corrupt_error(
+            path,
+            f"{path} must contain a JSON object at the top level.",
+        )
 
     return raw, True
 
 
 def _write_claude_json(path: Path, payload: dict[str, Any]) -> None:
-    _atomic_write_json(path, payload)
+    try:
+        _atomic_write_json(path, payload)
+    except InstallError:
+        raise
+    except Exception as exc:
+        raise _claude_json_write_error(path, exc) from exc
 
 
 
@@ -636,16 +883,33 @@ def _load_state(path: Path) -> dict[str, Any] | None:
     try:
         raw = json.loads(path.read_text(encoding="utf-8"))
     except json.JSONDecodeError as exc:
-        raise InstallError(f"{path} is not valid JSON: {exc}") from exc
+        raise _state_error(path, f"{path} is not valid JSON: {exc}", cli_exit_code=INSTALL_ERROR_EXIT_CORRUPTED_STATE) from exc
 
     if not isinstance(raw, dict):
-        raise InstallError(f"{path} must contain a JSON object at the top level.")
+        raise _state_error(
+            path,
+            f"{path} must contain a JSON object at the top level.",
+            cli_exit_code=INSTALL_ERROR_EXIT_CORRUPTED_STATE,
+        )
 
     return raw
 
 
 def _write_state(path: Path, state: dict[str, Any]) -> None:
-    _atomic_write_json(path, state)
+    try:
+        _atomic_write_json(path, state)
+    except InstallError:
+        raise
+    except Exception as exc:
+        raise InstallError(
+            title="Couldn't write claude-anyteam's install receipt",
+            explanation=(
+                "The installer could not save the receipt it uses to safely uninstall later."
+            ),
+            action="Check file permissions, then run `claude-anyteam install` again.",
+            severity="hard-stop",
+            details=f"{type(exc).__name__}: {exc}",
+        ) from exc
 
 
 def _delete_state(path: Path) -> bool:
@@ -654,6 +918,14 @@ def _delete_state(path: Path) -> bool:
         return True
     except FileNotFoundError:
         return False
+    except OSError as exc:
+        raise InstallError(
+            title="Couldn't remove claude-anyteam's install receipt",
+            explanation="The uninstaller could not remove its receipt after applying the recorded changes.",
+            action=f"Check permissions on `{_display_path(path)}`, then run `claude-anyteam uninstall` again.",
+            severity="hard-stop",
+            details=f"{type(exc).__name__}: {exc}",
+        ) from exc
 
 
 

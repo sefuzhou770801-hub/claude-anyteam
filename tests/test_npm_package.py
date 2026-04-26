@@ -36,6 +36,7 @@ def test_npm_installer_files_exist() -> None:
         NPM_DIR / 'bin' / 'setup.js',
         NPM_DIR / 'lib' / 'art.js',
         NPM_DIR / 'lib' / 'detect.js',
+        NPM_DIR / 'lib' / 'error-translator.js',
     ]
 
     for path in expected:

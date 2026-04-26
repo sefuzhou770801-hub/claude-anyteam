@@ -24,12 +24,20 @@ function envFirst(...names) {
 export const TOOL_NAME = envFirst('CLAUDE_ANYTEAM_PYTHON_PACKAGE', 'CODEX_TEAMMATE_PYTHON_PACKAGE') || 'claude-anyteam';
 export const UV_INSTALL_DIR = envFirst('CLAUDE_ANYTEAM_UV_INSTALL_DIR', 'CODEX_TEAMMATE_UV_INSTALL_DIR') || defaultBinDir();
 export const UV_TOOL_BIN_DIR = envFirst('CLAUDE_ANYTEAM_UV_TOOL_BIN_DIR', 'CODEX_TEAMMATE_UV_TOOL_BIN_DIR') || defaultBinDir();
+export const UV_TOOL_DIR = envFirst('CLAUDE_ANYTEAM_UV_TOOL_DIR', 'CODEX_TEAMMATE_UV_TOOL_DIR') || defaultToolDir();
 
 function defaultBinDir() {
   if (process.platform === 'win32') {
     return path.join(homedir(), 'AppData', 'Local', 'claude-anyteam', 'bin');
   }
   return path.join(homedir(), '.local', 'bin');
+}
+
+function defaultToolDir() {
+  if (process.platform === 'win32') {
+    return path.join(homedir(), 'AppData', 'Local', 'claude-anyteam', 'tools');
+  }
+  return undefined;
 }
 
 async function resolveInstallTarget() {
@@ -65,7 +73,14 @@ async function isExecutable(filePath) {
 
 export async function which(name, extraDirs = []) {
   const searchDirs = [];
-  if (name.includes(path.sep) || path.isAbsolute(name)) {
+  const hasSeparator = name.includes(path.sep) || (process.platform === 'win32' && name.includes('/'));
+  if (process.platform === 'win32' && /^[A-Za-z]:(?![\\/])/.test(name)) {
+    // "D:foo.exe" is drive-relative on Windows, not "D:\foo.exe". Avoid
+    // resolving it against Node's hidden per-drive cwd; callers should pass an
+    // absolute drive path or let PATH lookup handle a bare executable name.
+    return null;
+  }
+  if (hasSeparator || path.isAbsolute(name)) {
     const candidate = path.resolve(name);
     return (await isExecutable(candidate)) ? candidate : null;
   }
@@ -98,10 +113,10 @@ export function manualInstallLines({ includePython = false } = {}) {
   const lines = [];
   if (process.platform === 'win32') {
     if (includePython) {
-      lines.push('Install Python 3: winget install Python.Python.3.12');
+      lines.push('PowerShell: winget install Python.Python.3.12');
     }
-    lines.push('Install uv: winget install Astral-sh.uv');
-    lines.push('Then rerun: npx --yes --package claude-anyteam claude-anyteam-setup');
+    lines.push('PowerShell: winget install Astral-sh.uv');
+    lines.push('Then rerun from PowerShell: npx --yes --package claude-anyteam claude-anyteam-setup');
     return lines;
   }
   lines.push('macOS/Homebrew: brew install python uv');
@@ -116,7 +131,49 @@ export function manualInstallLines({ includePython = false } = {}) {
 }
 
 export function formatCommand(command, args = []) {
-  return [command, ...args].join(' ');
+  if (process.platform === 'win32') {
+    const formattedCommand = formatPowerShellCommand(command);
+    return [formattedCommand, ...args.map(formatPowerShellArgument)].join(' ');
+  }
+  return [formatPosixArgument(command), ...args.map(formatPosixArgument)].join(' ');
+}
+
+function formatPosixArgument(value) {
+  const text = String(value);
+  if (/^[A-Za-z0-9_@%+=:,./-]+$/.test(text)) {
+    return text;
+  }
+  return `'${text.replace(/'/g, "'\\''")}'`;
+}
+
+function formatPowerShellCommand(value) {
+  const formatted = formatPowerShellArgument(value);
+  return formatted === String(value) ? formatted : `& ${formatted}`;
+}
+
+function formatPowerShellArgument(value) {
+  const text = String(value);
+  if (/^[A-Za-z0-9_@%+=:,./\\-]+$/u.test(text)) {
+    return text;
+  }
+  return `'${text.replace(/'/g, "''")}'`;
+}
+
+export function formatDisplayPath(value) {
+  const text = String(value);
+  return process.platform === 'win32' ? text.replace(/\//g, '\\') : text;
+}
+
+export function uvToolEnv(baseEnv = process.env) {
+  const env = {
+    ...baseEnv,
+    UV_NO_PROGRESS: '1',
+    UV_TOOL_BIN_DIR,
+  };
+  if (UV_TOOL_DIR) {
+    env.UV_TOOL_DIR = UV_TOOL_DIR;
+  }
+  return env;
 }
 
 export function runCommand(command, args = [], options = {}) {
@@ -139,17 +196,74 @@ export function runCommand(command, args = [], options = {}) {
   });
 }
 
-export async function detectPython() {
-  const command = await which(process.platform === 'win32' ? 'python' : 'python3');
-  if (!command) {
+export async function detectPython(options = {}) {
+  const diagnostics = Boolean(options.diagnostics);
+  const probe = 'import sys; print(sys.executable); print(sys.version.split()[0])';
+  const candidates = process.platform === 'win32'
+    ? [
+        { name: 'python', prefixArgs: [] },
+        { name: 'py', prefixArgs: ['-3'] },
+        { name: 'python3', prefixArgs: [] },
+      ]
+    : [{ name: 'python3', prefixArgs: [] }];
+  let issue = null;
+
+  for (const candidate of candidates) {
+    const command = await which(candidate.name);
+    if (!command) {
+      continue;
+    }
+
+    if (isWindowsStorePythonAlias(command)) {
+      issue ||= {
+        kind: 'windows-store-python-stub',
+        path: command,
+        details: 'Windows App Execution Alias points python.exe at the Microsoft Store stub.',
+      };
+      continue;
+    }
+
+    const result = await runCommand(command, [...candidate.prefixArgs, '-c', probe]);
+    if (result.code !== 0) {
+      const stubIssue = windowsStorePythonIssue(command, result);
+      if (stubIssue) {
+        issue ||= stubIssue;
+      }
+      continue;
+    }
+
+    const [resolvedPath, version] = result.stdout.trim().split(/\r?\n/);
+    const python = { path: path.resolve(resolvedPath || command), version: version || 'unknown' };
+    return diagnostics ? { python, issue: null } : python;
+  }
+
+  return diagnostics ? { python: null, issue } : null;
+}
+
+function isWindowsStorePythonAlias(command) {
+  if (process.platform !== 'win32') {
+    return false;
+  }
+  const normalized = command.replace(/\//g, '\\').toLowerCase();
+  return normalized.includes('\\microsoft\\windowsapps\\') && /\\python(?:3)?\.exe$/.test(normalized);
+}
+
+function windowsStorePythonIssue(command, result) {
+  if (process.platform !== 'win32') {
     return null;
   }
-  const result = await runCommand(command, ['-c', 'import sys; print(sys.executable); print(sys.version.split()[0])']);
-  if (result.code !== 0) {
-    return null;
+  const combined = `${result.stdout || ''}\n${result.stderr || ''}`;
+  if (
+    isWindowsStorePythonAlias(command)
+    || /microsoft store|app execution alias|python was not found|disable this shortcut/i.test(combined)
+  ) {
+    return {
+      kind: 'windows-store-python-stub',
+      path: command,
+      details: combined.trim() || 'python.exe resolved to the Microsoft Store app execution alias.',
+    };
   }
-  const [resolvedPath, version] = result.stdout.trim().split(/\r?\n/);
-  return { path: path.resolve(resolvedPath || command), version: version || 'unknown' };
+  return null;
 }
 
 export async function detectUv() {
@@ -166,7 +280,7 @@ export async function detectUv() {
 
 export async function installUv() {
   if (process.platform === 'win32') {
-    throw new Error('Automatic uv installation is only wired up for macOS/Linux shells right now.');
+    throw new Error('Automatic uv installation uses the official shell installer on macOS/Linux. On Windows, install uv from PowerShell with: winget install Astral-sh.uv');
   }
   const workingDir = await fs.mkdtemp(path.join(tmpdir(), 'claude-anyteam-uv-'));
   const scriptPath = path.join(workingDir, 'install-uv.sh');
@@ -225,11 +339,7 @@ async function resolveToolPaths(binDir) {
 }
 
 export async function resolveToolBinDir({ uvPath }) {
-  const env = {
-    ...process.env,
-    UV_NO_PROGRESS: '1',
-    UV_TOOL_BIN_DIR,
-  };
+  const env = uvToolEnv(process.env);
   const binDirResult = await runCommand(uvPath, ['--no-config', 'tool', 'dir', '--bin'], { env, cwd: toolWorkingDir() });
   if (binDirResult.code !== 0) {
     const error = new Error('uv could not resolve its tool bin directory.');
@@ -255,6 +365,13 @@ export async function installTool({ uvPath, pythonPath }) {
   }
 
   const { env, binDir } = await resolveToolBinDir({ uvPath });
+  const symlinkCheck = await checkWindowsSymlinkPrivilege();
+  if (!symlinkCheck.ok) {
+    const error = new Error('Windows blocked symlink creation, which uv tool install needs.');
+    error.code = 'WINDOWS_SYMLINK_PERMISSION';
+    error.details = symlinkCheck.details || symlinkCheck.message || 'Enable Developer Mode or rerun from an elevated PowerShell session.';
+    throw error;
+  }
   // --prerelease=allow: claude-anyteam currently pins fastmcp==3.0.0b1 (a
   // beta), and uv refuses pre-release deps by default. Without this flag the
   // install fails on a clean machine with the cryptic uv "no solution found"
@@ -284,4 +401,87 @@ export async function installTool({ uvPath, pythonPath }) {
     throw error;
   }
   return { env, binDir, ...resolvedPaths, installMode: 'installed' };
+}
+
+export async function ensureWindowsLongPaths() {
+  if (process.platform !== 'win32') {
+    return { supported: false, enabled: true, changed: false };
+  }
+
+  const key = 'HKLM\\SYSTEM\\CurrentControlSet\\Control\\FileSystem';
+  const value = 'LongPathsEnabled';
+  try {
+    const query = await runCommand('reg', ['query', key, '/v', value]);
+    const queryOutput = `${query.stdout || ''}\n${query.stderr || ''}`;
+    if (query.code === 0 && /LongPathsEnabled\s+REG_DWORD\s+0x0*1\b/i.test(queryOutput)) {
+      return { supported: true, enabled: true, changed: false };
+    }
+
+    const add = await runCommand('reg', ['add', key, '/v', value, '/t', 'REG_DWORD', '/d', '1', '/f']);
+    if (add.code === 0) {
+      return { supported: true, enabled: true, changed: true };
+    }
+    return {
+      supported: true,
+      enabled: false,
+      changed: false,
+      details: (add.stderr || add.stdout || queryOutput).trim(),
+    };
+  } catch (error) {
+    return {
+      supported: true,
+      enabled: false,
+      changed: false,
+      details: error.message,
+    };
+  }
+}
+
+export async function checkWindowsSymlinkPrivilege() {
+  if (process.platform !== 'win32') {
+    return { ok: true };
+  }
+
+  const workingDir = await fs.mkdtemp(path.join(tmpdir(), 'claude-anyteam-symlink-'));
+  const target = path.join(workingDir, 'target.txt');
+  const link = path.join(workingDir, 'link.txt');
+  try {
+    await fs.writeFile(target, 'probe', 'utf8');
+    await fs.symlink(target, link);
+    return { ok: true };
+  } catch (error) {
+    return {
+      ok: false,
+      code: error.code,
+      message: error.message,
+      details: `${error.code || 'symlink failed'}: ${error.message}`,
+    };
+  } finally {
+    await fs.rm(workingDir, { recursive: true, force: true });
+  }
+}
+
+export function windowsInstallAdvice(error, { binDir = UV_TOOL_BIN_DIR } = {}) {
+  if (process.platform !== 'win32') {
+    return [];
+  }
+
+  const details = `${error?.code || ''}\n${error?.message || ''}\n${error?.details || ''}`;
+  const lines = [];
+
+  if (/WINDOWS_SYMLINK_PERMISSION|EPERM.*symlink|privilege.*symbolic|symbolic link/i.test(details)) {
+    lines.push('Windows blocked symlink creation. Enable Developer Mode (Settings > System > For developers) or rerun from an Administrator PowerShell session.');
+  }
+
+  if (/ENAMETOOLONG|MAX_PATH|path too long|filename or extension is too long|ERROR_FILENAME_EXCED_RANGE|0x80010135/i.test(details)) {
+    lines.push('Windows long paths appear to be disabled. Open PowerShell as Administrator and run: New-ItemProperty -Path "HKLM:\\SYSTEM\\CurrentControlSet\\Control\\FileSystem" -Name LongPathsEnabled -Value 1 -PropertyType DWord -Force');
+    lines.push('Then close and reopen your terminal before rerunning npx --yes claude-anyteam.');
+  }
+
+  if (/EBUSY|EPERM|EACCES|being used by another process|resource busy|locked|access is denied/i.test(details)) {
+    lines.push(`Antivirus or Windows Defender may be locking a uv tool file. Retry once; if it persists, add ${formatDisplayPath(binDir)} to your AV exclusion list.`);
+    lines.push(`Windows Defender PowerShell (Admin): Add-MpPreference -ExclusionPath '${String(binDir).replace(/'/g, "''")}'`);
+  }
+
+  return [...new Set(lines)];
 }

@@ -20,6 +20,7 @@ import {
   which,
 } from '../lib/detect.js';
 import { renderBanner, renderBox, theme } from '../lib/art.js';
+import { isPythonVersionTooOld, translate } from '../lib/error-translator.js';
 
 const CLAUDE_PLUGIN_MARKETPLACE_SOURCE = 'JonathanRosado/claude-anyteam';
 const CLAUDE_PLUGIN_MARKETPLACE_NAME = 'claude-anyteam';
@@ -111,6 +112,32 @@ function printWarning(title, lines) {
   console.log('');
 }
 
+function rawDetailsLines(raw) {
+  const text = String(raw || '');
+  if (!text) {
+    return ['    No extra diagnostics.'];
+  }
+  return text.split(/\r?\n/).map((line) => `    ${line}`);
+}
+
+function translatedDiagnosticLines(translated, { command, recovered } = {}) {
+  const statusSymbol = translated.severity === 'soft' ? theme.symbols.success : theme.symbols.error;
+  const lines = [
+    `${statusSymbol} ${theme.heading(translated.title)}`,
+    `${theme.symbols.info} ${theme.heading('What happened')}: ${translated.explanation}`,
+  ];
+  if (recovered) {
+    lines.push(`${theme.symbols.success} ${theme.heading('Recovered')}: ${recovered}`);
+  }
+  lines.push(`${theme.symbols.info} ${theme.heading('Next step')}: ${translated.action}`);
+  if (command) {
+    lines.push(`${theme.symbols.info} ${theme.heading('Command')}: ${theme.accent(command)}`);
+  }
+  lines.push(`${theme.symbols.info} ${theme.heading('Raw details')}:`);
+  lines.push(...rawDetailsLines(translated.raw));
+  return lines;
+}
+
 function trimmedDetails(error) {
   return String(error?.details || error?.message || '').trim();
 }
@@ -126,6 +153,13 @@ function claudePluginManualSummary() {
 
 function claudePluginManualLines() {
   return CLAUDE_PLUGIN_MANUAL_COMMANDS.map((command) => `    ${theme.accent(command)}`);
+}
+
+function claudeNotFoundTranslation() {
+  return translate({
+    kind: 'claude-not-found',
+    raw: 'claude CLI not detected on PATH',
+  });
 }
 
 function skippedClaudePluginResult(reasonLines) {
@@ -252,22 +286,34 @@ async function main() {
 
   const python = await detectPython();
   if (!python) {
-    const instructions = manualInstallLines({ includePython: true });
     if (silent) {
       postinstallHint(new Error('python3 was not found'));
       return 0;
     }
-    printFailure('PYTHON 3 REQUIRED', [
-      `${theme.symbols.error} ${theme.heading('claude-anyteam needs python3 before anything else can happen.')}`,
-      `${theme.symbols.info} Install Python 3, then rerun ${theme.accent('npx --yes claude-anyteam')}.`,
+    const translated = translate('no python interpreter found');
+    printFailure('PYTHON 3.12+ NOT FOUND', [
+      ...translatedDiagnosticLines(translated),
       '',
-      ...instructions.map((line) => `${theme.symbols.info} ${line}`),
+      ...manualInstallLines({ includePython: true }).map((line) => `${theme.symbols.info} ${line}`),
     ]);
     return 1;
   }
 
   if (!silent) {
     console.log(`${theme.symbols.success} ${theme.heading('python3 detected')} ${theme.muted(`(${python.version})`)} ${theme.accent(python.path)}`);
+  }
+
+  if (isPythonVersionTooOld(python.version)) {
+    if (silent) {
+      postinstallHint(new Error(`Python ${python.version} is too old; Python 3.12+ is required`));
+      return 0;
+    }
+    const translated = translate({
+      raw: `Detected Python ${python.version} at ${python.path}`,
+      pythonVersion: python.version,
+    });
+    printFailure('PYTHON VERSION TOO OLD', translatedDiagnosticLines(translated));
+    return 1;
   }
 
   let uv = await detectUv();
@@ -323,11 +369,12 @@ async function main() {
         postinstallHint(error);
         return 0;
       }
-      printFailure('TOOL INSTALL FAILED', [
-        `${theme.symbols.error} ${theme.heading(`uv could not install ${TOOL_NAME}.`)}`,
-        `${theme.symbols.info} Command: ${theme.accent(formatCommand(uv.path, ['--no-config', 'tool', 'install', '--force', '--prerelease=allow', '--python', python.path, TOOL_NAME]))}`,
-        `${theme.symbols.info} Details: ${trimmedDetails(error) || 'No extra diagnostics.'}`,
-      ]);
+      const command = error.command || formatCommand(uv.path, ['--no-config', 'tool', 'install', '--force', '--prerelease=allow', '--python', python.path, TOOL_NAME]);
+      const translated = translate(error.details || error.message, {
+        platform: process.platform,
+        pythonVersion: python.version,
+      });
+      printFailure('TOOL INSTALL FAILED', translatedDiagnosticLines(translated, { command }));
       return 1;
     }
   }
@@ -378,12 +425,17 @@ async function main() {
   let claudePlugin = null;
   const claudePath = await which('claude');
   if (!claudePath) {
+    const translated = claudeNotFoundTranslation();
     claudePlugin = skippedClaudePluginResult([
-      `${theme.symbols.warn} ${theme.heading('Claude Code CLI was not found on PATH, so the plugin install step was skipped.')}`,
+      ...translatedDiagnosticLines(translated, {
+        recovered: 'Skipped Claude Code plugin registration and continued with the core claude-anyteam install.',
+      }),
+      '',
       `${theme.symbols.info} Run these commands once ${theme.accent('claude')} is available:`,
       '',
       ...claudePluginManualLines(),
     ]);
+    claudePlugin.warningTitle = 'CLAUDE CODE PLUGIN RECOVERED';
     if (!silent) {
       printWarning(claudePlugin.warningTitle, claudePlugin.warningLines);
     }
