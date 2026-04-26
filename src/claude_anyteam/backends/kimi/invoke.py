@@ -26,14 +26,6 @@ from claude_anyteam.env import identity_env
 from claude_anyteam.schema_validation import inline_schema_prompt_fragment, load_schema, parse_and_validate
 
 WRAPPER_SERVER_ALIAS = "anyteam"
-WRAPPER_TOOL_NAMES = frozenset({
-    "send_message",
-    "task_update",
-    "task_create",
-    "read_inbox",
-    "task_list",
-    "read_config",
-})
 SESSION_HINT_RE = re.compile(r"To resume this session: kimi -r (\S+)")
 KIMI_CREDENTIALS_REL = Path(".kimi") / "credentials" / "kimi-code.json"
 KIMI_CREDENTIAL_LOCK_REL = Path(".kimi") / "credentials" / "kimi-code.lock"

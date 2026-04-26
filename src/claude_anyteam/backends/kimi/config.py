@@ -8,18 +8,18 @@ from typing import Literal
 
 from claude_anyteam.config import _pick
 from claude_anyteam.env import (
-    COLOR_ENV, CWD_ENV, EFFORT_ENV, MODEL_ENV, NAME_ENV, PLAN_MODE_ENV,
+    COLOR_ENV, CWD_ENV, EFFORT_ENV, KIMI_BINARY_ENV, MODEL_ENV, NAME_ENV, PLAN_MODE_ENV,
     POLL_ENV, TEAM_ENV, env_first,
 )
 
-KIMI_BINARY_ENV = "CLAUDE_ANYTEAM_KIMI_BINARY"
 KIMI_HOME_ENV = "CLAUDE_ANYTEAM_KIMI_HOME"
 KIMI_BACKEND_ENV = "CLAUDE_ANYTEAM_KIMI_BACKEND"
 KIMI_THINKING_ENV = "CLAUDE_ANYTEAM_KIMI_THINKING"
 
 KIMI_THINKING = frozenset({"on", "off", "auto"})
 KIMI_EFFORTS = frozenset({"minimal", "low", "medium", "high", "xhigh"})
-KIMI_BACKENDS = frozenset({"headless", "acp"})
+# ACP transport (Plan B) deferred — re-add to validator when implemented.
+KIMI_BACKENDS = frozenset({"headless"})
 
 
 @dataclass(frozen=True)
@@ -34,7 +34,7 @@ class KimiSettings:
     model: str | None = None
     effort: str | None = None
     kimi_home: Path | None = None
-    backend: Literal["headless", "acp"] = "headless"
+    backend: Literal["headless"] = "headless"
     thinking: Literal["on", "off", "auto"] = "auto"
 
 
@@ -66,7 +66,7 @@ def from_env(overrides: dict[str, object] | None = None) -> KimiSettings:
     home_raw = _pick(overrides, "kimi_home", os.environ.get(KIMI_HOME_ENV))
     backend_raw = str(_pick(overrides, "backend", os.environ.get(KIMI_BACKEND_ENV, "headless")))
     if backend_raw not in KIMI_BACKENDS:
-        raise ValueError(f"Kimi backend must be headless or acp, got {backend_raw!r}")
+        raise ValueError(f"Kimi backend must be one of {', '.join(sorted(KIMI_BACKENDS))}, got {backend_raw!r}")
     thinking_raw = str(_pick(overrides, "thinking", os.environ.get(KIMI_THINKING_ENV, "auto")))
     if thinking_raw not in KIMI_THINKING:
         raise ValueError(f"Kimi thinking must be on, off, or auto, got {thinking_raw!r}")
