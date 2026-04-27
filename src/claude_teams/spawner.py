@@ -156,12 +156,13 @@ def spawn_teammate(
         )
         pane_id = result.stdout.strip()
 
-        config = teams.read_config(team_name, base_dir)
-        for m in config.members:
-            if isinstance(m, TeammateMember) and m.name == name:
-                m.tmux_pane_id = pane_id
-                break
-        teams.write_config(team_name, config, base_dir)
+        with teams.locked_team_config(team_name, base_dir):
+            config = teams.read_config(team_name, base_dir)
+            for m in config.members:
+                if isinstance(m, TeammateMember) and m.name == name:
+                    m.tmux_pane_id = pane_id
+                    break
+            teams.write_config(team_name, config, base_dir)
     except Exception:
         if member_added:
             try:

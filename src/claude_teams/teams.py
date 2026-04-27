@@ -16,6 +16,7 @@ from claude_teams.models import (
     TeamDeleteResult,
     TeammateMember,
 )
+from claude_teams._filelock import config_lock
 
 CLAUDE_DIR = Path.home() / ".claude"
 TEAMS_DIR = CLAUDE_DIR / "teams"
@@ -30,6 +31,14 @@ def _teams_dir(base_dir: Path | None = None) -> Path:
 
 def _tasks_dir(base_dir: Path | None = None) -> Path:
     return (base_dir / "tasks") if base_dir else TASKS_DIR
+
+
+def config_lock_path(name: str, base_dir: Path | None = None) -> Path:
+    return _teams_dir(base_dir) / name / "config.lock"
+
+
+def locked_team_config(name: str, base_dir: Path | None = None):
+    return config_lock(_teams_dir(base_dir) / name)
 
 
 def team_exists(name: str, base_dir: Path | None = None) -> bool:
@@ -81,6 +90,7 @@ def create_team(
     )
 
     config_path = team_dir / "config.json"
+    config_lock_path(name, base_dir=base_dir).touch(exist_ok=True)
     config_path.write_text(json.dumps(config.model_dump(by_alias=True, exclude_none=True), indent=2))
 
     return TeamCreateResult(
@@ -156,17 +166,19 @@ def delete_team(name: str, base_dir: Path | None = None) -> TeamDeleteResult:
 
 
 def add_member(name: str, member: TeammateMember, base_dir: Path | None = None) -> None:
-    config = read_config(name, base_dir=base_dir)
-    existing_names = {m.name for m in config.members}
-    if member.name in existing_names:
-        raise ValueError(f"Member {member.name!r} already exists in team {name!r}")
-    config.members.append(member)
-    write_config(name, config, base_dir=base_dir)
+    with locked_team_config(name, base_dir=base_dir):
+        config = read_config(name, base_dir=base_dir)
+        existing_names = {m.name for m in config.members}
+        if member.name in existing_names:
+            raise ValueError(f"Member {member.name!r} already exists in team {name!r}")
+        config.members.append(member)
+        write_config(name, config, base_dir=base_dir)
 
 
 def remove_member(team_name: str, agent_name: str, base_dir: Path | None = None) -> None:
     if agent_name == "team-lead":
         raise ValueError("Cannot remove team-lead from team")
-    config = read_config(team_name, base_dir=base_dir)
-    config.members = [m for m in config.members if m.name != agent_name]
-    write_config(team_name, config, base_dir=base_dir)
+    with locked_team_config(team_name, base_dir=base_dir):
+        config = read_config(team_name, base_dir=base_dir)
+        config.members = [m for m in config.members if m.name != agent_name]
+        write_config(team_name, config, base_dir=base_dir)

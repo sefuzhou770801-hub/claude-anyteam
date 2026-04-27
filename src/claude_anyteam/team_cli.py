@@ -35,6 +35,8 @@ from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Any, TextIO
 
+from claude_teams._filelock import config_lock
+
 # Effort whitelist mirrors the per-backend allowlists (Codex/Gemini/Kimi all
 # accept the same five-tier scale). If a future backend diverges, this
 # becomes the union and the per-backend adapter remains the source of truth.
@@ -323,44 +325,45 @@ def _team_patch_command(argv: list[str], *, stdout: TextIO | None = None, stderr
         err.write(f"error: no team config at {path}\n")
         return 1
 
-    cfg = _existing_dict(path)
-    members = cfg.get("members")
-    if not isinstance(members, list):
-        err.write(f"error: {path} has no 'members' list\n")
-        return 1
+    with config_lock(path.parent):
+        cfg = _existing_dict(path)
+        members = cfg.get("members")
+        if not isinstance(members, list):
+            err.write(f"error: {path} has no 'members' list\n")
+            return 1
 
-    targets: list[str]
-    if args.all_external:
-        targets = [
-            m["name"]
-            for m in members
-            if isinstance(m, dict)
-            and isinstance(m.get("name"), str)
-            and m["name"].startswith(_ROUTED_PREFIXES)
-        ]
-        if not targets:
-            out.write(f"no routed-adapter members in {path}\n")
-            return 0
-    else:
-        targets = [args.agent]
+        targets: list[str]
+        if args.all_external:
+            targets = [
+                m["name"]
+                for m in members
+                if isinstance(m, dict)
+                and isinstance(m.get("name"), str)
+                and m["name"].startswith(_ROUTED_PREFIXES)
+            ]
+            if not targets:
+                out.write(f"no routed-adapter members in {path}\n")
+                return 0
+        else:
+            targets = [args.agent]
 
-    patched: list[str] = []
-    missing: list[str] = []
-    for name in targets:
-        member = next(
-            (m for m in members if isinstance(m, dict) and m.get("name") == name),
-            None,
-        )
-        if member is None:
-            missing.append(name)
-            continue
-        if member.get("agentType") == args.agent_type:
-            continue
-        member["agentType"] = args.agent_type
-        patched.append(name)
+        patched: list[str] = []
+        missing: list[str] = []
+        for name in targets:
+            member = next(
+                (m for m in members if isinstance(m, dict) and m.get("name") == name),
+                None,
+            )
+            if member is None:
+                missing.append(name)
+                continue
+            if member.get("agentType") == args.agent_type:
+                continue
+            member["agentType"] = args.agent_type
+            patched.append(name)
 
-    if patched:
-        _write_atomic_json(path, cfg)
+        if patched:
+            _write_atomic_json(path, cfg)
 
     if missing:
         err.write(f"warning: members not found: {', '.join(missing)}\n")
@@ -802,8 +805,6 @@ def _team_prune_dead_command(argv: list[str], *, stdout: TextIO | None = None, s
     if not cfg_path.exists():
         err.write(f"error: no team config at {cfg_path}\n")
         return 1
-    cfg = _existing_dict(cfg_path)
-
     live_pane_ids = _live_tmux_pane_ids()
     if live_pane_ids is None:
         err.write(
@@ -814,36 +815,38 @@ def _team_prune_dead_command(argv: list[str], *, stdout: TextIO | None = None, s
         )
         return 1
 
-    members = cfg.get("members") if isinstance(cfg, dict) else None
-    if not isinstance(members, list):
-        err.write(f"error: team config has no `members` array\n")
-        return 1
+    with config_lock(cfg_path.parent):
+        cfg = _existing_dict(cfg_path)
+        members = cfg.get("members") if isinstance(cfg, dict) else None
+        if not isinstance(members, list):
+            err.write(f"error: team config has no `members` array\n")
+            return 1
 
-    kept: list[Any] = []
-    pruned: list[str] = []
-    for m in members:
-        if not isinstance(m, dict):
+        kept: list[Any] = []
+        pruned: list[str] = []
+        for m in members:
+            if not isinstance(m, dict):
+                kept.append(m)
+                continue
+            pane = str(m.get("tmuxPaneId", ""))
+            if pane and pane != "in-process" and pane not in live_pane_ids:
+                pruned.append(str(m.get("name", "?")))
+                continue
             kept.append(m)
-            continue
-        pane = str(m.get("tmuxPaneId", ""))
-        if pane and pane != "in-process" and pane not in live_pane_ids:
-            pruned.append(str(m.get("name", "?")))
-            continue
-        kept.append(m)
 
-    if not pruned:
-        out.write(f"no dead members in team {args.team!r}\n")
-        return 0
+        if not pruned:
+            out.write(f"no dead members in team {args.team!r}\n")
+            return 0
 
-    if not args.yes:
-        out.write(f"would prune {len(pruned)} dead member(s) from team {args.team!r}:\n")
-        for name in pruned:
-            out.write(f"  - {name}\n")
-        out.write("re-run with --yes to apply.\n")
-        return 0
+        if not args.yes:
+            out.write(f"would prune {len(pruned)} dead member(s) from team {args.team!r}:\n")
+            for name in pruned:
+                out.write(f"  - {name}\n")
+            out.write("re-run with --yes to apply.\n")
+            return 0
 
-    cfg["members"] = kept
-    cfg_path.write_text(json.dumps(cfg, indent=2, sort_keys=True) + "\n", encoding="utf-8")
+        cfg["members"] = kept
+        _write_atomic_json(cfg_path, cfg)
     out.write(f"pruned {len(pruned)} dead member(s) from team {args.team!r}: {', '.join(pruned)}\n")
     return 0
 

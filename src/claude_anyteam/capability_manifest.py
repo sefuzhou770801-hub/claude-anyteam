@@ -17,7 +17,7 @@ from pathlib import Path
 from tempfile import NamedTemporaryFile
 from typing import Any
 
-from claude_teams._filelock import file_lock
+from claude_teams._filelock import config_lock, file_lock
 
 from . import logger
 from .messages import CapabilityManifestUpdatedIn, CapabilityManifestUpdatedOut, now_iso, parse_protocol_text
@@ -70,17 +70,19 @@ def _atomic_write_json(path: Path, data: dict[str, Any]) -> None:
 def write_manifest(team_root: Path, agent_name: str, manifest: dict[str, Any]) -> Path:
     """Atomically write ``agent_name``'s rich Agent Card manifest."""
     path = manifest_path_for_team_dir(team_root, agent_name)
-    _atomic_write_json(path, manifest)
+    with config_lock(team_root):
+        _atomic_write_json(path, manifest)
     return path
 
 
 def delete_manifest(team_root: Path, agent_name: str) -> bool:
     path = manifest_path_for_team_dir(team_root, agent_name)
-    try:
-        path.unlink()
-        return True
-    except FileNotFoundError:
-        return False
+    with config_lock(team_root):
+        try:
+            path.unlink()
+            return True
+        except FileNotFoundError:
+            return False
 
 
 def read_manifest_file(path: Path) -> dict[str, Any]:

@@ -20,7 +20,7 @@ from dataclasses import dataclass, field
 from pathlib import Path
 from tempfile import NamedTemporaryFile
 
-from claude_teams._filelock import file_lock
+from claude_teams._filelock import config_lock
 
 from . import logger
 from .capabilities import build_agent_card
@@ -69,17 +69,9 @@ def inbox_path(team: str, name: str) -> Path:
     return team_dir(team) / "inboxes" / f"{name}.json"
 
 
-def _team_lock_path(team: str) -> Path:
-    # Reuse the harness-managed inbox lock so claude-anyteam registration
-    # participates in the same mutual exclusion that native teammates use.
-    return team_dir(team) / "inboxes" / ".lock"
-
-
 @contextmanager
 def _locked_team_config(team: str) -> Iterator[None]:
-    lock_path = _team_lock_path(team)
-    lock_path.parent.mkdir(parents=True, exist_ok=True)
-    with file_lock(lock_path):
+    with config_lock(team_dir(team)):
         yield
 
 
