@@ -19,7 +19,9 @@ class LeadMember(BaseModel):
 
     agent_id: str = Field(alias="agentId")
     name: str
-    agent_type: str = Field(alias="agentType")
+    # R2 (09 §3.1): tolerate legacy config rows that predate agentType so
+    # one bad sibling cannot break read_config() / member-load.
+    agent_type: str = Field(alias="agentType", default="team-lead")
     model: str
     joined_at: int = Field(alias="joinedAt")
     tmux_pane_id: str = Field(alias="tmuxPaneId", default="")
@@ -32,6 +34,8 @@ class TeammateMember(BaseModel):
 
     agent_id: str = Field(alias="agentId")
     name: str
+    # R2 (09 §3.1): additive default for legacy rows missing agentType;
+    # existing explicit values still round-trip.
     agent_type: str = Field(alias="agentType", default="claude-anyteam")
     model: str
     prompt: str

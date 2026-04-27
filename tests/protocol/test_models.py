@@ -80,12 +80,12 @@ class TestLeadMember:
         lead = LeadMember(
             agent_id="team-lead@t",
             name="team-lead",
-            agent_type="team-lead",
             model="sonnet",
             joined_at=0,
             cwd="/tmp",
         )
         assert lead.tmux_pane_id == ""
+        assert lead.agent_type == "team-lead"
 
 
 class TestTeammateMember:
@@ -143,6 +143,20 @@ class TestTeammateMember:
         assert mate.backend_type == "claude"
         data = mate.model_dump(by_alias=True)
         assert data["backendType"] == "claude"
+
+    def test_agent_type_defaults_to_claude_anyteam_for_legacy_rows(self):
+        mate = TeammateMember(
+            agent_id="w@t",
+            name="w",
+            model="sonnet",
+            prompt="p",
+            color="blue",
+            joined_at=0,
+            tmux_pane_id="",
+            cwd="/tmp",
+        )
+        assert mate.agent_type == "claude-anyteam"
+        assert mate.model_dump(by_alias=True)["agentType"] == "claude-anyteam"
 
 class TestTeamConfig:
     def test_round_trip_with_lead_only(self):
@@ -207,6 +221,45 @@ class TestTeamConfig:
         assert len(config.members) == 2
         assert isinstance(config.members[0], LeadMember)
         assert isinstance(config.members[1], TeammateMember)
+
+    def test_deserializes_legacy_members_missing_agent_type(self):
+        raw = {
+            "name": "test",
+            "description": "",
+            "createdAt": 100,
+            "leadAgentId": "team-lead@test",
+            "leadSessionId": "sid",
+            "members": [
+                {
+                    "agentId": "team-lead@test",
+                    "name": "team-lead",
+                    "model": "opus",
+                    "joinedAt": 100,
+                    "tmuxPaneId": "",
+                    "cwd": "/tmp",
+                    "subscriptions": [],
+                },
+                {
+                    "agentId": "worker@test",
+                    "name": "worker",
+                    "model": "sonnet",
+                    "prompt": "do stuff",
+                    "color": "blue",
+                    "planModeRequired": False,
+                    "joinedAt": 200,
+                    "tmuxPaneId": "%5",
+                    "cwd": "/tmp",
+                    "subscriptions": [],
+                    "backendType": "claude",
+                    "isActive": False,
+                },
+            ],
+        }
+        config = TeamConfig.model_validate(raw)
+        assert isinstance(config.members[0], LeadMember)
+        assert config.members[0].agent_type == "team-lead"
+        assert isinstance(config.members[1], TeammateMember)
+        assert config.members[1].agent_type == "claude-anyteam"
 
 
 class TestTaskFile:

@@ -29,6 +29,8 @@ import subprocess
 import tempfile
 import time
 from dataclasses import dataclass
+from importlib import resources
+from importlib.resources.abc import Traversable
 from pathlib import Path
 from typing import Any
 
@@ -44,9 +46,14 @@ from .env import (
     env_first,
 )
 
-SCHEMAS_DIR = Path(__file__).resolve().parent / "schemas"
+# R1 (09 §3.1): schema files are versioned wire
+# assets, so resolve them as package resources instead of walking relative to
+# this source file. This keeps fresh wheel installs from depending on a
+# repository checkout layout.
+SCHEMAS_DIR = resources.files("claude_anyteam.schemas")
 TASK_COMPLETE_SCHEMA = SCHEMAS_DIR / "task-complete.schema.json"
 PLAN_SCHEMA = SCHEMAS_DIR / "plan.schema.json"
+SchemaResource = Path | Traversable
 
 
 @dataclass(frozen=True)
@@ -314,7 +321,7 @@ def run(
     prompt: str,
     *,
     cwd: Path,
-    schema: Path | None = None,
+    schema: SchemaResource | None = None,
     codex_binary: str = "codex",
     timeout_s: float = 600.0,
     extra_args: list[str] | None = None,
