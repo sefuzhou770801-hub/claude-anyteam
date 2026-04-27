@@ -19,8 +19,8 @@ class LeadMember(BaseModel):
 
     agent_id: str = Field(alias="agentId")
     name: str
-    # R2 (09 §3.1): tolerate legacy config rows that predate agentType so
-    # one bad sibling cannot break read_config() / member-load.
+    # R2 (09 §3.1): tolerate legacy config rows
+    # that predate agentType so one bad sibling cannot break read_config().
     agent_type: str = Field(alias="agentType", default="team-lead")
     model: str
     joined_at: int = Field(alias="joinedAt")
@@ -34,8 +34,8 @@ class TeammateMember(BaseModel):
 
     agent_id: str = Field(alias="agentId")
     name: str
-    # R2 (09 §3.1): additive default for legacy rows missing agentType;
-    # existing explicit values still round-trip.
+    # R2 (09 §3.1): additive default for legacy
+    # rows missing agentType; existing explicit values still round-trip.
     agent_type: str = Field(alias="agentType", default="claude-anyteam")
     model: str
     prompt: str
@@ -45,6 +45,18 @@ class TeammateMember(BaseModel):
     tmux_pane_id: str = Field(alias="tmuxPaneId")
     cwd: str
     subscriptions: list = Field(default_factory=list)
+    # Protocol-rev 09 R11 and 08 §6.3 Agent Card/capabilities():
+    # adapters declare a flat list of cheap capability flags at registration
+    # for roster discovery; rich per-capability manifests are exposed later
+    # via wrapper MCP in R12/R13.
+    capabilities: list[str] = Field(
+        default_factory=list,
+        description=(
+            "Adapter-declared flat capability flags for cheap roster "
+            "discovery; rich per-capability manifests are exposed via the "
+            "wrapper MCP."
+        ),
+    )
     backend_type: str = Field(alias="backendType", default="claude")
     is_active: bool = Field(alias="isActive", default=False)
 

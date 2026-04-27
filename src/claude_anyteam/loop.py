@@ -31,13 +31,21 @@ from typing import Any
 from . import codex as codex_mod
 from . import logger, protocol_io as pio
 from . import prompts as prompts_mod
+from .capabilities import (
+    CODEX_APP_SERVER_CAPABILITIES,
+    CODEX_EXEC_CAPABILITIES,
+    assert_known_capabilities,
+    rich_capability_manifest,
+)
+from .capability_manifest import CapabilityManifestCache
 from .config import Settings
 from .messages import (
+    CapabilityManifestUpdatedIn,
     PlanApprovalRequestIn,
     ShutdownRequestIn,
     parse_protocol_text,
 )
-from .registration import deregister, register
+from .registration import BackendMetadata, deregister, register
 
 
 @dataclass
@@ -60,6 +68,41 @@ class LoopState:
     # conversational context. Same in-memory, same-process-lifetime scope
     # as codex_session_id.
     app_server_last_thread_id: str | None = None
+    peer_manifest_cache: CapabilityManifestCache | None = None
+
+
+def _backend_metadata(settings: Settings) -> BackendMetadata:
+    """Registration metadata for the Codex adapter.
+
+    09 R11 stores 08 §6.3 Agent Card-derived cheap capability flags on
+    the roster; the richer manifest is intentionally deferred to R12/R13 wrapper MCP.
+    """
+    capabilities = (
+        CODEX_APP_SERVER_CAPABILITIES if settings.app_server else CODEX_EXEC_CAPABILITIES
+    )
+    capabilities = assert_known_capabilities(capabilities)
+    if settings.app_server:
+        return BackendMetadata(
+            capabilities=capabilities,
+            capability_manifest=rich_capability_manifest(
+                capabilities,
+                delivery_mode="live",
+                expiry_semantics="live_only",
+                steer_authorization="any_peer",
+                host_tool_surface="codex-native",
+            ),
+            transport="codex-app-server",
+            host_tool_surface="codex-native",
+        )
+    return BackendMetadata(
+        capabilities=capabilities,
+        capability_manifest=rich_capability_manifest(
+            capabilities,
+            host_tool_surface="codex-native",
+        ),
+        transport="codex-exec",
+        host_tool_surface="codex-native",
+    )
 
 
 def run(settings: Settings) -> int:
@@ -70,9 +113,14 @@ def run(settings: Settings) -> int:
         team=settings.team_name,
         agent_name=settings.agent_name,
     )
-    register(settings)
+    register(settings, _backend_metadata(settings))
 
     state = LoopState(settings=settings)
+    state.peer_manifest_cache = CapabilityManifestCache(
+        settings.team_name,
+        self_name=settings.agent_name,
+    )
+    state.peer_manifest_cache.load_startup()
 
     def _sig_handler(signum: int, _frame: Any) -> None:
         logger.warn("signal.received", signum=signum)
@@ -183,6 +231,16 @@ def _handle_message(state: LoopState, msg: Any) -> None:
         return
     if isinstance(payload, PlanApprovalRequestIn):
         _handle_plan_approval(state, payload)
+        return
+    if isinstance(payload, CapabilityManifestUpdatedIn):
+        if state.peer_manifest_cache is not None:
+            state.peer_manifest_cache.apply_update(payload)
+        logger.info(
+            "capability_manifest.update_seen",
+            agent=payload.agent_name,
+            capability_version=payload.capability_version,
+            removed=payload.removed,
+        )
         return
     # task_assignment, plan_approval_response — noted but not acted on here.
     # task_assignment messages are informational; the shared task list is the
@@ -314,9 +372,7 @@ def _handle_shutdown(state: LoopState, payload: ShutdownRequestIn) -> None:
         feedback = f"in-flight task #{state.in_flight_task}"
         logger.info("shutdown.reject", request_id=req_id, in_flight=state.in_flight_task)
         try:
-            pio.send_shutdown_response(
-                s.team_name, s.agent_name, req_id, approve=False, feedback=feedback
-            )
+            pio.send_shutdown_rejected(s.team_name, s.agent_name, req_id, reason=feedback)
         except Exception as e:
             logger.warn("shutdown.response_fail", error=str(e))
         state.shutdown_requested = True  # honour after current task finishes
@@ -324,7 +380,7 @@ def _handle_shutdown(state: LoopState, payload: ShutdownRequestIn) -> None:
 
     logger.info("shutdown.approve", request_id=req_id)
     try:
-        pio.send_shutdown_response(s.team_name, s.agent_name, req_id, approve=True)
+        pio.send_shutdown_approved(s.team_name, s.agent_name, req_id)
     except Exception as e:
         logger.warn("shutdown.response_fail", error=str(e))
     state.codex_session_id = None
@@ -795,14 +851,13 @@ def _execute_task_app_server(state: LoopState, task, prompt: str):
     Returns a `codex.CodexResult` in the same shape as the v7 exec path
     so the surrounding control flow in `_execute_task` is uniform.
     """
-    import json as _json
+    from . import schema_validation as _sv
 
     s = state.settings
 
     # Load the task-complete schema as a JSON dict (App Server wants it
     # inline in `turn/start` params, not as a file path).
-    with open(codex_mod.TASK_COMPLETE_SCHEMA) as f:
-        schema = _json.load(f)
+    schema = _sv.load_schema(codex_mod.TASK_COMPLETE_SCHEMA)
 
     steer_queue = codex_mod.SteerQueue()
 
@@ -836,6 +891,62 @@ def _execute_task_app_server(state: LoopState, task, prompt: str):
                     "task.steer_saw_shutdown", request_id=payload.effective_request_id()
                 )
 
+    def _visibility_event_sink(event) -> None:
+        """R16 fan-out for Codex App Server events.
+
+        The event log is the canonical substrate. Mailbox/task-state updates
+        are low-volume projections driven by the envelope's `visibility`
+        flags (B9 §6.2-§6.4); backend-native names remain in payload fields.
+        """
+
+        try:
+            pio.append_visibility_event(s.team_name, s.agent_name, event)
+        except Exception as e:
+            logger.warn(
+                "visibility.append_fail",
+                task_id=getattr(task, "id", None),
+                kind=getattr(event, "kind", None),
+                error=str(e),
+            )
+        visibility = getattr(event, "visibility", None)
+        if getattr(visibility, "task_state", False):
+            try:
+                pio.update_task(
+                    s.team_name,
+                    task.id,
+                    active_form=f"running codex: {event.summary[:160]}",
+                    metadata={
+                        "visibility": {
+                            "last_event_id": event.event_id,
+                            "last_kind": event.kind,
+                            "last_summary": event.summary,
+                            "last_payload": event.payload,
+                        }
+                    },
+                )
+            except Exception as e:
+                logger.warn(
+                    "visibility.task_state_fail",
+                    task_id=getattr(task, "id", None),
+                    kind=getattr(event, "kind", None),
+                    error=str(e),
+                )
+        if getattr(visibility, "mailbox", False):
+            try:
+                pio.send_visibility_event_to_lead(
+                    s.team_name,
+                    s.agent_name,
+                    event,
+                    summary=event.summary[:120],
+                )
+            except Exception as e:
+                logger.warn(
+                    "visibility.mailbox_fail",
+                    task_id=getattr(task, "id", None),
+                    kind=getattr(event, "kind", None),
+                    error=str(e),
+                )
+
     return codex_mod.app_server_invoke(
         task_prompt=prompt,
         cwd=s.cwd,
@@ -849,6 +960,8 @@ def _execute_task_app_server(state: LoopState, task, prompt: str):
         effort=s.effort,
         overall_timeout_s=s.turn_timeout_s,
         resume_thread_id=state.app_server_last_thread_id,
+        task_id=str(task.id),
+        event_sink=_visibility_event_sink,
     )
 
 

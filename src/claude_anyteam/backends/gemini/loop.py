@@ -13,7 +13,14 @@ from dataclasses import dataclass, field
 from typing import Any
 
 from claude_anyteam import logger, protocol_io as pio
-from claude_anyteam.messages import PlanApprovalRequestIn, ShutdownRequestIn, SteerIn, parse_protocol_text
+from claude_anyteam.capability_manifest import CapabilityManifestCache
+from claude_anyteam.capabilities import (
+    GEMINI_ACP_CAPABILITIES,
+    GEMINI_HEADLESS_CAPABILITIES,
+    assert_known_capabilities,
+    rich_capability_manifest,
+)
+from claude_anyteam.messages import CapabilityManifestUpdatedIn, PlanApprovalRequestIn, ShutdownRequestIn, SteerIn, parse_protocol_text
 from claude_anyteam.registration import BackendMetadata, deregister, register
 from claude_anyteam.schema_validation import inline_schema_prompt_fragment, load_schema
 
@@ -42,6 +49,42 @@ class GeminiLoopState:
     seen_shutdown_request_ids: set[str] = field(default_factory=set)
     gemini_session_id: str | None = None
     queued_steers: list[QueuedSteer] = field(default_factory=list)
+    peer_manifest_cache: CapabilityManifestCache | None = None
+
+
+def _backend_metadata(settings: GeminiSettings) -> BackendMetadata:
+    """Registration metadata for Gemini ACP/headless variants.
+
+    Per 09 R11 and 08 §6.3, this is the cheap roster declaration only;
+    rich invocation semantics live in the later Agent Card manifest layer.
+    """
+    capabilities = (
+        GEMINI_ACP_CAPABILITIES
+        if settings.backend == "acp"
+        else GEMINI_HEADLESS_CAPABILITIES
+    )
+    capabilities = assert_known_capabilities(capabilities)
+    manifest_kwargs = (
+        {
+            "delivery_mode": "live",
+            "expiry_semantics": "session_managed",
+            "steer_authorization": "any_peer",
+            "host_tool_surface": "mcp_anyteam",
+        }
+        if settings.backend == "acp"
+        else {"host_tool_surface": "mcp_anyteam"}
+    )
+    return BackendMetadata(
+        model="gemini-cli",
+        prompt=(
+            "Gemini teammate adapter. Protocol I/O is handled by the adapter; "
+            "coding work is delegated to Gemini CLI headless mode. No Claude LLM is involved."
+        ),
+        capabilities=capabilities,
+        capability_manifest=rich_capability_manifest(capabilities, **manifest_kwargs),
+        transport=f"gemini-{settings.backend}",
+        host_tool_surface="mcp_anyteam",
+    )
 
 
 def run(settings: GeminiSettings) -> int:
@@ -64,17 +107,13 @@ def run(settings: GeminiSettings) -> int:
             agent=settings.agent_name,
             cwd=settings.cwd,
         )
-    register(
-        settings,
-        BackendMetadata(
-            model="gemini-cli",
-            prompt=(
-                "Gemini teammate adapter. Protocol I/O is handled by the adapter; "
-                "coding work is delegated to Gemini CLI headless mode. No Claude LLM is involved."
-            ),
-        ),
-    )
+    register(settings, _backend_metadata(settings))
     state = GeminiLoopState(settings=settings)
+    state.peer_manifest_cache = CapabilityManifestCache(
+        settings.team_name,
+        self_name=settings.agent_name,
+    )
+    state.peer_manifest_cache.load_startup()
 
     def _sig_handler(signum: int, _frame: Any) -> None:
         logger.warn("gemini.signal.received", signum=signum)
@@ -199,6 +238,15 @@ def _handle_message(state: GeminiLoopState, msg: Any) -> None:
         _handle_shutdown(state, payload)
     elif isinstance(payload, PlanApprovalRequestIn):
         _handle_plan_approval(state, payload)
+    elif isinstance(payload, CapabilityManifestUpdatedIn):
+        if state.peer_manifest_cache is not None:
+            state.peer_manifest_cache.apply_update(payload)
+        logger.info(
+            "gemini.capability_manifest.update_seen",
+            agent=payload.agent_name,
+            capability_version=payload.capability_version,
+            removed=payload.removed,
+        )
     elif isinstance(payload, SteerIn):
         _handle_steer(state, payload, msg)
     else:
@@ -281,11 +329,11 @@ def _handle_prose(state: GeminiLoopState, msg: Any) -> None:
     except Exception as e:
         logger.warn("gemini.prose.crash", sender=sender, error=str(e))
 
-    # If the model already delivered the reply via the send_message MCP tool,
-    # last_message is empty by design (the model did everything in tools and
-    # produced no trailing assistant text). Don't double-send a canned
-    # fallback on top of the real reply. Mirrors the Codex adapter fix in
-    # src/claude_anyteam/loop.py:_handle_prose (PR #12) — same bug shape.
+    # 09 R22 / W7: if the model already delivered the reply via the
+    # send_message MCP tool, last_message is empty by design (the model did
+    # everything in tools and produced no trailing assistant text). Don't
+    # double-send a canned fallback on top of the real reply. Mirrors the
+    # Codex adapter fix in src/claude_anyteam/loop.py:_handle_prose (PR #12).
     if reply is None and result is not None and result.exit_code == 0 and getattr(result, "tool_call_events", 0) > 0:
         logger.info("gemini.prose.delivered_via_tool", sender=sender, tool_calls=result.tool_call_events)
         return
@@ -330,14 +378,15 @@ def _handle_shutdown(state: GeminiLoopState, payload: ShutdownRequestIn) -> None
         return
     state.seen_shutdown_request_ids.add(req_id)
     if state.in_flight_task is not None:
+        reason = f"in-flight task #{state.in_flight_task}"
         try:
-            pio.send_shutdown_response(s.team_name, s.agent_name, req_id, approve=False, feedback=f"in-flight task #{state.in_flight_task}")
+            pio.send_shutdown_rejected(s.team_name, s.agent_name, req_id, reason=reason)
         except Exception as e:
             logger.warn("gemini.shutdown.response_fail", error=str(e))
         state.shutdown_requested = True
         return
     try:
-        pio.send_shutdown_response(s.team_name, s.agent_name, req_id, approve=True)
+        pio.send_shutdown_approved(s.team_name, s.agent_name, req_id)
     except Exception as e:
         logger.warn("gemini.shutdown.response_fail", error=str(e))
     state.gemini_session_id = None

@@ -39,6 +39,7 @@ import urllib.request
 from pathlib import Path
 from typing import Any, Literal
 
+from .capability_manifest import CapabilityManifestCache
 from .env import LEGACY_NAME_ENV, LEGACY_TEAM_ENV, NAME_ENV, TEAM_ENV, env_first
 from claude_teams import messaging as _cs_messaging  # type: ignore[import-untyped]
 from claude_teams import tasks as _cs_tasks  # type: ignore[import-untyped]
@@ -58,6 +59,7 @@ EXPOSED_TOOLS: tuple[str, ...] = (
     "read_inbox",
     "task_list",
     "read_config",
+    "mcp_anyteam_capability_manifest",
     "mcp_anyteam_shell",
     "mcp_anyteam_read_file",
     "mcp_anyteam_write_file",
@@ -166,7 +168,7 @@ def build_server(argv: list[str] | None = None) -> FastMCP:
         instructions=(
             "Narrowed MCP surface for a Codex teammate. Team: "
             f"{team!r}; identity: {self_name!r}. Call these tools when it "
-            "would be useful to your teammates — progress updates via "
+            "would be useful to your teammates — peer or lead updates via "
             "send_message, activeForm/owner/metadata changes via task_update, "
             "subtask creation via task_create, inspection via read_inbox / "
             "task_list / read_config. Destructive lifecycle operations "
@@ -175,19 +177,85 @@ def build_server(argv: list[str] | None = None) -> FastMCP:
         ),
     )
 
+    manifest_cache = CapabilityManifestCache(
+        team,
+        self_name=self_name,
+        root=_cs_teams.TEAMS_DIR,
+    )
+    manifest_cache.load_startup()
+
+    @mcp.tool
+    def mcp_anyteam_capability_manifest(
+        agent_name: str,
+        capability: str | None = None,
+    ) -> dict:
+        """Return a teammate's rich R12 Agent Card manifest from the local cache.
+
+        Use `read_config()` for cheap roster discovery via members[].capabilities;
+        use this R13 tool when you need the schema, description, when_to_use,
+        when_not_to, and failure_modes before invoking a peer capability.
+
+        Args:
+            agent_name: target teammate name from this team's roster.
+            capability: optional capability name. When omitted, returns the
+                whole cached Agent Card. When set, returns just that rich
+                per-capability entry.
+        """
+        if not agent_name:
+            raise ToolError("agent_name must not be empty; use read_config() to discover teammate names")
+        try:
+            cfg = _cs_teams.read_config(team)
+        except FileNotFoundError:
+            raise ToolError(f"team {team!r} not found")
+        member_names = {m.name for m in cfg.members}
+        if agent_name not in member_names:
+            raise ToolError(
+                f"agent_name {agent_name!r} is not a member of team {team!r}; "
+                "call read_config() to discover the roster"
+            )
+
+        # Long-lived wrapper processes refresh their in-memory cache from the
+        # R12 inbox event stream just before serving the lookup. This remains a
+        # cache hit for peer invocation: no per-call manifest file read unless
+        # a capability_version bump event told us to reload this entry.
+        manifest_cache.refresh_from_inbox()
+        manifest = manifest_cache.get(agent_name)
+        if manifest is None:
+            raise ToolError(
+                f"capability manifest for {agent_name!r} is not in the local cache; "
+                "use read_config() to verify the roster and wait one inbox poll cycle "
+                "for capability_manifest_updated broadcast refresh"
+            )
+
+        capabilities = manifest.get("capabilities")
+        if capability is None:
+            return manifest
+        if not isinstance(capabilities, dict) or capability not in capabilities:
+            available = sorted(capabilities) if isinstance(capabilities, dict) else []
+            raise ToolError(
+                f"capability {capability!r} is not cached for {agent_name!r}; "
+                f"available capabilities: {available}"
+            )
+        entry = capabilities[capability]
+        if not isinstance(entry, dict):
+            raise ToolError(
+                f"cached capability {capability!r} for {agent_name!r} is malformed"
+            )
+        return entry
+
     @mcp.tool
     def send_message(
         to: str,
         body: str,
         summary: str = "status update",
     ) -> dict:
-        """Send a message to another teammate. Use for progress updates,
-        clarifying questions, or handoffs. The sender is always you;
-        do not try to impersonate another teammate.
+        """Send a message to another teammate (team-lead or any peer). Use
+        for progress updates, clarifying questions, or handoffs. The sender
+        is always you; do not try to impersonate another teammate.
 
         Args:
-            to: recipient teammate name (e.g., 'team-lead'). Must be a
-                member of this team.
+            to: recipient teammate name (e.g., 'team-lead' or a peer). Must
+                be a member of this team; use '*' to broadcast to all others.
             body: message content. Plain prose or JSON-serialized protocol
                 payload both work.
             summary: optional short label shown in notifications (5-10 words).

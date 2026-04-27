@@ -214,7 +214,14 @@ def test_team_patch_missing_team_config(fake_home, capsys):
 def test_team_roster_human_readable(fake_home, capsys):
     _seed_team_config(fake_home, "build", [
         {"name": "team-lead", "agentType": "tech-lead", "model": "claude-opus-4-7", "backendType": "tmux", "color": "blue"},
-        {"name": "codex-alice", "agentType": "claude-anyteam", "model": "codex-cli", "backendType": "in-process", "color": "green"},
+        {
+            "name": "codex-alice",
+            "agentType": "claude-anyteam",
+            "model": "codex-cli",
+            "backendType": "in-process",
+            "color": "green",
+            "capabilities": ["structured_output", "thread_fork"],
+        },
     ])
     rc = cli_main(["team-roster", "--team", "build"])
     assert rc == 0
@@ -223,6 +230,8 @@ def test_team_roster_human_readable(fake_home, capsys):
     assert "codex-alice" in out
     assert "codex-cli" in out
     assert "tech-lead" in out
+    assert "capabilities=-" in out
+    assert "capabilities=structured_output,thread_fork" in out
 
 
 def test_team_roster_json_output(fake_home, capsys):

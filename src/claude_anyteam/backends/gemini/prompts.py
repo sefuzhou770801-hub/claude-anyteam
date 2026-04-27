@@ -9,7 +9,7 @@ from __future__ import annotations
 
 def _tools_text() -> str:
     return (
-        "- mcp_anyteam_send_message(to, body, summary?) — send a status update or clarifying question.\n"
+        "- mcp_anyteam_send_message(to, body, summary?) — send a status update or clarifying question to team-lead or any peer.\n"
         "- mcp_anyteam_task_update(task_id, active_form?, status?) — update your own active_form mid-run; do not set owner or mark completed.\n"
         "- mcp_anyteam_task_create(subject, description) — create a follow-up task if work should be split off.\n"
         "- mcp_anyteam_read_inbox(unread_only?) — read your own inbox for replies.\n"

@@ -30,7 +30,7 @@ def v7_task_prompt(task, agent_name: str, team_name: str) -> str:
         f"it would be useful to your teammates — do not call them by "
         f"default:\n"
         f"- send_message(to, body, summary?) — send a status update or "
-        f"clarifying question to a teammate (e.g., 'team-lead').\n"
+        f"clarifying question to any teammate (e.g., 'team-lead' or a peer).\n"
         f"- task_update(task_id, active_form?, status?) — update your own "
         f"task's `active_form` mid-run ('writing tests', 'running "
         f"verification') so teammates can see progress. Do not set owner; "

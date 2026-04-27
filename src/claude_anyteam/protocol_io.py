@@ -9,6 +9,7 @@ module also provides helpers for adapter-owned message types
 from __future__ import annotations
 
 import json
+import inspect
 import time
 from typing import Any
 
@@ -25,8 +26,11 @@ from .messages import (
     PermissionRequestOut,
     PermissionResponseIn,
     PlanApprovalRequestOut,
+    ShutdownApprovedOut,
+    ShutdownRejectedOut,
     ShutdownResponseOut,
     TaskCompleteOut,
+    VisibilityEvent,
     now_iso,
 )
 
@@ -161,11 +165,60 @@ def send_prose_to_lead(team: str, sender: str, text: str, summary: str) -> None:
     send_prose(team, sender, "team-lead", text, summary=summary)
 
 
+def _send_plain_message_compat(
+    team: str,
+    sender: str,
+    to: str,
+    body: str,
+    *,
+    summary: str,
+    message_kind: str | None = None,
+) -> None:
+    """Call the substrate send helper with an optional R3 message_kind.
+
+    R16 can stub messageKind now without taking ownership of foundation's R3
+    substrate migration: if the installed `claude_teams.messaging` already
+    accepts `message_kind`, pass the kind through; otherwise write the raw
+    inbox entry under the normal inbox lock with `messageKind` preserved.
+    """
+
+    kwargs: dict[str, Any] = {"summary": summary}
+    if message_kind is not None:
+        try:
+            params = inspect.signature(_m.send_plain_message).parameters
+        except (TypeError, ValueError):
+            params = {}
+        accepts_var_kw = any(
+            p.kind is inspect.Parameter.VAR_KEYWORD for p in params.values()
+        )
+        if "message_kind" in params or accepts_var_kw:
+            kwargs["message_kind"] = message_kind
+            _m.send_plain_message(team, sender, to, body, **kwargs)
+            return
+        path = _m.ensure_inbox(team, to)
+        with _file_lock(path.parent / ".lock"):
+            raw_list = json.loads(path.read_text())
+            raw_list.append(
+                {
+                    "from": sender,
+                    "text": body,
+                    "timestamp": now_iso(),
+                    "read": False,
+                    "summary": summary,
+                    "messageKind": message_kind,
+                }
+            )
+            path.write_text(json.dumps(raw_list))
+        return
+    _m.send_plain_message(team, sender, to, body, **kwargs)
+
+
 def send_json_to_lead(
     team: str,
     sender: str,
     payload: dict[str, Any] | Any,
     summary: str,
+    message_kind: str | None = None,
 ) -> None:
     """Send a JSON payload as the message body. `payload` may be a dict or
     a Pydantic model (must have `.model_dump_json`).
@@ -174,12 +227,197 @@ def send_json_to_lead(
         body = payload.model_dump_json(by_alias=True, exclude_none=True)
     else:
         body = json.dumps(payload)
-    _m.send_plain_message(team, sender, "team-lead", body, summary=summary)
+    _send_plain_message_compat(
+        team,
+        sender,
+        "team-lead",
+        body,
+        summary=summary,
+        message_kind=message_kind,
+    )
+
+
+def _visibility_events_dir(team: str):
+    """Return the R16/B9 §6.4 event-log directory for a team.
+
+    The append-only visibility stream lives next to `inboxes/` but uses its
+    own `events/.lock` so high-volume backend activity never contends with
+    human mailbox traffic. Resolve through `claude_teams.messaging.TEAMS_DIR`
+    so tests and alternate storage roots follow the same monkeypatch surface
+    as inbox helpers.
+    """
+
+    return _m.TEAMS_DIR / team / "events"
+
+
+def visibility_event_path(team: str, agent: str):
+    return _visibility_events_dir(team) / f"{agent}.jsonl"
+
+
+def append_visibility_event(
+    team: str,
+    agent: str,
+    event: VisibilityEvent | dict[str, Any],
+) -> VisibilityEvent:
+    """Append one validated B9 §6 visibility envelope.
+
+    This is the canonical full-fidelity channel introduced by 09 R16 / 08
+    PE-2+L17: `~/.claude/teams/<team>/events/<agent>.jsonl`, guarded by the
+    directory-local `events/.lock`. Fan-out to mailbox/task-state/stderr is
+    policy on top of this envelope, not a backend-name flattener; emitters
+    must preserve native event names in `payload.raw_backend_type` per
+    07 §7.3.
+    """
+
+    envelope = (
+        event if isinstance(event, VisibilityEvent)
+        else VisibilityEvent.model_validate(event)
+    )
+    events_dir = _visibility_events_dir(team)
+    events_dir.mkdir(parents=True, exist_ok=True)
+    (events_dir / ".lock").touch(exist_ok=True)
+    line = envelope.model_dump_json(by_alias=True, exclude_none=True)
+    with _file_lock(events_dir / ".lock"):
+        with (events_dir / f"{agent}.jsonl").open("a", encoding="utf-8") as f:
+            f.write(line)
+            f.write("\n")
+    # Some filelock implementations may unlink an empty lockfile on release;
+    # keep the protocol-visible events/.lock sentinel present like inboxes/.lock.
+    (events_dir / ".lock").touch(exist_ok=True)
+    return envelope
+
+
+def read_visibility_events(
+    team: str,
+    agent: str,
+    *,
+    since_seq: int | None = None,
+    limit: int | None = None,
+) -> list[VisibilityEvent]:
+    """Read event-log entries for diagnostics/tests.
+
+    `since_seq` is exclusive (`seq > since_seq`), matching the R16
+    offset-style acceptance without mutating the append-only file.
+    """
+
+    path = visibility_event_path(team, agent)
+    if not path.exists():
+        return []
+    out: list[VisibilityEvent] = []
+    for line in path.read_text(encoding="utf-8").splitlines():
+        if not line.strip():
+            continue
+        event = VisibilityEvent.model_validate(json.loads(line))
+        if since_seq is not None and event.seq <= since_seq:
+            continue
+        out.append(event)
+    if limit is not None and limit >= 0:
+        out = out[-limit:]
+    return out
+
+
+def send_visibility_event_to_lead(
+    team: str,
+    sender: str,
+    event: VisibilityEvent | dict[str, Any],
+    *,
+    summary: str | None = None,
+) -> None:
+    """Mailbox fan-out for low-frequency visibility events.
+
+    R3's `InboxMessage.message_kind` discriminator is present as an explicit
+    field in this branch; set it to the envelope kind (`turn_progress`,
+    `tool_event`, ...), while leaving the envelope body itself unchanged.
+    """
+
+    envelope = (
+        event if isinstance(event, VisibilityEvent)
+        else VisibilityEvent.model_validate(event)
+    )
+    send_json_to_lead(
+        team,
+        sender,
+        envelope,
+        summary=summary or f"visibility:{envelope.kind}",
+        message_kind=envelope.kind,
+    )
 
 
 def send_idle_notification(team: str, sender: str, reason: str = "available") -> None:
     payload = IdleNotificationOut(from_=sender, idle_reason=reason)  # type: ignore[call-arg]
     send_json_to_lead(team, sender, payload, summary="idle")
+
+
+def _shutdown_member_metadata(
+    team: str,
+    sender: str,
+) -> tuple[str | None, str | None]:
+    """Best-effort metadata for host-catalog shutdown_approved.
+
+    The 03 §"Lifecycle" host-binary lifecycle/mailbox extract lists paneId/backendType as
+    optional; include them when the shim registry has them, but never let a
+    config read race block the shutdown acknowledgement.
+    """
+
+    try:
+        cfg = _teams.read_config(team)
+    except Exception as e:
+        logger.debug("shutdown.metadata_unavailable", error=str(e))
+        return None, None
+    for member in getattr(cfg, "members", []):
+        if getattr(member, "name", None) == sender:
+            return (
+                getattr(member, "tmux_pane_id", None),
+                getattr(member, "backend_type", None),
+            )
+    return None, None
+
+
+def send_shutdown_approved(
+    team: str,
+    sender: str,
+    request_id: str,
+    *,
+    pane_id: str | None = None,
+    backend_type: str | None = None,
+) -> None:
+    if pane_id is None or backend_type is None:
+        found_pane_id, found_backend_type = _shutdown_member_metadata(team, sender)
+        pane_id = pane_id if pane_id is not None else found_pane_id
+        backend_type = backend_type if backend_type is not None else found_backend_type
+    payload = ShutdownApprovedOut(
+        request_id=request_id,
+        from_=sender,
+        pane_id=pane_id,
+        backend_type=backend_type,
+    )
+    send_json_to_lead(
+        team,
+        sender,
+        payload,
+        summary="shutdown_approved",
+        message_kind="shutdown_approved",
+    )
+
+
+def send_shutdown_rejected(
+    team: str,
+    sender: str,
+    request_id: str,
+    reason: str,
+) -> None:
+    payload = ShutdownRejectedOut(
+        request_id=request_id,
+        from_=sender,
+        reason=reason or "Shutdown rejected",
+    )
+    send_json_to_lead(
+        team,
+        sender,
+        payload,
+        summary="shutdown_rejected",
+        message_kind="shutdown_rejected",
+    )
 
 
 def send_shutdown_response(
@@ -189,13 +427,42 @@ def send_shutdown_response(
     approve: bool,
     feedback: str | None = None,
 ) -> None:
+    """Deprecated R6 alias for one release.
+
+    New code should call send_shutdown_approved/send_shutdown_rejected so the
+    wire type matches 09 R6, 07 §5.1, and the 03 §"Lifecycle" host catalog.
+    """
+
+    logger.warn(
+        "shutdown_response.deprecated_alias",
+        replacement="shutdown_approved" if approve else "shutdown_rejected",
+        request_id=request_id,
+    )
     payload = ShutdownResponseOut(
         request_id=request_id,
         approve=approve,
         feedback=feedback,
     )
-    summary = "shutdown_approved" if approve else "shutdown_rejected"
-    send_json_to_lead(team, sender, payload, summary=summary)
+    host_payload = payload.to_host_catalog(sender)
+    if isinstance(host_payload, ShutdownApprovedOut):
+        pane_id, backend_type = _shutdown_member_metadata(team, sender)
+        host_payload.pane_id = pane_id
+        host_payload.backend_type = backend_type
+        send_json_to_lead(
+            team,
+            sender,
+            host_payload,
+            summary="shutdown_approved",
+            message_kind="shutdown_approved",
+        )
+    else:
+        send_json_to_lead(
+            team,
+            sender,
+            host_payload,
+            summary="shutdown_rejected",
+            message_kind="shutdown_rejected",
+        )
 
 
 def send_task_blocked(

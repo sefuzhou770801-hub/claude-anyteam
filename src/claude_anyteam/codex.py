@@ -32,7 +32,7 @@ from dataclasses import dataclass
 from importlib import resources
 from importlib.resources.abc import Traversable
 from pathlib import Path
-from typing import Any
+from typing import Any, Callable
 
 from . import logger
 from .env import (
@@ -45,6 +45,7 @@ from .env import (
     identity_env,
     env_first,
 )
+from .messages import VisibilityEvent
 
 # R1 (09 §3.1): schema files are versioned wire
 # assets, so resolve them as package resources instead of walking relative to
@@ -606,6 +607,211 @@ def _start_or_fork_thread(
     return new_thread_id
 
 
+def _json_preview(value: Any, *, limit: int = 1000) -> str:
+    """Bounded JSON preview for B9 §6 payload forensic fields."""
+
+    try:
+        text = json.dumps(value, default=str, sort_keys=True)
+    except Exception:
+        text = repr(value)
+    if len(text) > limit:
+        return text[:limit] + "…"
+    return text
+
+
+def _first_present(mapping: dict[str, Any], *keys: str) -> Any:
+    for key in keys:
+        value = mapping.get(key)
+        if value not in (None, ""):
+            return value
+    return None
+
+
+def _item_target(item: dict[str, Any]) -> str | None:
+    value = _first_present(
+        item,
+        "target",
+        "command",
+        "cmd",
+        "query",
+        "url",
+        "path",
+        "file",
+        "name",
+        "text",
+    )
+    if isinstance(value, list):
+        return " ".join(str(v) for v in value)
+    if isinstance(value, dict):
+        return _json_preview(value, limit=300)
+    if value is None:
+        return None
+    return str(value)
+
+
+def _item_exit_code(item: dict[str, Any]) -> int | None:
+    value = _first_present(item, "exit_code", "exitCode", "returncode", "returnCode")
+    if value is None:
+        return None
+    try:
+        return int(value)
+    except (TypeError, ValueError):
+        return None
+
+
+def _item_status(item: dict[str, Any], *, exit_code: int | None) -> str | None:
+    value = _first_present(item, "status", "outcome", "state")
+    if isinstance(value, str) and value:
+        return value
+    if exit_code is not None:
+        return "success" if exit_code == 0 else "error"
+    return None
+
+
+def _phase_from_method(method: str, item: dict[str, Any]) -> str:
+    explicit = _first_present(item, "phase")
+    if isinstance(explicit, str) and explicit in {"started", "completed", "failed"}:
+        return explicit
+    method_n = _normalise(method)
+    status = str(_first_present(item, "status", "outcome", "state") or "").lower()
+    if "fail" in method_n or status in {"failed", "error"}:
+        return "failed"
+    if "start" in method_n or status in {"running", "started"}:
+        return "started"
+    return "completed"
+
+
+def _artifact_action(item: dict[str, Any]) -> str:
+    value = str(
+        _first_present(item, "action", "operation", "status", "changeType") or "modified"
+    ).lower()
+    if value in {"create", "created", "add", "added", "new"}:
+        return "created"
+    if value in {"delete", "deleted", "remove", "removed"}:
+        return "deleted"
+    return "modified"
+
+
+def _visibility_for_app_server_item(
+    *,
+    method: str,
+    item: dict[str, Any],
+    make_event: Callable[..., VisibilityEvent],
+) -> VisibilityEvent | None:
+    """Normalize Codex App Server native items into B9 §6 envelopes.
+
+    This is intentionally *not* a flattener (07 §7.3): the backend-native
+    item type is preserved verbatim as `payload.raw_backend_type` while the
+    outer envelope gives the lead/event-log a stable routing shape.
+    """
+
+    raw_type = str(item.get("type", ""))
+    item_n = _normalise(raw_type)
+    raw_preview = _json_preview(item)
+
+    if "filechange" in item_n:
+        path = _first_present(item, "path", "file", "filePath", "filename") or ""
+        action = _artifact_action(item)
+        payload: dict[str, Any] = {
+            "source": f"codex_app_server.{raw_type}",
+            "path": str(path),
+            "action": action,
+            "raw_backend_type": raw_type,
+            "raw_event_preview": raw_preview,
+        }
+        for out_key, *in_keys in (
+            ("bytes_delta", "bytes_delta", "bytesDelta"),
+            ("line_delta", "line_delta", "lineDelta"),
+            ("lines_added", "lines_added", "linesAdded"),
+            ("lines_removed", "lines_removed", "linesRemoved"),
+        ):
+            value = _first_present(item, *in_keys)
+            if value is not None:
+                payload[out_key] = value
+        summary = f"{raw_type}: {action} {path}".strip()
+        return make_event(
+            kind="artifact_event",
+            severity="info",
+            summary=summary,
+            payload=payload,
+        )
+
+    if "plan" in item_n:
+        return make_event(
+            kind="turn_progress",
+            severity="info",
+            summary=f"{raw_type}: plan updated",
+            payload={
+                "raw_backend_type": raw_type,
+                "raw_event_preview": raw_preview,
+                "plan": _first_present(item, "plan", "text", "content", "message"),
+            },
+        )
+
+    if "error" in item_n:
+        summary = str(
+            _first_present(item, "message", "error", "summary", "text")
+            or f"{raw_type}: backend error"
+        )
+        return make_event(
+            kind="turn_warning",
+            severity="error",
+            summary=summary[:200],
+            payload={
+                "raw_backend_type": raw_type,
+                "raw_event_preview": raw_preview,
+                "error": _first_present(item, "error", "message", "text"),
+            },
+        )
+
+    tool_like = any(
+        frag in item_n
+        for frag in (
+            "commandexecution",
+            "websearch",
+            "mcptoolcall",
+            "toolcall",
+            "tooluse",
+            "imagegeneration",
+        )
+    )
+    if not tool_like:
+        return None
+
+    fake_ev = {
+        "type": raw_type,
+        "item": item,
+        **{k: v for k, v in item.items() if k != "type"},
+    }
+    exit_code = _item_exit_code(item)
+    status = _item_status(item, exit_code=exit_code)
+    tool_name = raw_type
+    if "mcp" in item_n or "toolcall" in item_n or "tooluse" in item_n:
+        tool_name = _tool_name_from_event(fake_ev) or raw_type
+    payload = {
+        "category": "mcp_tool" if "mcp" in item_n else "host_tool",
+        "tool_name": tool_name,
+        "phase": _phase_from_method(method, item),
+        "target": _item_target(item),
+        "status": status,
+        "exit_code": exit_code,
+        "duration_ms": _first_present(item, "duration_ms", "durationMs", "elapsedMs"),
+        "stdout_preview": _first_present(item, "stdout_preview", "stdoutPreview"),
+        "stderr_preview": _first_present(item, "stderr_preview", "stderrPreview"),
+        "raw_backend_type": raw_type,
+        "raw_event_preview": raw_preview,
+    }
+    payload = {k: v for k, v in payload.items() if v is not None}
+    target = payload.get("target")
+    summary = f"{raw_type}: {target}" if target else raw_type
+    return make_event(
+        kind="tool_event",
+        severity="error" if payload.get("phase") == "failed" else "info",
+        summary=summary[:200],
+        payload=payload,
+    )
+
+
 def app_server_invoke(
     *,
     task_prompt: str,
@@ -621,6 +827,8 @@ def app_server_invoke(
     resume_thread_id: str | None = None,
     model: str | None = None,
     effort: str | None = None,
+    task_id: str | None = None,
+    event_sink: Callable[[VisibilityEvent], None] | None = None,
 ) -> CodexResult:
     """Run a task against Codex App Server. Returns a CodexResult in the
     same shape as `run()` so the control loop can use a single code path
@@ -661,6 +869,55 @@ def app_server_invoke(
     last_message = ""
     error: str | None = None
     exit_code = 0
+    thread_id: str | None = None
+    current_turn_id: str | None = None
+    turn_started_at: float | None = None
+    visibility_seq = 0
+
+    def _emit_visibility_event(
+        *,
+        kind: str,
+        severity: str,
+        summary: str,
+        payload: dict[str, Any],
+        visibility: dict[str, bool] | None = None,
+    ) -> VisibilityEvent:
+        nonlocal visibility_seq
+        visibility_seq += 1
+        turn_ref = current_turn_id or thread_id or "unknown-turn"
+        event = VisibilityEvent.model_validate(
+            {
+                "kind": kind,
+                "event_id": f"{settings_agent}:{turn_ref}:{visibility_seq:06d}",
+                "team": settings_team,
+                "agent": settings_agent,
+                "backend": "codex_app_server",
+                "task_id": task_id,
+                "turn_id": current_turn_id,
+                "seq": visibility_seq,
+                "severity": severity,
+                "summary": summary,
+                "visibility": visibility
+                or {
+                    "mailbox": False,
+                    "task_state": False,
+                    "event_log": True,
+                    "stderr": True,
+                },
+                "payload": payload,
+            }
+        )
+        if event_sink is not None:
+            try:
+                event_sink(event)
+            except Exception as e:
+                logger.warn(
+                    "visibility.event_sink_failed",
+                    kind=event.kind,
+                    event_id=event.event_id,
+                    error=str(e),
+                )
+        return event
 
     def _record(ev: dict[str, Any]) -> None:
         nonlocal tool_call_events
@@ -682,6 +939,11 @@ def app_server_invoke(
                     tool=_tool_name_from_event(fake_ev),
                     event={"item": item},
                 )
+            _visibility_for_app_server_item(
+                method=method,
+                item=item,
+                make_event=_emit_visibility_event,
+            )
 
     # MCP config for the wrapper — same shape as the exec path, injected via
     # Codex's config override mechanism on thread start. App Server accepts
@@ -722,7 +984,6 @@ def app_server_invoke(
     if model is not None:
         thread_kwargs["model"] = model
 
-    thread_id: str | None = None
     try:
         client.start()
         client.initialize()
@@ -741,6 +1002,20 @@ def app_server_invoke(
             effort=effort,
         )
         logger.info("app_server.turn_started", turn_id=current_turn_id)
+        _emit_visibility_event(
+            kind="turn_started",
+            severity="info",
+            summary="Codex App Server turn started",
+            payload={
+                "mode": "task" if task_id is not None else "prose",
+                "prompt_kind": "task_complete" if schema is not None else "prose_reply",
+                "timeout_s": overall_timeout_s,
+                "non_progress_soft_s": non_progress_warn_s,
+                "cwd": str(cwd),
+                "model": model,
+                "effort": effort,
+            },
+        )
 
         # Event loop: drain notifications, watch for turn/completed, deliver
         # queued steers. Polling with a short timeout lets us interleave
@@ -810,13 +1085,40 @@ def app_server_invoke(
                     and (time.monotonic() - last_progress_at) >= non_progress_warn_s
                 ):
                     elapsed_s = time.monotonic() - turn_started_at
+                    non_progress_s = time.monotonic() - last_progress_at
                     logger.warn(
                         "app_server.non_progress",
                         turn_id=current_turn_id,
                         elapsed_s=int(elapsed_s),
-                        non_progress_s=int(time.monotonic() - last_progress_at),
+                        non_progress_s=int(non_progress_s),
                         tool_call_events=tool_call_events,
                         last_message_len=len(last_message),
+                    )
+                    _emit_visibility_event(
+                        kind="turn_progress",
+                        severity="warn",
+                        summary=(
+                            f"no visible checkpoint for {int(non_progress_s)}s; "
+                            "checkpoint steer sent"
+                        ),
+                        visibility={
+                            "mailbox": True,
+                            "task_state": True,
+                            "event_log": True,
+                            "stderr": True,
+                        },
+                        payload={
+                            "elapsed_s": int(elapsed_s),
+                            "timeout_s": overall_timeout_s,
+                            "risk": "timeout_possible",
+                            "app_server_events": len(events),
+                            "agent_message_bytes": len(last_message),
+                            "mcp_tool_calls": tool_call_events,
+                            "host_tool_events": tool_call_events,
+                            "artifact_delta_bytes": 0,
+                            "last_checkpoint_at": None,
+                            "action_taken": "turn_steer_sent",
+                        },
                     )
                     try:
                         client.turn_steer(
@@ -892,6 +1194,42 @@ def app_server_invoke(
         exit_code = 1
     finally:
         client.close()
+
+    elapsed_s = (
+        time.monotonic() - turn_started_at
+        if turn_started_at is not None
+        else None
+    )
+    terminal_payload = {
+        "exit_code": exit_code,
+        "error": error,
+        "elapsed_s": int(elapsed_s) if elapsed_s is not None else None,
+        "structured": bool(structured),
+        "events": len(events),
+        "tool_call_events": tool_call_events,
+        "last_message_preview": last_message[:500],
+    }
+    terminal_payload = {k: v for k, v in terminal_payload.items() if v is not None}
+    if error or exit_code != 0:
+        _emit_visibility_event(
+            kind="turn_failed",
+            severity="error",
+            summary=(error or f"Codex App Server exited {exit_code}")[:200],
+            visibility={
+                "mailbox": True,
+                "task_state": True,
+                "event_log": True,
+                "stderr": True,
+            },
+            payload=terminal_payload,
+        )
+    else:
+        _emit_visibility_event(
+            kind="turn_completed",
+            severity="info",
+            summary="Codex App Server turn completed",
+            payload=terminal_payload,
+        )
 
     logger.info(
         "app_server.done",

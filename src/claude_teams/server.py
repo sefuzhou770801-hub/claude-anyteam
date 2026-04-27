@@ -393,13 +393,18 @@ def send_message(
             )
         if sender == recipient:
             raise ToolError("Cannot send a message to yourself")
-        if sender != "team-lead" and recipient != "team-lead":
-            raise ToolError("Teammates can only send direct messages to team-lead")
+        # 09 R21 / W3 peer-DM consistency: the protocol substrate should
+        # enforce membership and self-send guards, not a lead-only topology.
+        # Routed wrappers already allowed peer→peer; keeping the full server
+        # lead-only made native/full-MCP and routed-wrapper peers diverge.
         target_color = None
+        sender_color = None
         for m in config.members:
-            if m.name == recipient and isinstance(m, TeammateMember):
-                target_color = m.color
-                break
+            if isinstance(m, TeammateMember):
+                if m.name == recipient:
+                    target_color = m.color
+                if m.name == sender:
+                    sender_color = m.color
         content = _content_metadata(content, sender)
         messaging.send_plain_message(
             team_name,
@@ -407,7 +412,7 @@ def send_message(
             recipient,
             content,
             summary=summary,
-            color=target_color,
+            color=sender_color,
         )
 
         return SendMessageResult(
@@ -417,6 +422,7 @@ def send_message(
                 "sender": sender,
                 "target": recipient,
                 "targetColor": target_color,
+                "senderColor": sender_color,
             },
         ).model_dump(exclude_none=True)
 

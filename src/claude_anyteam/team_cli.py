@@ -31,7 +31,7 @@ import os
 import shutil
 import subprocess
 import sys
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Any, TextIO
 
@@ -344,6 +344,9 @@ class _RosterRow:
     adapter_effort: str | None = None
     adapter_turn_timeout_s: float | None = None
     config_source: str | None = None
+    # 09 R11 / 08 §6.3 cheap capability flags; rich Agent Card
+    # manifests are intentionally not expanded in the roster table.
+    capabilities: list[str] = field(default_factory=list)
     # tmux pane id from config.json. Used by the dead-pane check to flag
     # members whose backing tmux pane is gone (host crash, tmux kill-server,
     # process panic). Empty for non-tmux backends like the team-lead row.
@@ -403,6 +406,12 @@ def _roster_rows(cfg: dict[str, object], *, team: str | None = None, resolve: bo
                 except (TypeError, ValueError):
                     adapter_turn_timeout_s = None
             config_source = source
+        raw_capabilities = m.get("capabilities", [])
+        capabilities = (
+            [str(capability) for capability in raw_capabilities]
+            if isinstance(raw_capabilities, list)
+            else []
+        )
         rows.append(
             _RosterRow(
                 name=name,
@@ -415,6 +424,7 @@ def _roster_rows(cfg: dict[str, object], *, team: str | None = None, resolve: bo
                 adapter_effort=adapter_effort,
                 adapter_turn_timeout_s=adapter_turn_timeout_s,
                 config_source=config_source,
+                capabilities=capabilities,
                 tmux_pane_id=str(m.get("tmuxPaneId", "")),
             )
         )
@@ -459,6 +469,10 @@ def _read_agent_config(team: str, agent: str) -> tuple[dict[str, Any], str | Non
     if not isinstance(raw, dict):
         return {}, str(path)
     return raw, str(path)
+
+
+def _format_capabilities(capabilities: list[str]) -> str:
+    return ",".join(capabilities) if capabilities else "-"
 
 
 def _team_roster_command(argv: list[str], *, stdout: TextIO | None = None, stderr: TextIO | None = None) -> int:
@@ -532,9 +546,10 @@ def _team_roster_command(argv: list[str], *, stdout: TextIO | None = None, stder
             if r.adapter_turn_timeout_s is not None:
                 parts.append(f"adapter_turn_timeout_s={r.adapter_turn_timeout_s}")
             adapter_suffix = "  " + " ".join(parts)
+        capabilities_suffix = f"  capabilities={_format_capabilities(r.capabilities)}"
         out.write(
             f"{marker}{r.name:<{name_w}}  type={r.agent_type:<{type_w}}  model={r.model:<{model_w}}  "
-            f"backend={r.backend_type}  color={r.color}{suffix}{adapter_suffix}\n"
+            f"backend={r.backend_type}  color={r.color}{suffix}{adapter_suffix}{capabilities_suffix}\n"
         )
     return 0
 

@@ -10,6 +10,8 @@ import json
 
 from claude_anyteam.messages import (
     PlanApprovalRequestIn,
+    ShutdownApprovedOut,
+    ShutdownRejectedOut,
     ShutdownRequestIn,
     ShutdownResponseOut,
     TaskAssignmentIn,
@@ -87,20 +89,66 @@ def test_parse_extra_fields_tolerated():
     assert isinstance(p, ShutdownRequestIn)
 
 
-def test_shutdown_response_serializes_with_snake_case():
+def test_shutdown_approved_serializes_host_catalog_shape():
+    r = ShutdownApprovedOut(
+        request_id="abc",
+        from_="worker",
+        pane_id="in-process",
+        backend_type="codex",
+    )
+    as_dict = json.loads(r.model_dump_json(by_alias=True, exclude_none=True))
+    assert as_dict["type"] == "shutdown_approved"
+    assert as_dict["schema_version"] == 1
+    assert as_dict["requestId"] == "abc"
+    assert as_dict["from"] == "worker"
+    assert as_dict["paneId"] == "in-process"
+    assert as_dict["backendType"] == "codex"
+
+
+def test_shutdown_rejected_serializes_host_catalog_shape():
+    r = ShutdownRejectedOut(request_id="abc", from_="worker", reason="busy")
+    as_dict = json.loads(r.model_dump_json(by_alias=True, exclude_none=True))
+    assert as_dict["type"] == "shutdown_rejected"
+    assert as_dict["schema_version"] == 1
+    assert as_dict["requestId"] == "abc"
+    assert as_dict["from"] == "worker"
+    assert as_dict["reason"] == "busy"
+
+
+def test_parse_shutdown_approved_and_rejected_host_catalog_shapes():
+    approved = parse_protocol_text(
+        json.dumps({"type": "shutdown_approved", "requestId": "a1", "from": "worker", "timestamp": "ts"})
+    )
+    rejected = parse_protocol_text(
+        json.dumps({"type": "shutdown_rejected", "requestId": "r1", "from": "worker", "reason": "busy", "timestamp": "ts"})
+    )
+    assert isinstance(approved, ShutdownApprovedOut)
+    assert approved.request_id == "a1"
+    assert isinstance(rejected, ShutdownRejectedOut)
+    assert rejected.reason == "busy"
+
+
+def test_legacy_shutdown_response_alias_still_parses_for_one_release():
     r = ShutdownResponseOut(request_id="abc", approve=True)
     as_dict = json.loads(r.model_dump_json(by_alias=True, exclude_none=True))
     assert as_dict["type"] == "shutdown_response"
     assert as_dict["request_id"] == "abc"
     assert as_dict["approve"] is True
     assert "feedback" not in as_dict  # omitted when None
+    parsed = parse_protocol_text(json.dumps(as_dict))
+    assert isinstance(parsed, ShutdownResponseOut)
 
 
-def test_shutdown_response_with_feedback():
+def test_legacy_shutdown_response_alias_maps_to_host_catalog_shape():
     r = ShutdownResponseOut(request_id="abc", approve=False, feedback="busy")
-    as_dict = json.loads(r.model_dump_json(by_alias=True, exclude_none=True))
-    assert as_dict["approve"] is False
-    assert as_dict["feedback"] == "busy"
+    host = r.to_host_catalog("worker")
+    assert isinstance(host, ShutdownRejectedOut)
+    as_dict = json.loads(host.model_dump_json(by_alias=True, exclude_none=True))
+    assert as_dict["type"] == "shutdown_rejected"
+    assert as_dict["schema_version"] == 1
+    assert as_dict["requestId"] == "abc"
+    assert as_dict["from"] == "worker"
+    assert as_dict["reason"] == "busy"
 
 
 def test_task_complete_serializes_with_kind():

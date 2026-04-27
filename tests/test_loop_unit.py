@@ -59,17 +59,17 @@ def test_shutdown_while_idle_approves_and_exits():
     sent: list[tuple] = []
     with patch.object(
         loop_mod.pio,
-        "send_shutdown_response",
+        "send_shutdown_approved",
         side_effect=lambda *a, **k: sent.append((a, k)),
     ):
         _handle_message(state, msg)
     assert state.approved_shutdown is True
     assert state.shutdown_requested is False
     assert len(sent) == 1
-    # (team, agent, req_id, approve=True)
+    # (team, agent, req_id)
     args, kwargs = sent[0]
     assert args[2] == "r1"
-    assert kwargs["approve"] is True
+    assert kwargs == {}
 
 
 def test_shutdown_while_idle_clears_lineage_state():
@@ -82,7 +82,7 @@ def test_shutdown_while_idle_clears_lineage_state():
         text=json.dumps({"type": "shutdown_request", "request_id": "r1b"}),
     )
 
-    with patch.object(loop_mod.pio, "send_shutdown_response"):
+    with patch.object(loop_mod.pio, "send_shutdown_approved"):
         _handle_message(state, msg)
 
     assert state.approved_shutdown is True
@@ -98,7 +98,7 @@ def test_shutdown_while_mid_task_rejects_with_feedback():
     sent: list[tuple] = []
     with patch.object(
         loop_mod.pio,
-        "send_shutdown_response",
+        "send_shutdown_rejected",
         side_effect=lambda *a, **k: sent.append((a, k)),
     ):
         _handle_message(state, msg)
@@ -106,8 +106,7 @@ def test_shutdown_while_mid_task_rejects_with_feedback():
     assert state.shutdown_requested is True  # queued for later
     args, kwargs = sent[0]
     assert args[2] == "r2"
-    assert kwargs["approve"] is False
-    assert "in-flight task #4" in kwargs["feedback"]
+    assert "in-flight task #4" in kwargs["reason"]
 
 
 def test_shutdown_duplicate_request_id_ignored():
@@ -116,10 +115,14 @@ def test_shutdown_duplicate_request_id_ignored():
     msg = FakeInboxMessage(
         text=json.dumps({"type": "shutdown_request", "request_id": "r3"}),
     )
-    with patch.object(loop_mod.pio, "send_shutdown_response") as m:
+    with (
+        patch.object(loop_mod.pio, "send_shutdown_approved") as approved,
+        patch.object(loop_mod.pio, "send_shutdown_rejected") as rejected,
+    ):
         _handle_message(state, msg)
     assert state.approved_shutdown is False
-    assert m.call_count == 0
+    assert approved.call_count == 0
+    assert rejected.call_count == 0
 
 
 def _fake_codex_result(reply: str = "Four.", exit_code: int = 0, tool_call_events: int = 0):
@@ -309,7 +312,7 @@ def test_mid_turn_shutdown_sends_reject_response_immediately(tmp_path: Path):
         patch.object(loop_mod.pio, "read_own_inbox", return_value=[shutdown_msg]),
         patch.object(
             loop_mod.pio,
-            "send_shutdown_response",
+            "send_shutdown_rejected",
             side_effect=lambda *a, **k: sent.append((a, k)),
         ),
         patch.object(loop_mod.codex_mod, "app_server_invoke", side_effect=fake_invoke),
@@ -321,8 +324,7 @@ def test_mid_turn_shutdown_sends_reject_response_immediately(tmp_path: Path):
     assert len(sent) == 1
     args, kwargs = sent[0]
     assert args[2] == "mid-task-1"
-    assert kwargs["approve"] is False
-    assert kwargs["feedback"] == "in-flight task #42"
+    assert kwargs["reason"] == "in-flight task #42"
 
 
 def test_mid_turn_shutdown_duplicate_request_id_is_ignored(tmp_path: Path):
@@ -345,7 +347,7 @@ def test_mid_turn_shutdown_duplicate_request_id_is_ignored(tmp_path: Path):
         patch.object(loop_mod.pio, "read_own_inbox", return_value=[shutdown_msg]),
         patch.object(
             loop_mod.pio,
-            "send_shutdown_response",
+            "send_shutdown_rejected",
             side_effect=lambda *a, **k: sent.append((a, k)),
         ),
         patch.object(loop_mod.codex_mod, "app_server_invoke", side_effect=fake_invoke),

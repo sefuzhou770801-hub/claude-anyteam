@@ -1,6 +1,14 @@
 from __future__ import annotations
 
+from pathlib import Path
+from types import SimpleNamespace
+from unittest.mock import patch
+
+import pytest
+
 from claude_anyteam.backends.gemini import loop
+from claude_anyteam.backends.gemini.config import GeminiSettings
+from claude_anyteam.backends.gemini.loop import GeminiLoopState
 from claude_anyteam.codex import CodexResult
 
 
@@ -12,12 +20,46 @@ def test_hard_cancel_failures_drop_session_policy():
     assert loop._should_drop_session_after_failure(cancelled)
     assert not loop._should_drop_session_after_failure(other)
 
-from pathlib import Path
-from types import SimpleNamespace
-from unittest.mock import patch
 
-from claude_anyteam.backends.gemini.config import GeminiSettings
-from claude_anyteam.backends.gemini.loop import GeminiLoopState
+def _settings(tmp_path: Path, backend: str) -> GeminiSettings:
+    return GeminiSettings(
+        team_name="t",
+        agent_name="gemini-peer",
+        cwd=tmp_path,
+        poll_interval_s=0.01,
+        color="cyan",
+        plan_mode_required=False,
+        gemini_home=tmp_path / f"gemini-{backend}",
+        backend=backend,  # type: ignore[arg-type]
+    )
+
+
+@pytest.mark.parametrize("backend", ["acp", "headless"])
+def test_handle_prose_skips_fallback_when_model_used_send_message_tool(tmp_path: Path, monkeypatch, backend: str):
+    """09 R22 / W7: Gemini matches Codex PR #12 and Kimi PR #11.
+
+    When Gemini delivers a prose reply via the wrapper send_message tool, the
+    CLI may leave last_message empty. The loop must not add a second canned
+    fallback reply on top of the tool-delivered peer DM.
+    """
+
+    state = loop.GeminiLoopState(settings=_settings(tmp_path, backend))
+    msg = SimpleNamespace(from_="codex-peer", text="ack", summary="prose")
+    fake_result = CodexResult(
+        exit_code=0,
+        structured=None,
+        last_message="",
+        events=[],
+        tool_call_events=1,
+    )
+    monkeypatch.setattr(loop, "_backend_run", lambda *a, **k: fake_result)
+
+    send_prose_calls: list = []
+    monkeypatch.setattr(loop.pio, "send_prose", lambda *a, **k: send_prose_calls.append((a, k)))
+
+    loop._handle_prose(state, msg)
+
+    assert send_prose_calls == []
 
 
 def test_loop_surfaces_permission_block_with_details():

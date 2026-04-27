@@ -13,7 +13,9 @@ from dataclasses import dataclass, field
 from typing import Any
 
 from claude_anyteam import logger, protocol_io as pio
-from claude_anyteam.messages import PlanApprovalRequestIn, ShutdownRequestIn, SteerIn, parse_protocol_text
+from claude_anyteam.capability_manifest import CapabilityManifestCache
+from claude_anyteam.capabilities import KIMI_HEADLESS_CAPABILITIES, assert_known_capabilities, rich_capability_manifest
+from claude_anyteam.messages import CapabilityManifestUpdatedIn, PlanApprovalRequestIn, ShutdownRequestIn, SteerIn, parse_protocol_text
 from claude_anyteam.registration import BackendMetadata, deregister, register
 from claude_anyteam.schema_validation import inline_schema_prompt_fragment, load_schema
 
@@ -42,21 +44,41 @@ class KimiLoopState:
     seen_shutdown_request_ids: set[str] = field(default_factory=set)
     kimi_session_id: str | None = None
     queued_steers: list[QueuedSteer] = field(default_factory=list)
+    peer_manifest_cache: CapabilityManifestCache | None = None
+
+
+def _backend_metadata(settings: KimiSettings) -> BackendMetadata:
+    """Registration metadata for Kimi headless v1.
+
+    09 R11 adds the 08 §6.3 Agent Card-derived cheap roster flags; rich
+    manifest details remain deferred to the wrapper-MCP capability layer.
+    """
+    capabilities = assert_known_capabilities(KIMI_HEADLESS_CAPABILITIES)
+    return BackendMetadata(
+        model="kimi-cli",
+        prompt=(
+            "Kimi teammate adapter. Protocol I/O is handled by the adapter; "
+            "coding work is delegated to Kimi CLI headless mode. No Claude LLM is involved."
+        ),
+        capabilities=capabilities,
+        capability_manifest=rich_capability_manifest(
+            capabilities,
+            host_tool_surface="kimi-native",
+        ),
+        transport="kimi-headless",
+        host_tool_surface="kimi-native",
+    )
 
 
 def run(settings: KimiSettings) -> int:
     _backend_feature_test(settings)
-    register(
-        settings,
-        BackendMetadata(
-            model="kimi-cli",
-            prompt=(
-                "Kimi teammate adapter. Protocol I/O is handled by the adapter; "
-                "coding work is delegated to Kimi CLI headless mode. No Claude LLM is involved."
-            ),
-        ),
-    )
+    register(settings, _backend_metadata(settings))
     state = KimiLoopState(settings=settings)
+    state.peer_manifest_cache = CapabilityManifestCache(
+        settings.team_name,
+        self_name=settings.agent_name,
+    )
+    state.peer_manifest_cache.load_startup()
 
     def _sig_handler(signum: int, _frame: Any) -> None:
         logger.warn("kimi.signal.received", signum=signum)
@@ -171,6 +193,15 @@ def _handle_message(state: KimiLoopState, msg: Any) -> None:
         _handle_shutdown(state, payload)
     elif isinstance(payload, PlanApprovalRequestIn):
         _handle_plan_approval(state, payload)
+    elif isinstance(payload, CapabilityManifestUpdatedIn):
+        if state.peer_manifest_cache is not None:
+            state.peer_manifest_cache.apply_update(payload)
+        logger.info(
+            "kimi.capability_manifest.update_seen",
+            agent=payload.agent_name,
+            capability_version=payload.capability_version,
+            removed=payload.removed,
+        )
     elif isinstance(payload, SteerIn):
         _handle_steer(state, payload, msg)
     else:
@@ -299,16 +330,17 @@ def _handle_shutdown(state: KimiLoopState, payload: ShutdownRequestIn) -> None:
         return
     state.seen_shutdown_request_ids.add(req_id)
     if state.in_flight_task is not None:
+        reason = f"in-flight task #{state.in_flight_task}"
         logger.info("kimi.shutdown.reject", request_id=req_id, in_flight=state.in_flight_task)
         try:
-            pio.send_shutdown_response(s.team_name, s.agent_name, req_id, approve=False, feedback=f"in-flight task #{state.in_flight_task}")
+            pio.send_shutdown_rejected(s.team_name, s.agent_name, req_id, reason=reason)
         except Exception as e:
             logger.warn("kimi.shutdown.response_fail", error=str(e))
         state.shutdown_requested = True
         return
     logger.info("kimi.shutdown.approve", request_id=req_id)
     try:
-        pio.send_shutdown_response(s.team_name, s.agent_name, req_id, approve=True)
+        pio.send_shutdown_approved(s.team_name, s.agent_name, req_id)
     except Exception as e:
         logger.warn("kimi.shutdown.response_fail", error=str(e))
     state.kimi_session_id = None

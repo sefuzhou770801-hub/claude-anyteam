@@ -14,7 +14,7 @@ from types import SimpleNamespace
 from unittest.mock import patch
 
 import pytest
-from claude_teams.models import TeammateMember
+from claude_teams.models import LeadMember, TeammateMember
 
 from claude_anyteam.wrapper_server import (
     BLOCKED_TOOLS,
@@ -65,6 +65,58 @@ def _member(name: str, color: str) -> TeammateMember:
     )
 
 
+def _lead() -> LeadMember:
+    return LeadMember(
+        agentId="team-lead@claude-anyteam",
+        name="team-lead",
+        agentType="team-lead",
+        model="claude-opus",
+        joinedAt=0,
+        tmuxPaneId="",
+        cwd="/tmp",
+    )
+
+
+def _seed_manifest_team(team_root, *, version: str = "1"):
+    team_dir = team_root / "claude-anyteam"
+    team_dir.mkdir(parents=True, exist_ok=True)
+    (team_dir / "inboxes").mkdir(exist_ok=True)
+    config = {
+        "name": "claude-anyteam",
+        "createdAt": 0,
+        "leadAgentId": "team-lead@claude-anyteam",
+        "leadSessionId": "lead-session",
+        "members": [
+            _lead().model_dump(by_alias=True, exclude_none=True),
+            _member("contract-test", "magenta").model_dump(by_alias=True, exclude_none=True),
+            _member("peer-a", "blue").model_dump(by_alias=True, exclude_none=True),
+        ],
+    }
+    (team_dir / "config.json").write_text(json.dumps(config), encoding="utf-8")
+    manifest_dir = team_dir / "manifests"
+    manifest_dir.mkdir()
+    manifest = {
+        "schema_version": 1,
+        "capability_version": version,
+        "team_name": "claude-anyteam",
+        "agent_name": "peer-a",
+        "agent_id": "peer-a@claude-anyteam",
+        "capabilities": {
+            "permission_bridge": {
+                "version": version,
+                "schema": {"type": "object"},
+                "description": "Approval bridge",
+                "when_to_use": "approval needed",
+                "when_not_to": "routine reads",
+                "failure_modes": ["APPROVAL_TIMEOUT"],
+            }
+        },
+    }
+    (manifest_dir / "peer-a.json").write_text(json.dumps(manifest), encoding="utf-8")
+    (team_dir / "inboxes" / "contract-test.json").write_text("[]", encoding="utf-8")
+    return team_dir, manifest
+
+
 def test_exposed_tools_exactly_the_safe_subset(identity):
     names = _advertised_tool_names()
     assert set(names) == set(EXPOSED_TOOLS), (
@@ -83,9 +135,9 @@ def test_exposed_and_blocked_do_not_overlap():
     assert not overlap, f"EXPOSED_TOOLS and BLOCKED_TOOLS overlap: {overlap}"
 
 
-def test_exposed_count_includes_protocol_and_shadow_tools(identity):
-    """Canary: thirteen tools is the intentional count (six protocol tools plus seven shadow tools)."""
-    assert len(_advertised_tool_names()) == 13
+def test_exposed_count_includes_protocol_shadow_and_manifest_tools(identity):
+    """Canary: fourteen tools is intentional: six protocol tools, the R13 manifest tool, and seven shadow tools."""
+    assert len(_advertised_tool_names()) == 14
 
 
 def test_identity_required_at_build_time(monkeypatch):
@@ -158,6 +210,7 @@ def test_exposed_tools_covers_cs50victor_safe_subset():
     assert "read_inbox" in EXPOSED_TOOLS
     assert "task_list" in EXPOSED_TOOLS
     assert "read_config" in EXPOSED_TOOLS
+    assert "mcp_anyteam_capability_manifest" in EXPOSED_TOOLS
     assert "mcp_anyteam_shell" in EXPOSED_TOOLS
     assert "mcp_anyteam_read_file" in EXPOSED_TOOLS
     assert "mcp_anyteam_write_file" in EXPOSED_TOOLS
@@ -165,6 +218,84 @@ def test_exposed_tools_covers_cs50victor_safe_subset():
     assert "mcp_anyteam_edit_file" in EXPOSED_TOOLS
     assert "mcp_anyteam_search" in EXPOSED_TOOLS
     assert "mcp_anyteam_web_fetch" in EXPOSED_TOOLS
+
+
+def test_capability_manifest_tool_returns_cached_entry(identity, monkeypatch, tmp_path):
+    team_root = tmp_path / "teams"
+    _seed_manifest_team(team_root, version="1")
+    monkeypatch.setattr("claude_anyteam.wrapper_server._cs_teams.TEAMS_DIR", team_root)
+
+    mcp = build_server()
+
+    # After wrapper startup, the R13 tool must serve from memory; no manifest
+    # file read should occur on a cache-hit lookup.
+    def explode(_path):
+        raise AssertionError("manifest file read during cache-hit tool call")
+
+    monkeypatch.setattr("claude_anyteam.capability_manifest.read_manifest_file", explode)
+    result = asyncio.run(
+        mcp.call_tool(
+            "mcp_anyteam_capability_manifest",
+            {"agent_name": "peer-a", "capability": "permission_bridge"},
+        )
+    ).structured_content
+
+    assert result["schema"] == {"type": "object"}
+    assert result["when_to_use"] == "approval needed"
+    assert result["failure_modes"] == ["APPROVAL_TIMEOUT"]
+
+
+def test_capability_manifest_tool_reloads_on_version_bump_event(identity, monkeypatch, tmp_path):
+    team_root = tmp_path / "teams"
+    team_dir, manifest = _seed_manifest_team(team_root, version="1")
+    monkeypatch.setattr("claude_anyteam.wrapper_server._cs_teams.TEAMS_DIR", team_root)
+    mcp = build_server()
+
+    first = asyncio.run(
+        mcp.call_tool(
+            "mcp_anyteam_capability_manifest",
+            {"agent_name": "peer-a", "capability": "permission_bridge"},
+        )
+    ).structured_content
+    assert first["version"] == "1"
+
+    manifest["capability_version"] = "2"
+    manifest["capabilities"]["permission_bridge"]["version"] = "2"
+    manifest["capabilities"]["permission_bridge"]["schema"] = {"type": "object", "required": ["request_id"]}
+    manifest_path = team_dir / "manifests" / "peer-a.json"
+    manifest_path.write_text(json.dumps(manifest), encoding="utf-8")
+    inbox_event = {
+        "from": "peer-a",
+        "text": json.dumps({
+            "type": "capability_manifest_updated",
+            "agentName": "peer-a",
+            "capabilityVersion": "2",
+            "manifestPath": str(manifest_path),
+        }),
+        "timestamp": "2026-04-27T00:00:00.000Z",
+        "read": False,
+        "summary": "capability_manifest_updated:peer-a",
+        "messageKind": "capability_manifest_updated",
+    }
+    (team_dir / "inboxes" / "contract-test.json").write_text(json.dumps([inbox_event]), encoding="utf-8")
+
+    second = asyncio.run(
+        mcp.call_tool(
+            "mcp_anyteam_capability_manifest",
+            {"agent_name": "peer-a", "capability": "permission_bridge"},
+        )
+    ).structured_content
+    assert second["version"] == "2"
+    assert second["schema"]["required"] == ["request_id"]
+
+
+def test_capability_manifest_tool_unknown_member_mentions_read_config(identity, monkeypatch, tmp_path):
+    team_root = tmp_path / "teams"
+    _seed_manifest_team(team_root)
+    monkeypatch.setattr("claude_anyteam.wrapper_server._cs_teams.TEAMS_DIR", team_root)
+
+    with pytest.raises(Exception, match="read_config"):
+        _call_tool("mcp_anyteam_capability_manifest", {"agent_name": "missing-peer"})
 
 
 def test_mcp_anyteam_shell_exists_and_produces_output(identity):

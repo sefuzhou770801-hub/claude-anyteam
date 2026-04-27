@@ -103,6 +103,7 @@ class TestTeammateMember:
             cwd="/tmp/work",
             backend_type="claude",
             is_active=False,
+            capabilities=["structured_output"],
         )
         data = mate.model_dump(by_alias=True)
         assert data["agentId"] == "worker@my-team"
@@ -110,6 +111,7 @@ class TestTeammateMember:
         assert data["tmuxPaneId"] == "%34"
         assert data["backendType"] == "claude"
         assert data["isActive"] is False
+        assert data["capabilities"] == ["structured_output"]
 
     def test_defaults(self):
         mate = TeammateMember(
@@ -127,6 +129,38 @@ class TestTeammateMember:
         assert mate.backend_type == "claude"
         assert mate.is_active is False
         assert mate.subscriptions == []
+        assert mate.capabilities == []
+
+    def test_capabilities_default_missing_config_row(self):
+        raw = {
+            "agentId": "w@t",
+            "name": "w",
+            "agentType": "claude-anyteam",
+            "model": "codex-cli",
+            "prompt": "p",
+            "color": "blue",
+            "joinedAt": 0,
+            "tmuxPaneId": "in-process",
+            "cwd": "/tmp",
+        }
+        mate = TeammateMember.model_validate(raw)
+        assert mate.capabilities == []
+
+    def test_capabilities_loads_from_config_row(self):
+        raw = {
+            "agentId": "w@t",
+            "name": "w",
+            "agentType": "claude-anyteam",
+            "model": "codex-cli",
+            "prompt": "p",
+            "color": "blue",
+            "joinedAt": 0,
+            "tmuxPaneId": "in-process",
+            "cwd": "/tmp",
+            "capabilities": ["turn_steer", "thread_fork"],
+        }
+        mate = TeammateMember.model_validate(raw)
+        assert mate.capabilities == ["turn_steer", "thread_fork"]
 
     def test_backend_type_defaults_to_claude(self):
         mate = TeammateMember(
@@ -221,6 +255,7 @@ class TestTeamConfig:
         assert len(config.members) == 2
         assert isinstance(config.members[0], LeadMember)
         assert isinstance(config.members[1], TeammateMember)
+        assert config.members[1].capabilities == []
 
     def test_deserializes_legacy_members_missing_agent_type(self):
         raw = {
@@ -260,6 +295,7 @@ class TestTeamConfig:
         assert config.members[0].agent_type == "team-lead"
         assert isinstance(config.members[1], TeammateMember)
         assert config.members[1].agent_type == "claude-anyteam"
+
 
 
 class TestTaskFile:
