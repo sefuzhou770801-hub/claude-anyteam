@@ -863,6 +863,10 @@ def _execute_task_app_server(state: LoopState, task, prompt: str):
 
     steer_queue = codex_mod.SteerQueue(
         capabilities=_backend_metadata(s).capabilities,
+        # 09 R15-vis-followup: pass team + agent so SteerQueue.push can emit
+        # visibility_degraded(surface=peer_steer_rejected) per 08 CD-6 / 07 §6.5.
+        team=s.team_name,
+        agent=s.agent_name,
     )
     sampled_task_events = 0
 

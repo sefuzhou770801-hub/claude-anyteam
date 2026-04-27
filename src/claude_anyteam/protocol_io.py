@@ -413,6 +413,51 @@ def send_idle_notification(team: str, sender: str, reason: str = "available") ->
     send_json_to_lead(team, sender, payload, summary="idle")
 
 
+def emit_peer_steer_rejection(
+    *,
+    team: str,
+    agent: str,
+    backend: str,
+    sender: str,
+) -> VisibilityEvent:
+    """Emit visibility_degraded for a peer-steer rejection.
+
+    09 R15-vis-followup (08 CD-6 / 07 §6.5): when a backend's steer handler
+    rejects a non-lead steer because `accepts_peer_steer` is not declared in
+    its capability list, emit a structured `visibility_degraded` envelope to
+    the lead's mailbox AND append it to the agent's event log. The
+    pre-existing `logger.warn` call site stays for stderr forensics — this
+    helper is additive so the lead can observe coordination signals at
+    native fidelity without grepping stderr (the §2 anti-pattern this fix
+    closes).
+
+    Returns the appended envelope so callers can assert against it in tests.
+    """
+
+    event_id = f"{agent}:steer-reject:{int(time.time() * 1000)}"
+    envelope = VisibilityEvent(
+        kind="visibility_degraded",
+        event_id=event_id,
+        team=team,
+        agent=agent,
+        backend=backend,
+        seq=0,
+        severity="warn",
+        summary=f"peer steer from {sender} rejected; accepts_peer_steer not declared",
+        payload={
+            "surface": "peer_steer_rejected",
+            "reason": "accepts_peer_steer_not_declared",
+            "sender": sender,
+            "recipient": agent,
+        },
+    )
+    # Fan-out per 07 §7.4: event log always, mailbox always for warn-level
+    # rejection so the lead can audit without stderr scrape.
+    append_event(team, agent, envelope)
+    send_visibility_event_to_lead(team, agent, envelope)
+    return envelope
+
+
 def _shutdown_member_metadata(
     team: str,
     sender: str,

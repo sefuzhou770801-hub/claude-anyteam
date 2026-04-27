@@ -1416,9 +1416,20 @@ class _SteerQueue:
     delivered (same failure mode as a race-lost SendMessage).
     """
 
-    def __init__(self, *, capabilities: list[str] | None = None) -> None:
+    def __init__(
+        self,
+        *,
+        capabilities: list[str] | None = None,
+        team: str | None = None,
+        agent: str | None = None,
+    ) -> None:
         import queue as _queue
         self.capabilities = list(capabilities or [])
+        # 09 R15-vis-followup: stash team + agent for visibility_degraded
+        # envelope on rejection. Optional + None-default preserves existing
+        # callers (tests construct SteerQueue() without context).
+        self._team = team
+        self._agent = agent
         self._q: _queue.Queue[str] = _queue.Queue()
 
     def push(self, text: str, *, sender: str | None = "team-lead") -> bool:
@@ -1428,6 +1439,23 @@ class _SteerQueue:
                 sender=sender,
                 reason="not_team_lead_and_capability_not_declared",
             )
+            # 09 R15-vis-followup (08 CD-6 / 07 §6.5): emit visibility_degraded
+            # to lead's mailbox + event log when team+agent context is set.
+            # Non-fatal: visibility emission failures shouldn't shadow the gate.
+            if self._team and self._agent and sender:
+                try:
+                    from . import protocol_io as pio
+                    pio.emit_peer_steer_rejection(
+                        team=self._team,
+                        agent=self._agent,
+                        backend="codex",
+                        sender=sender,
+                    )
+                except Exception as e:
+                    logger.debug(
+                        "app_server.steer.rejection_event_emit_failed",
+                        error=str(e),
+                    )
             return False
         self._q.put(text)
         return True

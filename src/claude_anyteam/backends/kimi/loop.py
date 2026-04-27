@@ -221,6 +221,18 @@ def _handle_steer(state: KimiLoopState, payload: SteerIn, msg: Any) -> None:
             sender=sender,
             reason="not_team_lead_and_capability_not_declared",
         )
+        # 09 R15-vis-followup (08 CD-6 / 07 §6.5): emit visibility_degraded
+        # to lead's mailbox + event log so the rejection is observable
+        # without stderr scrape (§2 anti-pattern closure).
+        try:
+            pio.emit_peer_steer_rejection(
+                team=state.settings.team_name,
+                agent=state.settings.agent_name,
+                backend="kimi",
+                sender=sender,
+            )
+        except Exception as e:
+            logger.debug("kimi.steer.rejection_event_emit_failed", error=str(e))
         return
     message = payload.message.strip() if isinstance(payload.message, str) else ""
     if not message:

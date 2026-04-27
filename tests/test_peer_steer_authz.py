@@ -181,3 +181,124 @@ def test_team_lead_steer_allowed_without_peer_steer_capability(tmp_path: Path):
 
     assert queue.push("lead steer", sender="team-lead") is True
     assert queue.pop_nowait() == "lead steer"
+
+
+# ──────────────────────────────────────────────────────────────────────────
+# 09 R15-vis-followup (08 CD-6 / 07 §6.5): rejection emits visibility_degraded
+# envelope to lead's mailbox + event log alongside the existing logger.warn.
+# ──────────────────────────────────────────────────────────────────────────
+
+
+def _scoped_teams_dir(tmp_path: Path, monkeypatch):
+    """Monkeypatch substrate's TEAMS_DIR so emit-and-readback is hermetic."""
+    from claude_teams import messaging as cs_messaging
+
+    teams_root = tmp_path / "home" / ".claude" / "teams"
+    teams_root.mkdir(parents=True, exist_ok=True)
+    monkeypatch.setattr(cs_messaging, "TEAMS_DIR", teams_root)
+    # Pre-create lead inbox + per-agent dirs so emit doesn't need ensure_inbox racing.
+    (teams_root / TEAM).mkdir(parents=True, exist_ok=True)
+    (teams_root / TEAM / "inboxes").mkdir(parents=True, exist_ok=True)
+    return teams_root
+
+
+def _read_lead_visibility_event(teams_root: Path) -> dict:
+    """Read first visibility_event from lead's inbox; assert one is present."""
+    inbox = teams_root / TEAM / "inboxes" / "team-lead.json"
+    raw = json.loads(inbox.read_text(encoding="utf-8"))
+    vis = [m for m in raw if m.get("messageKind") == "visibility_degraded"]
+    assert vis, f"no visibility_degraded event in lead inbox; raw={raw}"
+    return vis[0]
+
+
+def test_codex_app_server_peer_steer_rejection_emits_visibility_degraded(
+    monkeypatch, tmp_path: Path
+):
+    teams_root = _scoped_teams_dir(tmp_path, monkeypatch)
+    metadata = codex_loop._backend_metadata(_codex_settings(tmp_path))
+    queue = codex_mod.SteerQueue(
+        capabilities=metadata.capabilities,
+        team=TEAM,
+        agent="codex-app-server",
+    )
+
+    assert queue.push("mid-task peer steer", sender=PEER) is False
+
+    vis = _read_lead_visibility_event(teams_root)
+    body = json.loads(vis["text"])
+    assert body["kind"] == "visibility_degraded"
+    assert body["payload"]["surface"] == "peer_steer_rejected"
+    assert body["payload"]["reason"] == "accepts_peer_steer_not_declared"
+    assert body["payload"]["sender"] == PEER
+    assert body["payload"]["recipient"] == "codex-app-server"
+    assert body["backend"] == "codex"
+
+    # Event log also has the envelope per 07 §7.4 fan-out.
+    log = (teams_root / TEAM / "events" / "codex-app-server.jsonl").read_text(
+        encoding="utf-8"
+    )
+    assert '"kind":"visibility_degraded"' in log
+    assert '"surface":"peer_steer_rejected"' in log
+
+
+def test_kimi_peer_steer_rejection_emits_visibility_degraded(
+    monkeypatch, tmp_path: Path
+):
+    teams_root = _scoped_teams_dir(tmp_path, monkeypatch)
+    state = kimi_loop.KimiLoopState(settings=_kimi_settings(tmp_path))
+    payload = SimpleNamespace(
+        from_=PEER, message="peer steer", task_id=None, priority="normal", expires_after_turns=1,
+    )
+    msg = SimpleNamespace(from_=PEER)
+
+    kimi_loop._handle_steer(state, payload, msg)
+
+    vis = _read_lead_visibility_event(teams_root)
+    body = json.loads(vis["text"])
+    assert body["kind"] == "visibility_degraded"
+    assert body["payload"]["sender"] == PEER
+    assert body["payload"]["recipient"] == "kimi-headless"
+    assert body["backend"] == "kimi"
+
+
+def test_gemini_headless_peer_steer_rejection_emits_visibility_degraded(
+    monkeypatch, tmp_path: Path
+):
+    teams_root = _scoped_teams_dir(tmp_path, monkeypatch)
+    state = gemini_loop.GeminiLoopState(
+        settings=_gemini_settings(tmp_path, backend="headless"),
+    )
+    payload = SimpleNamespace(
+        from_=PEER, message="peer steer", task_id=None, priority="normal", expires_after_turns=1,
+    )
+    msg = SimpleNamespace(from_=PEER)
+
+    gemini_loop._handle_steer(state, payload, msg)
+
+    vis = _read_lead_visibility_event(teams_root)
+    body = json.loads(vis["text"])
+    assert body["kind"] == "visibility_degraded"
+    assert body["payload"]["sender"] == PEER
+    assert body["payload"]["recipient"] == "gemini-headless"
+    assert body["backend"] == "gemini"
+
+
+def test_lead_steer_does_not_emit_visibility_degraded(
+    monkeypatch, tmp_path: Path
+):
+    """Negative: when lead steers, no visibility_degraded fires (lead-bypass)."""
+    teams_root = _scoped_teams_dir(tmp_path, monkeypatch)
+    metadata = codex_loop._backend_metadata(_codex_settings(tmp_path))
+    queue = codex_mod.SteerQueue(
+        capabilities=metadata.capabilities,
+        team=TEAM,
+        agent="codex-app-server",
+    )
+
+    assert queue.push("lead steer", sender="team-lead") is True
+
+    inbox = teams_root / TEAM / "inboxes" / "team-lead.json"
+    if inbox.exists():
+        raw = json.loads(inbox.read_text(encoding="utf-8"))
+        vis = [m for m in raw if m.get("messageKind") == "visibility_degraded"]
+        assert not vis, f"unexpected visibility_degraded for lead steer: {vis}"
