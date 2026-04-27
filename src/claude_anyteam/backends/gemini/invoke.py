@@ -7,6 +7,7 @@ import shutil
 import subprocess
 import tempfile
 import uuid
+from collections.abc import Callable
 from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any
@@ -20,6 +21,7 @@ from claude_anyteam.auth_preflight import (
 from claude_anyteam.codex import CodexResult, PLAN_SCHEMA, TASK_COMPLETE_SCHEMA
 from claude_anyteam.env import identity_env
 from claude_anyteam.headless_visibility import HeadlessTurnVisibility, coerce_stream_text
+from claude_anyteam.messages import VisibilityEvent
 from claude_anyteam.schema_validation import load_schema, parse_and_validate
 
 WRAPPER_SERVER_ALIAS = "anyteam"
@@ -531,6 +533,7 @@ def run(
     effort: str | None = None,
     gemini_home: Path | None = None,
     task_id: str | None = None,
+    event_sink: Callable[[VisibilityEvent], None] | None = None,
 ) -> CodexResult:
     team, agent = wrapper_identity or ("default", "gemini")
     real_home = os.environ.get("HOME")
@@ -585,6 +588,7 @@ def run(
         resume_session_id=resume_session_id,
         task_id=task_id,
         extra_payload={"effective_model": launch_model},
+        event_sink=event_sink,
     )
     try:
         proc = subprocess.run(args, cwd=str(cwd), capture_output=True, text=True, timeout=timeout_s, check=False, env=sub_env, stdin=subprocess.DEVNULL)

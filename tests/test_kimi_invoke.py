@@ -350,6 +350,32 @@ def test_headless_completed_payload_preserves_kimi_tool_calls(events_root, tmp_p
     assert payload["events"][0]["tool_calls"] == tool_calls
 
 
+def test_headless_prose_visibility_can_emit_through_event_sink(tmp_path, monkeypatch):
+    stdout = json.dumps({"role": "assistant", "content": "prose reply"})
+    _patch_kimi_run(
+        monkeypatch,
+        tmp_path,
+        [{"stdout": stdout, "stderr": "", "returncode": 0}],
+    )
+    emitted = []
+
+    result = invoke.run(
+        "prompt",
+        cwd=tmp_path,
+        kimi_home=tmp_path / "home",
+        wrapper_identity=("team-x", "kimi-prose"),
+        event_sink=emitted.append,
+    )
+
+    assert result.exit_code == 0
+    assert [event.kind for event in emitted] == ["turn_started", "turn_completed"]
+    assert [event.backend for event in emitted] == ["kimi_headless", "kimi_headless"]
+    assert emitted[0].payload["mode"] == "prose"
+    assert emitted[0].payload["prompt_kind"] == "prose_reply"
+    assert emitted[1].payload["exit_code"] == 0
+    assert emitted[1].payload["last_message_preview"] == "prose reply"
+
+
 def test_headless_prose_send_message_suppresses_terminal_preview(events_root, tmp_path, monkeypatch):
     stdout = "\n".join([
         json.dumps({
@@ -384,12 +410,12 @@ def test_headless_prose_send_message_suppresses_terminal_preview(events_root, tm
     assert result.exit_code == 0
     assert result.last_message.startswith("This final prose")
     events = pio.read_visibility_events("team-x", "kimi-a")
-    # Post #cross-impl: tool_event envelopes are emitted between turn_started
-    # and turn_completed; turn_completed is at events[-1]. tool_call_events
-    # count is replaced by per-tool envelopes (counted directly).
+    # Post #16 (kimi cascade-fix mirror of #18): tool_event envelopes emitted
+    # separately AND tool_call_events count restored on terminal payload.
     tool_call_envelopes = [e for e in events if e.kind == "tool_event"]
     assert len(tool_call_envelopes) == 1
     payload = events[-1].payload
+    assert payload["tool_call_events"] == 1
     assert payload["last_message_preview"] == ""
     assert payload["last_message_suppressed_reason"] == "delivered_via_send_message_tool"
 

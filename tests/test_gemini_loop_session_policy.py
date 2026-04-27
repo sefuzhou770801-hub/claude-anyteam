@@ -34,6 +34,22 @@ def _settings(tmp_path: Path, backend: str) -> GeminiSettings:
     )
 
 
+def _prose_result(
+    text: str = "",
+    *,
+    exit_code: int = 0,
+    tool_call_events: int = 0,
+) -> CodexResult:
+    return CodexResult(
+        exit_code=exit_code,
+        structured=None,
+        last_message=text,
+        events=[],
+        tool_call_events=tool_call_events,
+        error=None if exit_code == 0 else "failed",
+    )
+
+
 @pytest.mark.parametrize("backend", ["acp", "headless"])
 def test_handle_prose_skips_fallback_when_model_used_send_message_tool(tmp_path: Path, monkeypatch, backend: str):
     """09 R22 / W7: Gemini matches Codex PR #12 and Kimi PR #11.
@@ -60,6 +76,58 @@ def test_handle_prose_skips_fallback_when_model_used_send_message_tool(tmp_path:
     loop._handle_prose(state, msg)
 
     assert send_prose_calls == []
+
+
+@pytest.mark.parametrize("backend", ["acp", "headless"])
+def test_handle_prose_batch_collapses_idle_peer_dms_to_one_gemini_invocation(tmp_path: Path, monkeypatch, backend: str):
+    state = loop.GeminiLoopState(settings=_settings(tmp_path, backend))
+    messages = [
+        SimpleNamespace(from_=f"peer-{idx}", text=f"hello {idx}", summary="dm")
+        for idx in range(5)
+    ]
+    invocations: list[dict] = []
+
+    def fake_backend_run(_state, prompt: str, **kwargs):
+        invocations.append({"prompt": prompt, **kwargs})
+        return _prose_result(tool_call_events=5)
+
+    monkeypatch.setattr(loop, "_backend_run", fake_backend_run)
+    monkeypatch.setattr(loop.pio, "send_prose", lambda *a, **k: None)
+
+    loop._handle_prose_batch(state, messages)
+
+    assert len(invocations) == 1
+    assert invocations[0]["ephemeral"] is True
+    assert callable(invocations[0]["event_sink"])
+    assert invocations[0]["prompt"].count("[from peer-") == 5
+
+
+@pytest.mark.parametrize("backend", ["acp", "headless"])
+def test_handle_prose_batch_preserves_gemini_per_sender_fallback_on_crash(tmp_path: Path, monkeypatch, backend: str):
+    state = loop.GeminiLoopState(settings=_settings(tmp_path, backend))
+    messages = [
+        SimpleNamespace(from_="peer-a", text="hi", summary="dm"),
+        SimpleNamespace(from_="peer-b", text="yo", summary="dm"),
+        SimpleNamespace(from_="peer-c", text="?", summary="dm"),
+    ]
+    sent: list[tuple[str, str]] = []
+
+    def crashing_backend_run(*_args, **_kwargs):
+        raise RuntimeError("gemini crashed")
+
+    monkeypatch.setattr(loop, "_backend_run", crashing_backend_run)
+    monkeypatch.setattr(
+        loop.pio,
+        "send_prose",
+        lambda team, sender, to, text, summary: sent.append((to, text)),
+    )
+
+    loop._handle_prose_batch(state, messages)
+
+    assert sorted(to for to, _ in sent) == ["peer-a", "peer-b", "peer-c"]
+    for _, text in sent:
+        assert "incident=" in text
+        assert "adapter=gemini" in text
 
 
 @pytest.mark.parametrize("backend", ["acp", "headless"])

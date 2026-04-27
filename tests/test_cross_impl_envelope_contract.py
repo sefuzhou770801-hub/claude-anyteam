@@ -280,6 +280,7 @@ def _patch_gemini_acp_backend(
 ) -> None:
     _ContractGeminiAcpClient.instances = []
     monkeypatch.setattr(gemini_loop, "_backend_feature_test", lambda settings: None)
+    monkeypatch.setattr(gemini_loop, "_backend_auth_preflight", lambda settings, *, gemini_home: None)
     monkeypatch.setattr(gemini_loop.crash_hygiene, "run_startup_recovery", lambda **kwargs: None)
     monkeypatch.setattr(gemini_loop.crash_hygiene, "mark_adapter_start", lambda *a, **k: None)
     monkeypatch.setattr(gemini_loop.crash_hygiene, "mark_clean_shutdown", lambda *a, **k: None)
