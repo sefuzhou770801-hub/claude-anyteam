@@ -33,6 +33,9 @@ DEFAULT_TIMEOUT_SECONDS = 1800
 DEFAULT_POLL_SECONDS = 5.0
 RUNS_ROOT = Path("references/external-claude-code-re/proto-rev-execution-log/runs")
 TEAM_LEAD = "team-lead"
+STRESS_SANDBOX_ROOT = Path("/tmp")
+STRESS_SANDBOX_PREFIX = "stress-sandbox-"
+STRESS_SANDBOX_MARKER = ".stress_sandbox_marker"
 ABLATION_ENV_KEYS = (
     "CLAUDE_ANYTEAM_DISABLE_PEER_PROMPT_FRAGMENTS",
     "CLAUDE_ANYTEAM_DISABLE_MANIFEST_CACHE",
@@ -275,6 +278,74 @@ def scenario_environment(scenario: Mapping[str, Any]) -> tuple[dict[str, str], d
     src_dir = str(Path(__file__).resolve().parents[2] / "src")
     spawn_env["PYTHONPATH"] = src_dir + (os.pathsep + spawn_env["PYTHONPATH"] if spawn_env.get("PYTHONPATH") else "")
     return spawn_env, env_overrides
+
+
+def cleanup_stress_sandboxes(
+    current_sandbox: Path,
+    *,
+    root: Path | None = None,
+) -> list[Path]:
+    """Remove stale marked stress sandboxes before a new run starts.
+
+    D1 finding (2026-04-27): Codex pair turns spent budget exploring leftover
+    ``/tmp/stress-sandbox-*`` directories from prior runs. Cleanup is therefore
+    default-on, but deletion is marker-gated: a directory must match the stress
+    prefix and contain ``.stress_sandbox_marker``. The current ``--sandbox`` is
+    never removed, even if it already has a marker.
+    """
+
+    root = (root or STRESS_SANDBOX_ROOT).expanduser()
+    if not root.exists():
+        return []
+
+    current_resolved = current_sandbox.expanduser().resolve(strict=False)
+    removed: list[Path] = []
+    for candidate in sorted(root.glob(f"{STRESS_SANDBOX_PREFIX}*")):
+        try:
+            if candidate.resolve(strict=False) == current_resolved:
+                continue
+            # Never follow symlinks for cleanup. We only own real directories
+            # that the harness itself marked as stress sandboxes.
+            if candidate.is_symlink() or not candidate.is_dir():
+                continue
+            marker = candidate / STRESS_SANDBOX_MARKER
+            if not marker.is_file():
+                continue
+            shutil.rmtree(candidate)
+            removed.append(candidate)
+        except FileNotFoundError:
+            continue
+    return removed
+
+
+def write_sandbox_marker(
+    sandbox: Path,
+    *,
+    scenario_id: str,
+    run_id: str,
+) -> Path:
+    """Mark ``sandbox`` as harness-owned so future cleanup can identify it."""
+
+    sandbox.mkdir(parents=True, exist_ok=True)
+    marker = sandbox / STRESS_SANDBOX_MARKER
+    marker.write_text(
+        json.dumps(
+            {
+                "schema_version": 1,
+                "kind": "claude-anyteam-stress-sandbox",
+                "scenario": scenario_id,
+                "run_id": run_id,
+                "sandbox": str(sandbox),
+                "created_at": datetime.now(timezone.utc)
+                .isoformat(timespec="milliseconds")
+                .replace("+00:00", "Z"),
+            },
+            sort_keys=True,
+        )
+        + "\n",
+        encoding="utf-8",
+    )
+    return marker
 
 
 def init_sandbox_repo(repo: Path) -> None:
@@ -1102,6 +1173,9 @@ def run_scenario(args: argparse.Namespace, *, stderr: TextIO | None = None) -> i
     run_time_git_sha = _git_sha()
 
     try:
+        if getattr(args, "cleanup_sandbox", True):
+            cleanup_stress_sandboxes(sandbox)
+        write_sandbox_marker(sandbox, scenario_id=scenario_id, run_id=run_id)
         init_sandbox_repo(sandbox / "repo")
         create_stress_team(team_name, scenario, sandbox)
         run_manifest = build_run_workload_manifest(
@@ -1205,6 +1279,18 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument("--out", required=True, help="Archive output directory")
     parser.add_argument("--timeout-seconds", type=int, default=DEFAULT_TIMEOUT_SECONDS)
     parser.add_argument("--cleanup-team", action="store_true")
+    parser.add_argument(
+        "--cleanup-sandbox",
+        action=argparse.BooleanOptionalAction,
+        default=True,
+        help=(
+            "Before initializing this run, remove old marked "
+            "/tmp/stress-sandbox-* directories (default: on; use "
+            "--no-cleanup-sandbox to opt out). Safety: only directories "
+            f"containing {STRESS_SANDBOX_MARKER} are deleted, symlinks are "
+            "skipped, and the current --sandbox path is never removed."
+        ),
+    )
     parser.add_argument("--dry-run", action="store_true", help="Skip live spawns and seed deterministic synthetic events")
     return parser
 

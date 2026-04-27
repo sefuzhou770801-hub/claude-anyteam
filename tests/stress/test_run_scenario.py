@@ -26,6 +26,9 @@ def isolated_protocol_roots(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> 
     monkeypatch.setattr(cs_teams, "TASKS_DIR", tasks_root)
     monkeypatch.setattr(cs_tasks, "TASKS_DIR", tasks_root)
     monkeypatch.setattr(cs_messaging, "TEAMS_DIR", teams_root)
+    # run_scenario defaults to cleaning /tmp/stress-sandbox-*; keep unit tests
+    # hermetic and let individual cleanup tests opt into a tmp_path root.
+    monkeypatch.setattr(run_scenario, "STRESS_SANDBOX_ROOT", tmp_path / "stress-root")
     return teams_root, tasks_root
 
 
@@ -145,6 +148,120 @@ def _invoke(tmp_path: Path, scenario: str, workload: str = "W1.json", run_id: st
 
 def _scorecard(out: Path) -> dict:
     return json.loads((out / "scorecard.json").read_text())
+
+
+def _mark_stress_sandbox(path: Path) -> None:
+    path.mkdir(parents=True, exist_ok=True)
+    (path / run_scenario.STRESS_SANDBOX_MARKER).write_text("stress sandbox\n")
+
+
+def test_cleanup_sandbox_explicit_flag_removes_marked_prior_sandbox(
+    isolated_protocol_roots,
+    fake_scorers,
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+) -> None:
+    monkeypatch.setattr(run_scenario, "STRESS_SANDBOX_ROOT", tmp_path)
+    prior = tmp_path / "stress-sandbox-old-run"
+    _mark_stress_sandbox(prior)
+
+    rc, _, sandbox = _invoke(
+        tmp_path,
+        "S1",
+        run_id="CLEANUP-EXPLICIT",
+        extra=["--cleanup-sandbox"],
+    )
+
+    assert rc == 0
+    assert not prior.exists()
+    assert (sandbox / run_scenario.STRESS_SANDBOX_MARKER).is_file()
+
+
+def test_no_cleanup_sandbox_preserves_prior_sandboxes(
+    isolated_protocol_roots,
+    fake_scorers,
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+) -> None:
+    monkeypatch.setattr(run_scenario, "STRESS_SANDBOX_ROOT", tmp_path)
+    prior = tmp_path / "stress-sandbox-old-run"
+    _mark_stress_sandbox(prior)
+
+    rc, _, sandbox = _invoke(
+        tmp_path,
+        "S1",
+        run_id="NO-CLEANUP",
+        extra=["--no-cleanup-sandbox"],
+    )
+
+    assert rc == 0
+    assert prior.is_dir()
+    assert (prior / run_scenario.STRESS_SANDBOX_MARKER).is_file()
+    assert (sandbox / run_scenario.STRESS_SANDBOX_MARKER).is_file()
+
+
+def test_cleanup_sandbox_marker_safety_preserves_unmarked_pattern_dirs(
+    isolated_protocol_roots,
+    fake_scorers,
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+) -> None:
+    monkeypatch.setattr(run_scenario, "STRESS_SANDBOX_ROOT", tmp_path)
+    marked = tmp_path / "stress-sandbox-marked"
+    _mark_stress_sandbox(marked)
+    unmarked = tmp_path / "stress-sandbox-user-data"
+    unmarked.mkdir()
+    (unmarked / "do-not-delete.txt").write_text("not owned by stress harness\n")
+
+    rc, _, _ = _invoke(tmp_path, "S1", run_id="MARKER-SAFETY")
+
+    assert rc == 0
+    assert not marked.exists()
+    assert unmarked.is_dir()
+    assert (unmarked / "do-not-delete.txt").is_file()
+
+
+def test_cleanup_sandbox_never_removes_current_sandbox(
+    isolated_protocol_roots,
+    fake_scorers,
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+) -> None:
+    monkeypatch.setattr(run_scenario, "STRESS_SANDBOX_ROOT", tmp_path)
+    current = tmp_path / "stress-sandbox-current"
+    _mark_stress_sandbox(current)
+    (current / "keep.txt").write_text("belongs to this run\n")
+    out = tmp_path / "runs" / "current"
+
+    rc = run_scenario.main(
+        [
+            "--scenario",
+            "S1",
+            "--run-id",
+            "CURRENT-SANDBOX",
+            "--workload-manifest",
+            str(_workload()),
+            "--sandbox",
+            str(current),
+            "--out",
+            str(out),
+            "--dry-run",
+            "--cleanup-sandbox",
+        ]
+    )
+
+    assert rc == 0
+    assert (current / "keep.txt").is_file()
+    assert (current / run_scenario.STRESS_SANDBOX_MARKER).is_file()
+
+
+def test_cleanup_sandbox_help_documents_default_and_marker_safety() -> None:
+    help_text = run_scenario.build_parser().format_help()
+
+    assert "--cleanup-sandbox" in help_text
+    assert "--no-cleanup-sandbox" in help_text
+    assert "/tmp/stress-sandbox-*" in help_text
+    assert run_scenario.STRESS_SANDBOX_MARKER in help_text
 
 
 def test_dry_run_S1(isolated_protocol_roots, fake_scorers, tmp_path: Path) -> None:
