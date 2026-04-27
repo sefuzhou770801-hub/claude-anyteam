@@ -364,9 +364,13 @@ def peer_prompt_fragment(agent_name: str, card: dict[str, Any]) -> str:
         block = _peer_capability_block(agent_name, str(capability), entry)
         if block:
             blocks.append(block)
-    if not blocks:
-        return ""
-    return "\n\n".join(blocks)
+    manifest_lookup = (
+        f"## {agent_name}: capability lookup workflow\n"
+        f"- Before invoking {agent_name}'s primitive (e.g., `turn_steer`), "
+        f"call `mcp_anyteam_capability_manifest('{agent_name}', '<primitive>')` "
+        f"to verify acceptance and review delivery_mode/expiry_semantics."
+    )
+    return "\n\n".join([manifest_lookup, *blocks])
 
 
 def peer_prompt_fragments_for(requester: str, cache: Any) -> str:
@@ -404,8 +408,6 @@ def peer_prompt_fragments_for(requester: str, cache: Any) -> str:
             for capability, entry in caps.items()
             if capability not in requester_caps
         }
-        if not peer_unique:
-            continue
         peer_card = dict(card)
         peer_card["capabilities"] = peer_unique
         fragment = peer_prompt_fragment(peer_name, peer_card)

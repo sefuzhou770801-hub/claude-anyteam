@@ -170,6 +170,40 @@ def test_codex_task_prompt_excludes_self():
     assert "Duplicate requester capability should be omitted" not in prompt
 
 
+def test_r14_fragment_instructs_manifest_query():
+    fragment = _fragment()
+
+    assert "Before invoking gemini-peer's primitive" in fragment
+    assert "`mcp_anyteam_capability_manifest('gemini-peer', '<primitive>')`" in fragment
+    assert "verify acceptance" in fragment
+    assert "delivery_mode/expiry_semantics" in fragment
+    assert "turn_steer" in fragment
+
+
+def test_homogeneous_paired_still_emits_manifest_lookup():
+    cache = CapabilityManifestCache(team=TEAM, self_name=SELF)
+    shared_caps = {
+        "turn_steer": {
+            "description": "Inject text mid-turn.",
+            "when_to_use": "When peer is on a stale path.",
+            "callable_from_peers": False,
+        },
+        "structured_output": {
+            "description": "Schema-validated task-complete JSON.",
+            "callable_from_peers": False,
+        },
+    }
+    cache.manifests = {
+        SELF: {"agent_name": SELF, "capabilities": shared_caps},
+        "codex-pair-b": {"agent_name": "codex-pair-b", "capabilities": shared_caps},
+    }
+
+    fragment = cache.peer_prompt_fragments_for(SELF)
+
+    assert "Before invoking codex-pair-b's primitive" in fragment
+    assert "`mcp_anyteam_capability_manifest('codex-pair-b', '<primitive>')`" in fragment
+
+
 def test_gemini_task_prompt_includes_codex_thread_fork_fragment():
     fragment = _fragment()
     prompt = gemini_prompts.task_prompt(
