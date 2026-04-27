@@ -1237,13 +1237,19 @@ Base fields are mandatory. `payload` is typed per `kind`. `raw_event_ref` or a r
   "severity": "warn",
   "summary": "peer DM MCP unavailable; using protocol_io fallback",
   "payload": {
-    "surface": "peer_dm | host_tool_stream | permission_bridge",
+    "surface": "peer_dm | host_tool_stream | permission_bridge | peer_steer_refused_at_wrapper",
     "reason": "...",
     "impact": "...",
     "suggested_fix": "..."
   }
 }
 ```
+
+`surface="peer_steer_refused_at_wrapper"` is the sender-wrapper enforcement
+case: a peer attempted to send a `steer` payload to another peer before
+querying `mcp_anyteam_capability_manifest(<recipient>, "turn_steer")` within
+the allowed freshness window. Payloads include `sender`, `recipient`,
+`primitive`, and `reason="manifest_not_queried"`.
 
 #### `steer_ack`
 ```json

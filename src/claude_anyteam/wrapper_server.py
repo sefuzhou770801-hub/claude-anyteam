@@ -44,7 +44,7 @@ from typing import Any, Callable, Literal, TypeVar, cast
 
 from .capability_manifest import CapabilityManifestCache
 from .env import LEGACY_NAME_ENV, LEGACY_TEAM_ENV, NAME_ENV, TEAM_ENV, env_first
-from .messages import VisibilityEvent
+from .messages import SteerIn, VisibilityEvent, parse_protocol_text
 from . import protocol_io
 from claude_teams import messaging as _cs_messaging  # type: ignore[import-untyped]
 from claude_teams import tasks as _cs_tasks  # type: ignore[import-untyped]
@@ -54,6 +54,45 @@ from fastmcp import FastMCP
 from fastmcp.exceptions import ToolError
 
 logger = logging.getLogger("claude_anyteam.wrapper")
+
+
+class PeerSteerManifestCheckError(ToolError):
+    """Peer-steer was refused by the sender-side manifest precondition."""
+
+
+def _flag_disabled(value: str | None) -> bool:
+    return value is not None and value.strip().lower() in {"1", "true", "yes", "on"}
+
+
+def _flag_enabled(value: str | None, *, default: bool = True) -> bool:
+    if value is None:
+        return default
+    return value.strip().lower() not in {"0", "false", "no", "off"}
+
+
+def _enforce_peer_steer_manifest_check() -> bool:
+    """S10c ablation knob for wrapper-side peer-steer enforcement."""
+
+    if _flag_disabled(os.environ.get("CLAUDE_ANYTEAM_DISABLE_PEER_STEER_MANIFEST_CHECK")):
+        return False
+    return _flag_enabled(
+        os.environ.get("CLAUDE_ANYTEAM_ENFORCE_PEER_STEER_MANIFEST_CHECK"),
+        default=True,
+    )
+
+
+def _peer_steer_manifest_max_age_turns() -> int:
+    raw = os.environ.get("CLAUDE_ANYTEAM_PEER_STEER_MANIFEST_MAX_AGE_TURNS")
+    if raw in (None, ""):
+        return 1
+    try:
+        return max(0, int(raw))
+    except ValueError:
+        logger.warning(
+            "invalid CLAUDE_ANYTEAM_PEER_STEER_MANIFEST_MAX_AGE_TURNS=%r; using 1",
+            raw,
+        )
+        return 1
 
 # Tool set we deliberately expose to Codex. Checked by a test so additions
 # require intent. Order here matches the help-text ordering Codex will see.
@@ -336,6 +375,8 @@ def build_server(argv: list[str] | None = None) -> FastMCP:
 
     visibility_seq = 0
     wrapper_turn_id = f"wrapper-{os.getpid()}"
+    tool_call_seq = 0
+    manifest_query_seq_by_recipient: dict[str, int] = {}
 
     def _fanout_visibility_event(
         event: VisibilityEvent,
@@ -471,6 +512,70 @@ def build_server(argv: list[str] | None = None) -> FastMCP:
         _fanout_visibility_event(event, mailbox=True)
         return event
 
+    def _record_manifest_query(agent_name: str) -> None:
+        manifest_query_seq_by_recipient[agent_name] = tool_call_seq
+
+    def _recent_manifest_query(agent_name: str) -> bool:
+        last_seq = manifest_query_seq_by_recipient.get(agent_name)
+        if last_seq is None:
+            return False
+        return (tool_call_seq - last_seq) <= _peer_steer_manifest_max_age_turns()
+
+    def _steer_recipients_requiring_manifest_query(
+        to: str,
+        body: str,
+        cfg: Any,
+    ) -> list[str]:
+        if self_name == "team-lead" or to == "team-lead":
+            return []
+        payload = parse_protocol_text(body)
+        if not isinstance(payload, SteerIn):
+            return []
+        if to == "*":
+            recipients: list[str] = []
+            for member in getattr(cfg, "members", []):
+                target = getattr(member, "name", None)
+                if target and target not in {self_name, "team-lead"}:
+                    recipients.append(target)
+            return recipients
+        return [to]
+
+    def _emit_peer_steer_refused_at_wrapper(
+        *,
+        recipient: str,
+        recipients: list[str],
+    ) -> VisibilityEvent:
+        guidance = (
+            f"Call mcp_anyteam_capability_manifest({recipient!r}, "
+            "'turn_steer') before attempting peer-steer."
+        )
+        event = _make_event(
+            kind="visibility_degraded",
+            severity="warn",
+            summary=f"peer steer to {recipient} refused at wrapper; manifest not queried",
+            mailbox=True,
+            payload={
+                "surface": "peer_steer_refused_at_wrapper",
+                "reason": "manifest_not_queried",
+                "sender": self_name,
+                "recipient": recipient,
+                "recipients": recipients,
+                "primitive": "turn_steer",
+                "max_age_turns": _peer_steer_manifest_max_age_turns(),
+                "impact": (
+                    "The peer steer was not delivered; the recipient backend "
+                    "did not spend a turn rejecting it."
+                ),
+                "suggested_fix": (
+                    guidance
+                    + " Then retry only if the manifest permits peer steering."
+                ),
+                "guidance": guidance,
+            },
+        )
+        _fanout_visibility_event(event, mailbox=True)
+        return event
+
     def instrumented_tool(category: ToolCategory) -> Callable[[_F], _F]:
         def decorate(func: _F) -> _F:
             tool_name = func.__name__
@@ -478,6 +583,8 @@ def build_server(argv: list[str] | None = None) -> FastMCP:
 
             @functools.wraps(func)
             def wrapper(*args: Any, **kwargs: Any) -> Any:
+                nonlocal tool_call_seq
+                tool_call_seq += 1
                 bound_args = _bind_tool_arguments(signature, args, kwargs)
                 target = _tool_target(tool_name, bound_args)
                 started_at = time.monotonic()
@@ -498,12 +605,13 @@ def build_server(argv: list[str] | None = None) -> FastMCP:
                         started_at=started_at,
                         exc=exc,
                     )
-                    _emit_visibility_degraded(
-                        tool_name=tool_name,
-                        category=category,
-                        reason=_preview(str(exc), limit=600) or exc.__class__.__name__,
-                        failed_event_id=failed.event_id,
-                    )
+                    if not isinstance(exc, PeerSteerManifestCheckError):
+                        _emit_visibility_degraded(
+                            tool_name=tool_name,
+                            category=category,
+                            reason=_preview(str(exc), limit=600) or exc.__class__.__name__,
+                            failed_event_id=failed.event_id,
+                        )
                     raise
 
                 if _result_indicates_failure(tool_name, result):
@@ -569,6 +677,7 @@ def build_server(argv: list[str] | None = None) -> FastMCP:
         # Card so peers see no capability data at all even if their wrapper
         # bypasses the cache layer directly.
         if os.environ.get("CLAUDE_ANYTEAM_DISABLE_MANIFEST_CACHE") == "1":
+            _record_manifest_query(agent_name)
             return {}
         try:
             cfg = _cs_teams.read_config(team)
@@ -596,6 +705,7 @@ def build_server(argv: list[str] | None = None) -> FastMCP:
 
         capabilities = manifest.get("capabilities")
         if capability is None:
+            _record_manifest_query(agent_name)
             return manifest
         if not isinstance(capabilities, dict) or capability not in capabilities:
             available = sorted(capabilities) if isinstance(capabilities, dict) else []
@@ -608,6 +718,7 @@ def build_server(argv: list[str] | None = None) -> FastMCP:
             raise ToolError(
                 f"cached capability {capability!r} for {agent_name!r} is malformed"
             )
+        _record_manifest_query(agent_name)
         return entry
 
     @mcp.tool
@@ -639,6 +750,29 @@ def build_server(argv: list[str] | None = None) -> FastMCP:
         except FileNotFoundError:
             raise ToolError(f"team {team!r} not found on disk")
         member_names = {m.name for m in cfg.members}
+        if to != "*" and to not in member_names:
+            raise ToolError(
+                f"recipient {to!r} is not a member of team {team!r}; "
+                f"members: {sorted(member_names)}"
+            )
+        steer_recipients = _steer_recipients_requiring_manifest_query(to, body, cfg)
+        if _enforce_peer_steer_manifest_check() and steer_recipients:
+            missing = [
+                recipient
+                for recipient in steer_recipients
+                if not _recent_manifest_query(recipient)
+            ]
+            if missing:
+                recipient = missing[0]
+                _emit_peer_steer_refused_at_wrapper(
+                    recipient=recipient,
+                    recipients=missing,
+                )
+                raise PeerSteerManifestCheckError(
+                    "peer steer refused at wrapper: manifest_not_queried; "
+                    f"call mcp_anyteam_capability_manifest({recipient!r}, "
+                    "'turn_steer') before attempting peer-steer"
+                )
         if to == "*":
             delivered = 0
             for m in cfg.members:
@@ -655,11 +789,6 @@ def build_server(argv: list[str] | None = None) -> FastMCP:
                 )
                 delivered += 1
             return {"delivered_to": "*", "sender": self_name, "count": delivered}
-        if to not in member_names:
-            raise ToolError(
-                f"recipient {to!r} is not a member of team {team!r}; "
-                f"members: {sorted(member_names)}"
-            )
         # Stamp the sender's colour onto the wire payload. `send_plain_message`
         # stores this value directly on the inbox message, so using the
         # recipient's colour (the old behavior) misattributes who spoke.

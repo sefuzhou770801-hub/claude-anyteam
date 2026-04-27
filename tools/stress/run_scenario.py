@@ -36,6 +36,7 @@ TEAM_LEAD = "team-lead"
 ABLATION_ENV_KEYS = (
     "CLAUDE_ANYTEAM_DISABLE_PEER_PROMPT_FRAGMENTS",
     "CLAUDE_ANYTEAM_DISABLE_MANIFEST_CACHE",
+    "CLAUDE_ANYTEAM_DISABLE_PEER_STEER_MANIFEST_CHECK",
 )
 
 SCENARIOS: dict[str, dict[str, Any]] = {
@@ -166,6 +167,18 @@ SCENARIOS: dict[str, dict[str, Any]] = {
             "CLAUDE_ANYTEAM_DISABLE_MANIFEST_CACHE": "1",
         },
         "ablation_against": "S5",
+    },
+    "S10c": {
+        "name": "ablation-peer-steer-manifest-check-disabled",
+        "description": "Same composition as S6; L3 wrapper-side peer-steer manifest precondition disabled.",
+        "team_size": 2,
+        "members": [
+            {"name": "codex-pair-a", "agent_type": "codex", "model": "gpt-5.5", "effort": "xhigh", "transport": "app_server"},
+            {"name": "codex-pair-b", "agent_type": "codex", "model": "gpt-5.5", "effort": "xhigh", "transport": "app_server"},
+        ],
+        "n_tasks": 15,
+        "env": {"CLAUDE_ANYTEAM_DISABLE_PEER_STEER_MANIFEST_CHECK": "1"},
+        "ablation_against": "S6",
     },
 }
 

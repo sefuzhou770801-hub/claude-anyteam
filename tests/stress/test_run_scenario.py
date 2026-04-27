@@ -209,6 +209,17 @@ def test_dry_run_S10b_ablation(isolated_protocol_roots, fake_scorers, tmp_path: 
     }
 
 
+def test_dry_run_S10c_ablation(isolated_protocol_roots, fake_scorers, tmp_path: Path) -> None:
+    rc, out, _ = _invoke(tmp_path, "S10c")
+
+    assert rc == 0
+    card = _scorecard(out)
+    assert card["env_overrides"] == {
+        "CLAUDE_ANYTEAM_DISABLE_PEER_STEER_MANIFEST_CHECK": "1"
+    }
+    assert card["ablation_against"] == "S6"
+
+
 def test_unknown_scenario_id(isolated_protocol_roots, fake_scorers, tmp_path: Path, capsys: pytest.CaptureFixture[str]) -> None:
     rc, _, _ = _invoke(tmp_path, "S404")
 

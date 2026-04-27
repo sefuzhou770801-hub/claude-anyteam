@@ -115,12 +115,50 @@ def _seed_manifest_team(team_root, *, version: str = "1"):
                 "when_to_use": "approval needed",
                 "when_not_to": "routine reads",
                 "failure_modes": ["APPROVAL_TIMEOUT"],
+            },
+            "turn_steer": {
+                "version": version,
+                "schema": {"type": "object"},
+                "description": "Peer steer",
+                "when_to_use": "mid-turn course correction",
+                "when_not_to": "recipient does not allow peers",
+                "failure_modes": ["PEER_STEER_REJECTED"],
             }
         },
     }
     (manifest_dir / "peer-a.json").write_text(json.dumps(manifest), encoding="utf-8")
     (team_dir / "inboxes" / "contract-test.json").write_text("[]", encoding="utf-8")
     return team_dir, manifest
+
+
+def _seeded_wrapper(identity, monkeypatch):
+    _seed_manifest_team(identity)
+    monkeypatch.setattr("claude_anyteam.wrapper_server._cs_teams.TEAMS_DIR", identity)
+    return build_server()
+
+
+def _call_existing_tool(mcp, name: str, arguments: dict) -> dict:
+    return asyncio.run(mcp.call_tool(name, arguments)).structured_content
+
+
+def _steer_body(message: str = "Please use the revised constraint.") -> str:
+    return json.dumps({"type": "steer", "message": message})
+
+
+def _peer_a_inbox(identity) -> list[dict]:
+    inbox = identity / "claude-anyteam" / "inboxes" / "peer-a.json"
+    if not inbox.exists():
+        return []
+    return json.loads(inbox.read_text(encoding="utf-8"))
+
+
+def _wrapper_refusals() -> list:
+    return [
+        event
+        for event in pio.read_visibility_events("claude-anyteam", "contract-test")
+        if event.kind == "visibility_degraded"
+        and event.payload.get("surface") == "peer_steer_refused_at_wrapper"
+    ]
 
 
 def test_exposed_tools_exactly_the_safe_subset(identity):
@@ -581,3 +619,124 @@ def test_send_message_direct_message_uses_sender_color(identity, monkeypatch, tm
     assert len(payload) == 1
     assert payload[0]["from"] == "contract-test"
     assert payload[0]["color"] == "magenta"
+
+
+def test_wrapper_peer_steer_refused_without_recent_manifest_query(
+    identity,
+    monkeypatch,
+):
+    mcp = _seeded_wrapper(identity, monkeypatch)
+
+    with pytest.raises(Exception, match="manifest_not_queried"):
+        _call_existing_tool(
+            mcp,
+            "send_message",
+            {"to": "peer-a", "body": _steer_body(), "summary": "peer steer"},
+        )
+
+    assert _peer_a_inbox(identity) == []
+    refusals = _wrapper_refusals()
+    assert len(refusals) == 1
+    assert refusals[0].payload["sender"] == "contract-test"
+    assert refusals[0].payload["recipient"] == "peer-a"
+
+
+def test_wrapper_peer_steer_allowed_with_recent_manifest_query(
+    identity,
+    monkeypatch,
+):
+    mcp = _seeded_wrapper(identity, monkeypatch)
+
+    manifest = _call_existing_tool(
+        mcp,
+        "mcp_anyteam_capability_manifest",
+        {"agent_name": "peer-a", "capability": "turn_steer"},
+    )
+    assert manifest["description"] == "Peer steer"
+    result = _call_existing_tool(
+        mcp,
+        "send_message",
+        {"to": "peer-a", "body": _steer_body("use the fresh plan"), "summary": "peer steer"},
+    )
+
+    assert result == {"delivered_to": "peer-a", "sender": "contract-test"}
+    inbox = _peer_a_inbox(identity)
+    assert len(inbox) == 1
+    assert json.loads(inbox[0]["text"])["message"] == "use the fresh plan"
+    assert _wrapper_refusals() == []
+
+
+def test_wrapper_peer_steer_max_age_turns_respected(
+    identity,
+    monkeypatch,
+):
+    mcp = _seeded_wrapper(identity, monkeypatch)
+
+    _call_existing_tool(
+        mcp,
+        "mcp_anyteam_capability_manifest",
+        {"agent_name": "peer-a", "capability": "turn_steer"},
+    )
+    _call_existing_tool(mcp, "read_config", {})
+
+    with pytest.raises(Exception, match="manifest_not_queried"):
+        _call_existing_tool(
+            mcp,
+            "send_message",
+            {"to": "peer-a", "body": _steer_body(), "summary": "peer steer"},
+        )
+
+    assert _peer_a_inbox(identity) == []
+    assert len(_wrapper_refusals()) == 1
+
+
+def test_wrapper_enforce_disabled_ablation(
+    identity,
+    monkeypatch,
+):
+    monkeypatch.setenv("CLAUDE_ANYTEAM_DISABLE_PEER_STEER_MANIFEST_CHECK", "1")
+    mcp = _seeded_wrapper(identity, monkeypatch)
+
+    result = _call_existing_tool(
+        mcp,
+        "send_message",
+        {"to": "peer-a", "body": _steer_body(), "summary": "peer steer"},
+    )
+
+    assert result == {"delivered_to": "peer-a", "sender": "contract-test"}
+    assert len(_peer_a_inbox(identity)) == 1
+    assert _wrapper_refusals() == []
+
+
+def test_visibility_envelope_emitted_on_wrapper_refusal(
+    identity,
+    monkeypatch,
+):
+    mcp = _seeded_wrapper(identity, monkeypatch)
+
+    with pytest.raises(Exception, match="manifest_not_queried"):
+        _call_existing_tool(
+            mcp,
+            "send_message",
+            {"to": "peer-a", "body": _steer_body(), "summary": "peer steer"},
+        )
+
+    event = _wrapper_refusals()[0]
+    assert event.backend == "wrapper_mcp"
+    assert event.visibility.mailbox is True
+    assert event.payload["surface"] == "peer_steer_refused_at_wrapper"
+    assert event.payload["reason"] == "manifest_not_queried"
+    assert event.payload["primitive"] == "turn_steer"
+    assert event.payload["max_age_turns"] == 1
+    assert "mcp_anyteam_capability_manifest('peer-a', 'turn_steer')" in event.payload["guidance"]
+
+    lead_inbox = identity / "claude-anyteam" / "inboxes" / "team-lead.json"
+    raw = json.loads(lead_inbox.read_text(encoding="utf-8"))
+    lead_events = [
+        json.loads(message["text"])
+        for message in raw
+        if message.get("messageKind") == "visibility_degraded"
+    ]
+    assert len(lead_events) == 1
+    assert lead_events[0]["event_id"] == event.event_id
+    assert lead_events[0]["payload"]["surface"] == "peer_steer_refused_at_wrapper"
