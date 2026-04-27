@@ -496,48 +496,40 @@ class TestInboxMessageKindRoundTrip:
         raw_out = m.model_dump(by_alias=True, exclude_none=True)
         assert raw_out["messageKind"] == "peer_dm"
 
-    def test_substrate_mark_as_read_preserves_message_kind(self, tmp_path):
+    def test_substrate_mark_as_read_preserves_message_kind(self, tmp_path, monkeypatch):
         """End-to-end: write inbox file with messageKind, call substrate's
         read_inbox(mark_as_read=True), assert raw file still has messageKind
         on the now-marked-read entry. Catches the post-546b72c strip
         regression where InboxMessage didn't declare the field."""
         from claude_teams import messaging
 
-        inbox_dir = tmp_path / "inboxes"
-        inbox_dir.mkdir()
-        inbox_file = inbox_dir / "alice.json"
-        # Two entries: one tool_event, one heartbeat. Both must survive.
+        team = "kind-roundtrip"
+        agent = "alice"
+        monkeypatch.setattr(messaging, "TEAMS_DIR", tmp_path / "teams")
+        inbox_file = messaging.ensure_inbox(team, agent)
+        # Two entries: one turn-progress event, one peer DM. Both must survive
+        # the actual substrate mark-as-read rewrite path.
         entries = [
             {
                 "from": "lead",
-                "text": '{"kind":"tool_event","payload":{}}',
+                "text": '{"kind":"turn_progress","payload":{}}',
                 "timestamp": "2026-04-27T00:00:00Z",
                 "read": False,
-                "messageKind": "tool_event",
+                "messageKind": "turn_progress",
             },
             {
                 "from": "alice-2",
-                "text": '{"kind":"heartbeat"}',
+                "text": "hello",
                 "timestamp": "2026-04-27T00:00:01Z",
                 "read": False,
-                "messageKind": "heartbeat",
+                "messageKind": "peer_dm",
             },
         ]
-        inbox_file.write_text(json.dumps(entries))
-        # Drive substrate path. The read uses tmp_path-relative inbox via
-        # team_name + agent override. Use the lower-level helpers if the
-        # public API requires more rigging; for this regression, validating
-        # InboxMessage round-trip through read+rewrite is the load-bearing check.
-        msgs = [InboxMessage.model_validate(e) for e in entries]
-        # Mark one as read (the substrate would mark all that match the filter).
-        msgs[0].read = True
-        # Re-serialize the whole array exactly as messaging.read_inbox does.
-        rewritten = [m.model_dump(by_alias=True, exclude_none=True) for m in msgs]
-        # Assertion: messageKind survives on BOTH entries — the marked-read one
-        # and the untouched one (both go through the rewrite).
-        assert rewritten[0]["messageKind"] == "tool_event"
-        assert rewritten[1]["messageKind"] == "heartbeat"
-        # And the kind survives on every entry, not just one (catches partial
-        # strips). The catch-up's wrapper-only-write path would have failed this.
-        for r in rewritten:
-            assert "messageKind" in r, f"messageKind stripped from {r}"
+        inbox_file.write_text(json.dumps(entries), encoding="utf-8")
+
+        returned = messaging.read_inbox(team, agent, unread_only=True, mark_as_read=True)
+
+        assert [m.message_kind for m in returned] == ["turn_progress", "peer_dm"]
+        rewritten = json.loads(inbox_file.read_text(encoding="utf-8"))
+        assert [r["messageKind"] for r in rewritten] == ["turn_progress", "peer_dm"]
+        assert all(r["read"] is True for r in rewritten)

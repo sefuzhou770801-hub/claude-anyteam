@@ -289,12 +289,8 @@ def _handle_prose(state: KimiLoopState, msg: Any) -> None:
             reply = result.last_message
     except Exception as e:
         logger.warn("kimi.prose.crash", sender=sender, error=str(e))
-    # Skip the canned fallback when the model already delivered the reply
-    # via the send_message MCP tool — Kimi often returns no final text in
-    # that case (last_message=""), and a second message would contradict
-    # the real one.
-    if reply is None and result is not None and result.exit_code == 0 and getattr(result, "tool_call_events", 0) > 0:
-        logger.info("kimi.prose.delivered_via_tool", sender=sender, tool_calls=result.tool_call_events)
+    if reply is None and pio.should_skip_prose_fallback(result):
+        logger.info("kimi.prose.delivered_via_tool", sender=sender, tool_calls=getattr(result, "tool_call_events", 0))
         return
     if reply is None:
         # See diagnostics module + Codex/Gemini loops — same pattern across

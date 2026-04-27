@@ -319,13 +319,8 @@ def _handle_prose(state: LoopState, msg: Any) -> None:
     except Exception as e:
         logger.warn("prose.codex_crash", sender=sender, error=str(e))
 
-    # If the model already delivered the reply via the send_message MCP tool,
-    # last_message is empty by design (the model did everything in tools and
-    # produced no trailing assistant text). Don't double-send a canned
-    # fallback on top of the real reply.  Mirrors the Kimi adapter fix at
-    # backends/kimi/loop.py (PR #11) — same bug, same shape, same guard.
-    if reply is None and result is not None and result.exit_code == 0 and getattr(result, "tool_call_events", 0) > 0:
-        logger.info("prose.delivered_via_tool", sender=sender, tool_calls=result.tool_call_events)
+    if reply is None and pio.should_skip_prose_fallback(result):
+        logger.info("prose.delivered_via_tool", sender=sender, tool_calls=getattr(result, "tool_call_events", 0))
         return
 
     if reply is None:

@@ -39,6 +39,22 @@ def read_config(team: str):
     return _teams.read_config(team)
 
 
+def should_skip_prose_fallback(result: Any) -> bool:
+    """Return True when a prose reply was already delivered by a tool call.
+
+    09 R23 extracts the PR-#11/#12 delivered-via-tool guard from the Codex,
+    Gemini, and Kimi loops into one helper. Some backends leave
+    ``last_message`` empty after the model calls the wrapper ``send_message``
+    tool; in that case the adapter must not add a canned fallback on top of
+    the real peer reply.
+    """
+    return (
+        result is not None
+        and getattr(result, "exit_code", None) == 0
+        and getattr(result, "tool_call_events", 0) > 0
+    )
+
+
 def read_inbox(team: str, name: str, *, mark_as_read: bool = True) -> list[_InboxMessage]:
     """Read unread messages from an inbox.
 
