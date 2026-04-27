@@ -331,6 +331,100 @@ def test_m13_collision_detected(teams_dir: Path, tmp_path: Path):
     assert scenario["aggregate"]["M13_total_collisions"] == 1
 
 
+def test_m13_attribution_includes_backend_timestamps_and_ordering(
+    teams_dir: Path,
+    tmp_path: Path,
+):
+    team = "team-m13-attribution"
+    append_event(team, "kimi-a", "turn_started", 1, at=0, backend="kimi_headless", turn_id="turn-a")
+    append_event(team, "codex-b", "turn_started", 1, at=0, backend="codex_app_server", turn_id="turn-b")
+    send(team, "kimi-a", 2, "codex-b", at=5, backend="wrapper_mcp")
+    append_event(
+        team,
+        "kimi-a",
+        "turn_completed",
+        3,
+        at=8,
+        backend="kimi_headless",
+        turn_id="turn-a",
+        payload={
+            "tool_call_events": 1,
+            "last_message_preview": "sent the structured reply and then emitted prose fallback too",
+        },
+    )
+
+    scenario, _pairs, agents = run_score(team, tmp_path / "out")
+
+    aggregate = scenario["aggregate"]["M13_collisions_by_backend"][
+        "kimi_headless->codex_app_server"
+    ]
+    assert aggregate == {
+        "sender_backend": "kimi_headless",
+        "recipient_backend": "codex_app_server",
+        "collisions": 1,
+        "send_message_count": 1,
+        "collision_rate": 1.0,
+    }
+    record = scenario["aggregate"]["M13_per_collision_attribution"][0]
+    assert record["turn_id"] == "turn-a"
+    assert record["sender"] == "kimi-a"
+    assert record["sender_backend"] == "kimi_headless"
+    assert record["recipient"] == "codex-b"
+    assert record["recipient_backend"] == "codex_app_server"
+    assert record["structured_reply_seen"] is True
+    assert record["prose_fallback_seen"] is True
+    assert record["structured_reply_ts"] == ts(5)
+    assert record["prose_fallback_ts"] == ts(8)
+    assert record["inter_event_ms"] == 3000
+    assert record["terminal_event_kind"] == "structured_first_then_prose"
+    assert agents["kimi-a"]["metrics"]["M13_per_collision_attribution"] == [record]
+
+
+def test_m13_mixed_backend_recipients_are_disambiguated(
+    teams_dir: Path,
+    tmp_path: Path,
+):
+    team = "team-m13-mixed-backend"
+    append_event(team, "kimi-a", "turn_started", 1, at=0, backend="kimi_headless", turn_id="turn-a")
+    append_event(team, "codex-b", "turn_started", 1, at=0, backend="codex_app_server", turn_id="turn-b")
+    append_event(team, "kimi-c", "turn_started", 1, at=0, backend="kimi_headless", turn_id="turn-c")
+    send(team, "kimi-a", 2, "codex-b", at=5, backend="wrapper_mcp")
+    send(team, "kimi-a", 3, "kimi-c", at=6, backend="wrapper_mcp")
+    append_event(
+        team,
+        "kimi-a",
+        "turn_completed",
+        4,
+        at=9,
+        backend="kimi_headless",
+        turn_id="turn-a",
+        payload={
+            "tool_call_events": 2,
+            "last_message_preview": "sent two peer messages and then leaked a prose fallback",
+        },
+    )
+
+    scenario, _pairs, agents = run_score(team, tmp_path / "out")
+
+    records = scenario["aggregate"]["M13_per_collision_attribution"]
+    assert {(row["recipient"], row["recipient_backend"]) for row in records} == {
+        ("codex-b", "codex_app_server"),
+        ("kimi-c", "kimi_headless"),
+    }
+    assert scenario["aggregate"]["M13_collisions_by_backend"][
+        "kimi_headless->codex_app_server"
+    ]["collisions"] == 1
+    assert scenario["aggregate"]["M13_collisions_by_backend"][
+        "kimi_headless->kimi_headless"
+    ]["collisions"] == 1
+    assert agents["kimi-a"]["metrics"]["M13_collisions_by_backend"][
+        "kimi_headless->codex_app_server"
+    ]["send_message_count"] == 1
+    assert agents["kimi-a"]["metrics"]["M13_collisions_by_backend"][
+        "kimi_headless->kimi_headless"
+    ]["send_message_count"] == 1
+
+
 def test_m13_no_collision_when_preview_short(teams_dir: Path, tmp_path: Path):
     team = "team-m13-short"
     append_event(
