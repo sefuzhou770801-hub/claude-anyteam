@@ -15,7 +15,12 @@ from unittest.mock import patch
 
 from claude_anyteam import loop as loop_mod
 from claude_anyteam.config import Settings
-from claude_anyteam.loop import LoopState, _find_and_claim, _handle_message
+from claude_anyteam.loop import (
+    LoopState,
+    _find_and_claim,
+    _handle_message,
+    _mid_turn_prose_should_be_steer,
+)
 
 
 def _settings() -> Settings:
@@ -486,3 +491,130 @@ def test_claim_returns_none_when_all_claimed_or_blocked():
     assert result is None
     assert state.in_flight_task is None
     assert m.call_count == 0
+
+
+# ---- _mid_turn_prose_should_be_steer (phase4 #17) ---------------------------
+#
+# Phase4 #17 lands the L4 half of the R3/#59 sender-side messageKind
+# discriminator. These tests pin the per-kind decision matrix so future
+# refactors cannot silently undo the throughput-regression fix observed in
+# stress run S6+W7-post59 (n_completed=3/15, M11a p95 RTT=237s) where
+# informational peer-DMs jammed recipient turn budgets via queued steers.
+
+
+def test_mid_turn_prose_should_be_steer_lead_prose_always_steer_default_kind():
+    # Lead prose without an explicit kind defaults to steer for operational
+    # parity with native Claude leads.
+    assert _mid_turn_prose_should_be_steer(
+        sender="team-lead",
+        recipient_capabilities=[],
+        message_kind=None,
+    ) is True
+
+
+def test_mid_turn_prose_should_be_steer_lead_informational_still_steer():
+    # Lead authority overrides messageKind: an explicit "informational" lead
+    # prose still becomes a steer, because §3 declares lead-as-orchestrator
+    # in all backends regardless of how the helper labelled the wire.
+    assert _mid_turn_prose_should_be_steer(
+        sender="team-lead",
+        recipient_capabilities=["accepts_peer_steer"],
+        message_kind="informational",
+    ) is True
+
+
+def test_mid_turn_prose_should_be_steer_peer_informational_never_steer_even_when_recipient_accepts():
+    # Core regression — without this branch, a peer's kind="informational"
+    # coordination DM would queue as steer when recipient declares
+    # accepts_peer_steer, which is exactly the post-#59 throughput collapse.
+    assert _mid_turn_prose_should_be_steer(
+        sender="codex-r1",
+        recipient_capabilities=["accepts_peer_steer"],
+        message_kind="informational",
+    ) is False
+
+
+def test_mid_turn_prose_should_be_steer_peer_steer_kind_with_capability_is_steer():
+    # When sender explicitly tagged kind="steer" and recipient declares
+    # accepts_peer_steer, the prose should become a steer fragment.
+    assert _mid_turn_prose_should_be_steer(
+        sender="codex-r1",
+        recipient_capabilities=["accepts_peer_steer"],
+        message_kind="steer",
+    ) is True
+
+
+def test_mid_turn_prose_should_be_steer_peer_handoff_with_capability_is_steer():
+    # kind="handoff" is not "informational"; it falls through to the
+    # capability check. With accepts_peer_steer declared, it queues as steer
+    # so the recipient picks up the handoff context mid-turn rather than
+    # parking it for after-turn drain.
+    assert _mid_turn_prose_should_be_steer(
+        sender="codex-r1",
+        recipient_capabilities=["accepts_peer_steer"],
+        message_kind="handoff",
+    ) is True
+
+
+def test_mid_turn_prose_should_be_steer_peer_unknown_kind_with_capability_is_steer():
+    # Unknown kinds (forward-compat wire fields) fall through the
+    # informational gate and respect the capability declaration.
+    assert _mid_turn_prose_should_be_steer(
+        sender="codex-r1",
+        recipient_capabilities=["accepts_peer_steer"],
+        message_kind="future_kind",
+    ) is True
+
+
+def test_mid_turn_prose_should_be_steer_peer_default_kind_with_capability_is_steer():
+    # Pre-R3 wire rows (no messageKind) preserve the post-#56 v2 behavior:
+    # peer prose without a kind label respects accepts_peer_steer.
+    assert _mid_turn_prose_should_be_steer(
+        sender="codex-r1",
+        recipient_capabilities=["accepts_peer_steer"],
+        message_kind=None,
+    ) is True
+
+
+def test_mid_turn_prose_should_be_steer_peer_default_kind_without_capability_defers():
+    # Pre-R3 wire row from peer; recipient does NOT declare
+    # accepts_peer_steer → defer to post-turn handler (post-#56 contract).
+    assert _mid_turn_prose_should_be_steer(
+        sender="codex-r1",
+        recipient_capabilities=[],
+        message_kind=None,
+    ) is False
+
+
+def test_mid_turn_prose_should_be_steer_peer_informational_without_capability_defers():
+    # Belt-and-suspenders: even when capability is absent, kind="informational"
+    # never becomes steer. Both branches agree on defer.
+    assert _mid_turn_prose_should_be_steer(
+        sender="codex-r1",
+        recipient_capabilities=[],
+        message_kind="informational",
+    ) is False
+
+
+def test_mid_turn_prose_should_be_steer_peer_steer_kind_without_capability_defers():
+    # kind="steer" alone does NOT override the recipient's lack of
+    # accepts_peer_steer. The capability declaration governs.
+    assert _mid_turn_prose_should_be_steer(
+        sender="codex-r1",
+        recipient_capabilities=[],
+        message_kind="steer",
+    ) is False
+
+
+def test_mid_turn_prose_should_be_steer_no_sender_defers():
+    # Defensive: sender=None must not crash and must not become a steer.
+    assert _mid_turn_prose_should_be_steer(
+        sender=None,
+        recipient_capabilities=["accepts_peer_steer"],
+        message_kind=None,
+    ) is False
+    assert _mid_turn_prose_should_be_steer(
+        sender=None,
+        recipient_capabilities=["accepts_peer_steer"],
+        message_kind="steer",
+    ) is False

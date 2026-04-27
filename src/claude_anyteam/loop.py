@@ -57,6 +57,7 @@ def _mid_turn_prose_should_be_steer(
     *,
     sender: str | None,
     recipient_capabilities: list[str],
+    message_kind: str | None = None,
 ) -> bool:
     """Return whether an untyped prose inbox message should become steer.
 
@@ -67,10 +68,20 @@ def _mid_turn_prose_should_be_steer(
     peer steer. The recipient's own capability declaration governs that
     interpretation: only recipients advertising ``accepts_peer_steer`` opt in
     to converting peer prose into mid-turn steer fragments.
+
+    Per phase4 #59 sender-side messageKind discriminator: peer-sent prose
+    with kind="informational" is routine coordination, NOT a steer attempt,
+    even when the recipient declares accepts_peer_steer. Honoring the
+    discriminator at L4 closes the post-#59 throughput regression where
+    informational peer-DMs jammed recipient turn budgets via queued steers.
+    Lead prose still becomes a steer regardless of kind — the lead's
+    operational authority is unchanged.
     """
 
     if sender == "team-lead":
         return True
+    if message_kind == "informational":
+        return False
     return bool(sender and "accepts_peer_steer" in recipient_capabilities)
 
 
@@ -942,15 +953,22 @@ def _execute_task_app_server(state: LoopState, task, prompt: str):
             ).parse_protocol_text(m.text)
             if payload is None:
                 sender = getattr(m, "from_", None)
+                # Phase4 #17: honor R3/#59 sender-side messageKind discriminator.
+                # InboxMessage.message_kind defaults to "peer_dm" when the wire
+                # row omits it (legacy v0.6.x rows); explicit "informational"
+                # marks routine coordination DMs that must not become steer.
+                message_kind = getattr(m, "message_kind", None)
                 if not _mid_turn_prose_should_be_steer(
                     sender=sender,
                     recipient_capabilities=recipient_capabilities,
+                    message_kind=message_kind,
                 ):
                     deferred_prose_messages.append(m)
                     logger.info(
                         "task.mid_turn_prose_deferred",
                         from_=sender,
                         text_head=m.text[:120],
+                        message_kind=message_kind,
                     )
                     continue
                 accepted = steer_queue.push(

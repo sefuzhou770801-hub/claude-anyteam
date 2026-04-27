@@ -64,6 +64,26 @@ def _prose_msg(sender: str, text: str = "FYI: I found the relevant file."):
     return SimpleNamespace(from_=sender, text=text, summary="info")
 
 
+def _prose_msg_with_kind(
+    sender: str,
+    text: str = "FYI: I found the relevant file.",
+    *,
+    message_kind: str = "informational",
+):
+    """Phase4 #17: prose msg with explicit messageKind discriminator.
+
+    Mirrors how the substrate populates `InboxMessage.message_kind` from the
+    R3/#59 wire field (camelCase `messageKind` on disk, snake_case attr on
+    the model). Tests use this to simulate post-#59 sender behavior.
+    """
+    return SimpleNamespace(
+        from_=sender,
+        text=text,
+        summary="info",
+        message_kind=message_kind,
+    )
+
+
 def _codex_result() -> codex_mod.CodexResult:
     return codex_mod.CodexResult(
         exit_code=0,
@@ -299,6 +319,218 @@ def test_team_lead_steer_allowed_without_peer_steer_capability(tmp_path: Path):
 
     assert queue.push("lead steer", sender="team-lead") is True
     assert queue.pop_nowait() == "lead steer"
+
+
+# ──────────────────────────────────────────────────────────────────────────
+# Phase4 #17: L4 messageKind integration. The L3 wrapper-MCP gate (#53/#54)
+# already enforces structural correctness on the sender side. The L4
+# fix at codex_loop._mid_turn_prose_should_be_steer honors the recipient-side
+# discriminator: peer prose with messageKind="informational" must NOT be
+# queued as a mid-turn steer fragment, even when the recipient declares
+# accepts_peer_steer. Locks the regression observed in stress run
+# S6+W7-post59 (n_completed=3/15, M11a p95 RTT=237s).
+# ──────────────────────────────────────────────────────────────────────────
+
+
+def test_phase4_17_codex_mid_turn_peer_informational_with_capability_is_deferred(
+    monkeypatch, tmp_path: Path
+):
+    """Regression-lock for #17: peer-DM kind=informational must defer.
+
+    Pre-#17, this test fails because the recipient has accepts_peer_steer
+    declared, which bypasses the discriminator and queues every peer prose
+    (including kind="informational") as a steer fragment. Post-#17, the L4
+    function reads message_kind off the InboxMessage and shorts to defer.
+    """
+    schema_path = tmp_path / "task-complete.schema.json"
+    schema_path.write_text("{}", encoding="utf-8")
+    state = codex_loop.LoopState(settings=_codex_settings(tmp_path))
+    msg = _prose_msg_with_kind(
+        PEER,
+        "FYI: I'll be done in 5min.",
+        message_kind="informational",
+    )
+    deferred: list[tuple[str, str]] = []
+    queue_pop_count = {"n": 0}
+
+    def fake_invoke(**kwargs):
+        kwargs["mid_turn_hook"]()
+        # Steer queue must be empty — informational DM never queued.
+        assert kwargs["steer_queue"].pop_nowait() is None
+        queue_pop_count["n"] += 1
+        return _codex_result()
+
+    monkeypatch.setattr(codex_loop.codex_mod, "TASK_COMPLETE_SCHEMA", schema_path)
+    monkeypatch.setattr(codex_loop.pio, "read_own_inbox", lambda *_args: [msg])
+    monkeypatch.setattr(codex_loop.codex_mod, "app_server_invoke", fake_invoke)
+    # Recipient explicitly declares accepts_peer_steer — exactly the
+    # post-#59 stress configuration where the regression manifests.
+    monkeypatch.setattr(
+        codex_loop,
+        "_backend_metadata",
+        lambda _settings: SimpleNamespace(capabilities=["accepts_peer_steer"]),
+    )
+    monkeypatch.setattr(
+        codex_loop,
+        "_handle_prose",
+        lambda _state, prose_msg: deferred.append((prose_msg.from_, prose_msg.text)),
+    )
+
+    codex_loop._execute_task_app_server(
+        state,
+        SimpleNamespace(id="42"),
+        prompt="do work",
+    )
+
+    # Informational peer-DM is deferred to the post-turn prose handler,
+    # NOT queued as a mid-turn steer fragment.
+    assert deferred == [(PEER, "FYI: I'll be done in 5min.")]
+    assert queue_pop_count["n"] == 1
+
+
+def test_phase4_17_codex_mid_turn_peer_steer_kind_with_capability_still_queues(
+    monkeypatch, tmp_path: Path
+):
+    """Phase4 #17 must NOT block legitimate peer-steer attempts.
+
+    When sender stamps kind="steer" and recipient declares
+    accepts_peer_steer, the prose still queues as a steer fragment. The
+    discriminator only short-circuits the "informational" case.
+    """
+    schema_path = tmp_path / "task-complete.schema.json"
+    schema_path.write_text("{}", encoding="utf-8")
+    state = codex_loop.LoopState(settings=_codex_settings(tmp_path))
+    msg = _prose_msg_with_kind(
+        PEER,
+        "Use the revised constraint.",
+        message_kind="steer",
+    )
+    deferred: list[tuple[str, str]] = []
+
+    def fake_invoke(**kwargs):
+        kwargs["mid_turn_hook"]()
+        assert (
+            kwargs["steer_queue"].pop_nowait()
+            == f"mid-task message from {PEER}: Use the revised constraint."
+        )
+        return _codex_result()
+
+    monkeypatch.setattr(codex_loop.codex_mod, "TASK_COMPLETE_SCHEMA", schema_path)
+    monkeypatch.setattr(codex_loop.pio, "read_own_inbox", lambda *_args: [msg])
+    monkeypatch.setattr(codex_loop.codex_mod, "app_server_invoke", fake_invoke)
+    monkeypatch.setattr(
+        codex_loop,
+        "_backend_metadata",
+        lambda _settings: SimpleNamespace(capabilities=["accepts_peer_steer"]),
+    )
+    monkeypatch.setattr(
+        codex_loop,
+        "_handle_prose",
+        lambda _state, prose_msg: deferred.append((prose_msg.from_, prose_msg.text)),
+    )
+
+    codex_loop._execute_task_app_server(
+        state,
+        SimpleNamespace(id="42"),
+        prompt="do work",
+    )
+
+    # No defer; the steer-kind prose was queued mid-turn.
+    assert deferred == []
+
+
+def test_phase4_17_codex_mid_turn_lead_informational_still_steers(
+    monkeypatch, tmp_path: Path
+):
+    """Lead authority overrides messageKind discriminator.
+
+    The lead is the orchestrator across all three north stars; even an
+    "informational" lead message becomes a mid-turn steer fragment, since
+    declining lead steers would block legitimate operational guidance.
+    """
+    schema_path = tmp_path / "task-complete.schema.json"
+    schema_path.write_text("{}", encoding="utf-8")
+    state = codex_loop.LoopState(settings=_codex_settings(tmp_path))
+    msg = _prose_msg_with_kind(
+        "team-lead",
+        "FYI: peer pair-b stalled.",
+        message_kind="informational",
+    )
+    deferred: list[tuple[str, str]] = []
+
+    def fake_invoke(**kwargs):
+        kwargs["mid_turn_hook"]()
+        # Lead prose still queued, regardless of kind.
+        assert (
+            kwargs["steer_queue"].pop_nowait()
+            == "mid-task message from team-lead: FYI: peer pair-b stalled."
+        )
+        return _codex_result()
+
+    monkeypatch.setattr(codex_loop.codex_mod, "TASK_COMPLETE_SCHEMA", schema_path)
+    monkeypatch.setattr(codex_loop.pio, "read_own_inbox", lambda *_args: [msg])
+    monkeypatch.setattr(codex_loop.codex_mod, "app_server_invoke", fake_invoke)
+    monkeypatch.setattr(
+        codex_loop,
+        "_handle_prose",
+        lambda _state, prose_msg: deferred.append((prose_msg.from_, prose_msg.text)),
+    )
+
+    codex_loop._execute_task_app_server(
+        state,
+        SimpleNamespace(id="42"),
+        prompt="do work",
+    )
+
+    assert deferred == []
+
+
+def test_phase4_17_codex_mid_turn_legacy_inbox_row_without_kind_preserves_56_behavior(
+    monkeypatch, tmp_path: Path
+):
+    """Legacy v0.6.x rows without messageKind keep the post-#56 v2 contract.
+
+    A peer prose with no message_kind attribute (pre-R3 wire row) and
+    recipient declaring accepts_peer_steer must STILL queue as steer — the
+    discriminator only fires when the wire field is explicitly
+    "informational". This protects forward-compat for legacy team configs.
+    """
+    schema_path = tmp_path / "task-complete.schema.json"
+    schema_path.write_text("{}", encoding="utf-8")
+    state = codex_loop.LoopState(settings=_codex_settings(tmp_path))
+    # Note: _prose_msg has no message_kind attr — simulates pre-R3 wire row.
+    msg = _prose_msg(PEER, "Use the revised constraint.")
+    deferred: list[tuple[str, str]] = []
+
+    def fake_invoke(**kwargs):
+        kwargs["mid_turn_hook"]()
+        assert (
+            kwargs["steer_queue"].pop_nowait()
+            == f"mid-task message from {PEER}: Use the revised constraint."
+        )
+        return _codex_result()
+
+    monkeypatch.setattr(codex_loop.codex_mod, "TASK_COMPLETE_SCHEMA", schema_path)
+    monkeypatch.setattr(codex_loop.pio, "read_own_inbox", lambda *_args: [msg])
+    monkeypatch.setattr(codex_loop.codex_mod, "app_server_invoke", fake_invoke)
+    monkeypatch.setattr(
+        codex_loop,
+        "_backend_metadata",
+        lambda _settings: SimpleNamespace(capabilities=["accepts_peer_steer"]),
+    )
+    monkeypatch.setattr(
+        codex_loop,
+        "_handle_prose",
+        lambda _state, prose_msg: deferred.append((prose_msg.from_, prose_msg.text)),
+    )
+
+    codex_loop._execute_task_app_server(
+        state,
+        SimpleNamespace(id="42"),
+        prompt="do work",
+    )
+
+    assert deferred == []
 
 
 # ──────────────────────────────────────────────────────────────────────────
