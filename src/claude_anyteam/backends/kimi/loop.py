@@ -72,27 +72,62 @@ def _backend_metadata(settings: KimiSettings) -> BackendMetadata:
 
 
 def run(settings: KimiSettings) -> int:
-    _backend_feature_test(settings)
-    register(settings, _backend_metadata(settings))
-    state = KimiLoopState(settings=settings)
-    state.peer_manifest_cache = CapabilityManifestCache(
-        settings.team_name,
-        self_name=settings.agent_name,
-    )
-    state.peer_manifest_cache.load_startup()
-
-    def _sig_handler(signum: int, _frame: Any) -> None:
-        logger.warn("kimi.signal.received", signum=signum)
-        state.shutdown_requested = True
-
-    signal.signal(signal.SIGINT, _sig_handler)
-    signal.signal(signal.SIGTERM, _sig_handler)
-
+    state: KimiLoopState | None = None
     exit_code = 0
+    startup_phase = "feature_test"
+    startup_complete = False
     try:
+        _backend_feature_test(settings)
+        startup_phase = "registration"
+        register(settings, _backend_metadata(settings))
+        startup_phase = "capability_manifest_load"
+        state = KimiLoopState(settings=settings)
+        state.peer_manifest_cache = CapabilityManifestCache(
+            settings.team_name,
+            self_name=settings.agent_name,
+        )
+        state.peer_manifest_cache.load_startup()
+
+        def _sig_handler(signum: int, _frame: Any) -> None:
+            logger.warn("kimi.signal.received", signum=signum)
+            assert state is not None
+            state.shutdown_requested = True
+
+        startup_phase = "signal_setup"
+        signal.signal(signal.SIGINT, _sig_handler)
+        signal.signal(signal.SIGTERM, _sig_handler)
+
+        startup_complete = True
         _main_loop(state)
     except Exception as e:
-        logger.error("kimi.loop.crash", error=str(e))
+        if startup_complete:
+            logger.error("kimi.loop.crash", error=str(e))
+            error_class = "adapter_crash"
+        else:
+            logger.error("kimi.startup.crash", phase=startup_phase, error=str(e))
+            error_class = "adapter_startup_crash"
+            # Startup failures happen before the first inbox poll/turn, so
+            # fan out an envelope directly instead of relying on task/prose
+            # fallbacks that never run.
+            try:
+                pio.emit_adapter_startup_crash(
+                    team=settings.team_name,
+                    agent=settings.agent_name,
+                    backend="kimi",
+                    phase=startup_phase,
+                    error=e,
+                    payload={
+                        "transport": settings.backend,
+                        "kimi_binary": settings.kimi_binary,
+                        "kimi_home": str(settings.kimi_home) if settings.kimi_home else None,
+                        "cwd": str(settings.cwd),
+                        "model": settings.model,
+                        "effort": settings.effort,
+                        "thinking": settings.thinking,
+                    },
+                )
+            except Exception as emit_exc:
+                logger.debug("kimi.startup.visibility_emit_failed", error=str(emit_exc))
         # Persist a structured incident so the lead can find this via
         # `claude-anyteam diagnose`. Same crash-hygiene pattern as
         # Codex/Gemini — adapter crashes that would otherwise only
@@ -103,18 +138,21 @@ def run(settings: KimiSettings) -> int:
                 team=settings.team_name,
                 agent=settings.agent_name,
                 backend="kimi",
-                error_class="adapter_crash",
+                error_class=error_class,
                 summary=str(e),
             )
         except Exception:
             pass
         exit_code = 1
     finally:
-        if state.approved_shutdown:
+        if state is not None and state.approved_shutdown:
             deregister(settings)
             logger.info("kimi.loop.deregistered", name=settings.agent_name)
         else:
-            logger.warn("kimi.loop.exit_without_deregister", in_flight_task=state.in_flight_task)
+            logger.warn(
+                "kimi.loop.exit_without_deregister",
+                in_flight_task=(state.in_flight_task if state is not None else None),
+            )
     return exit_code
 
 

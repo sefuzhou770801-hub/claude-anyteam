@@ -89,47 +89,87 @@ def _backend_metadata(settings: GeminiSettings) -> BackendMetadata:
 
 
 def run(settings: GeminiSettings) -> int:
-    _backend_feature_test(settings)
+    state: GeminiLoopState | None = None
     gemini_home = settings.gemini_home or headless_invoke._default_gemini_home(settings.team_name, settings.agent_name)
-    if settings.backend == "acp":
-        headless_invoke.ensure_adapter_state(gemini_home)
-        previous_state = headless_invoke.read_adapter_state(gemini_home)
-        crash_hygiene.run_startup_recovery(
-            gemini_home=gemini_home,
-            team=settings.team_name,
-            agent=settings.agent_name,
-            cwd=settings.cwd,
-            gemini_binary=settings.gemini_binary,
-            state=previous_state,
-        )
-        crash_hygiene.mark_adapter_start(
-            gemini_home,
-            team=settings.team_name,
-            agent=settings.agent_name,
-            cwd=settings.cwd,
-        )
-    register(settings, _backend_metadata(settings))
-    state = GeminiLoopState(settings=settings)
-    state.peer_manifest_cache = CapabilityManifestCache(
-        settings.team_name,
-        self_name=settings.agent_name,
-    )
-    state.peer_manifest_cache.load_startup()
-
-    def _sig_handler(signum: int, _frame: Any) -> None:
-        logger.warn("gemini.signal.received", signum=signum)
-        state.shutdown_requested = True
-        if settings.backend == "acp":
-            acp_invoke.terminate_active_acp_children(signum=signum, reason="adapter_signal")
-
-    signal.signal(signal.SIGINT, _sig_handler)
-    signal.signal(signal.SIGTERM, _sig_handler)
-
     exit_code = 0
+    startup_phase = "feature_test"
+    startup_complete = False
     try:
+        _backend_feature_test(settings)
+        if settings.backend == "acp":
+            startup_phase = "startup_recovery"
+            headless_invoke.ensure_adapter_state(gemini_home)
+            previous_state = headless_invoke.read_adapter_state(gemini_home)
+            crash_hygiene.run_startup_recovery(
+                gemini_home=gemini_home,
+                team=settings.team_name,
+                agent=settings.agent_name,
+                cwd=settings.cwd,
+                gemini_binary=settings.gemini_binary,
+                state=previous_state,
+            )
+            crash_hygiene.mark_adapter_start(
+                gemini_home,
+                team=settings.team_name,
+                agent=settings.agent_name,
+                cwd=settings.cwd,
+            )
+        startup_phase = "registration"
+        register(settings, _backend_metadata(settings))
+        startup_phase = "capability_manifest_load"
+        state = GeminiLoopState(settings=settings)
+        state.peer_manifest_cache = CapabilityManifestCache(
+            settings.team_name,
+            self_name=settings.agent_name,
+        )
+        state.peer_manifest_cache.load_startup()
+
+        def _sig_handler(signum: int, _frame: Any) -> None:
+            logger.warn("gemini.signal.received", signum=signum)
+            assert state is not None
+            state.shutdown_requested = True
+            if settings.backend == "acp":
+                acp_invoke.terminate_active_acp_children(signum=signum, reason="adapter_signal")
+
+        startup_phase = "signal_setup"
+        signal.signal(signal.SIGINT, _sig_handler)
+        signal.signal(signal.SIGTERM, _sig_handler)
+
+        startup_complete = True
         _main_loop(state)
     except Exception as e:
-        logger.error("gemini.loop.crash", error=str(e))
+        if startup_complete:
+            logger.error("gemini.loop.crash", error=str(e))
+            error_class = "adapter_crash"
+        else:
+            logger.error(
+                "gemini.startup.crash",
+                phase=startup_phase,
+                backend=settings.backend,
+                error=str(e),
+            )
+            error_class = "adapter_startup_crash"
+            # Startup failures happen before the first inbox poll/turn, so
+            # fan out an envelope directly instead of relying on task/prose
+            # fallbacks that never run.
+            try:
+                pio.emit_adapter_startup_crash(
+                    team=settings.team_name,
+                    agent=settings.agent_name,
+                    backend="gemini",
+                    phase=startup_phase,
+                    error=e,
+                    payload={
+                        "transport": settings.backend,
+                        "gemini_binary": settings.gemini_binary,
+                        "gemini_home": str(gemini_home),
+                        "cwd": str(settings.cwd),
+                        "model": settings.model,
+                        "effort": settings.effort,
+                    },
+                )
+            except Exception as emit_exc:
+                logger.debug("gemini.startup.visibility_emit_failed", error=str(emit_exc))
         # Persist a structured incident so the lead can find this via
         # `claude-anyteam diagnose`. Particularly important for Gemini
         # cold-start failures where the adapter exits before its first
@@ -142,18 +182,21 @@ def run(settings: GeminiSettings) -> int:
                 team=settings.team_name,
                 agent=settings.agent_name,
                 backend="gemini",
-                error_class="adapter_crash",
+                error_class=error_class,
                 summary=str(e),
             )
         except Exception:
             pass
         exit_code = 1
     finally:
-        if state.approved_shutdown:
+        if state is not None and state.approved_shutdown:
             deregister(settings)
             logger.info("gemini.loop.deregistered", name=settings.agent_name)
         else:
-            logger.warn("gemini.loop.exit_without_deregister", in_flight_task=state.in_flight_task)
+            logger.warn(
+                "gemini.loop.exit_without_deregister",
+                in_flight_task=(state.in_flight_task if state is not None else None),
+            )
         if settings.backend == "acp" and exit_code == 0:
             crash_hygiene.mark_clean_shutdown(gemini_home)
     return exit_code

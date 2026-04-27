@@ -408,6 +408,143 @@ def send_visibility_event_to_lead(
     )
 
 
+def _bounded_text(value: Any, *, limit: int = 4000) -> Any:
+    """Return a JSON-safe, bounded representation of a native error field."""
+
+    if value is None:
+        return None
+    if isinstance(value, bytes):
+        text = value.decode("utf-8", errors="replace")
+    elif isinstance(value, str):
+        text = value
+    elif isinstance(value, (int, float, bool)):
+        return value
+    else:
+        try:
+            json.dumps(value)
+            return value
+        except (TypeError, ValueError):
+            text = repr(value)
+    if len(text) > limit:
+        return text[:limit] + "…"
+    return text
+
+
+def _exception_wire_details(error: BaseException) -> dict[str, Any]:
+    """Preserve backend-native exception details for visibility envelopes.
+
+    The visibility envelope should normalize routing fields only.  Startup
+    probes often wrap a native subprocess exception in RuntimeError; include
+    the wrapper *and* the cause so leads can see the original command,
+    return code, stdout, and stderr without grepping tmux/proc logs.
+    """
+
+    def _one(exc: BaseException) -> dict[str, Any]:
+        detail: dict[str, Any] = {
+            "type": f"{exc.__class__.__module__}.{exc.__class__.__name__}",
+            "message": str(exc),
+            "repr": repr(exc),
+        }
+        for attr in ("cmd", "returncode", "stdout", "stderr", "output", "timeout"):
+            if hasattr(exc, attr):
+                value = getattr(exc, attr)
+                if value is not None:
+                    detail[attr] = _bounded_text(value)
+        return detail
+
+    out = _one(error)
+    cause = error.__cause__ or error.__context__
+    if cause is not None and cause is not error:
+        out["cause"] = _one(cause)
+    return out
+
+
+def emit_adapter_startup_crash(
+    *,
+    team: str,
+    agent: str,
+    backend: str,
+    phase: str,
+    error: BaseException,
+    payload: dict[str, Any] | None = None,
+) -> VisibilityEvent:
+    """Emit a lead-visible startup-crash ``visibility_degraded`` envelope.
+
+    Gemini/Kimi routed teammates can fail before their first turn (for
+    example during CLI binary/feature probes).  Those failures used to live
+    only in stderr/proc logs; this helper fans the structured envelope out to
+    both the append-only event log and the lead mailbox while preserving the
+    backend-native exception/subprocess details in ``payload.raw_backend_error``.
+    """
+
+    error_message = str(error)
+    event_payload: dict[str, Any] = {
+        "surface": "adapter_startup",
+        "phase": phase,
+        "error_type": f"{error.__class__.__module__}.{error.__class__.__name__}",
+        "error_message": error_message,
+        "raw_backend_error": _exception_wire_details(error),
+    }
+    if payload:
+        event_payload.update(payload)
+
+    event_id = f"{agent}:startup-crash:{int(time.time() * 1000)}"
+    envelope = VisibilityEvent(
+        kind="visibility_degraded",
+        event_id=event_id,
+        team=team,
+        agent=agent,
+        backend=backend,
+        seq=0,
+        severity="error",
+        summary=(
+            f"{backend} adapter startup failed during {phase}: {error_message}"
+        )[:300],
+        visibility={
+            "mailbox": True,
+            "task_state": False,
+            "event_log": True,
+            "stderr": True,
+        },
+        payload=event_payload,
+    )
+
+    log_payload = {
+        "kind": envelope.kind,
+        "event_id": envelope.event_id,
+        "seq": envelope.seq,
+        "severity": envelope.severity,
+        "summary": envelope.summary,
+        "visibility_event": envelope.model_dump(by_alias=True, exclude_none=True),
+    }
+    logger.error("visibility.event", **log_payload)
+
+    appended = False
+    try:
+        append_event(team, agent, envelope)
+        appended = True
+    except Exception as e:
+        logger.warn(
+            "visibility.startup_crash_event_log_failed",
+            backend=backend,
+            agent=agent,
+            phase=phase,
+            error=str(e),
+        )
+    try:
+        send_visibility_event_to_lead(team, agent, envelope)
+    except Exception as e:
+        logger.warn(
+            "visibility.startup_crash_mailbox_failed",
+            backend=backend,
+            agent=agent,
+            phase=phase,
+            event_log_appended=appended,
+            error=str(e),
+        )
+    return envelope
+
+
 def send_idle_notification(team: str, sender: str, reason: str = "available") -> None:
     payload = IdleNotificationOut(from_=sender, idle_reason=reason)  # type: ignore[call-arg]
     send_json_to_lead(team, sender, payload, summary="idle")
