@@ -16,17 +16,23 @@ from unittest.mock import patch
 import pytest
 from claude_teams.models import LeadMember, TeammateMember
 
+from claude_anyteam import protocol_io as pio
 from claude_anyteam.wrapper_server import (
     BLOCKED_TOOLS,
     EXPOSED_TOOLS,
+    TOOL_CATEGORIES,
     build_server,
 )
 
 
 @pytest.fixture
-def identity(monkeypatch):
+def identity(monkeypatch, tmp_path):
     monkeypatch.setenv("CLAUDE_ANYTEAM_TEAM", "claude-anyteam")
     monkeypatch.setenv("CLAUDE_ANYTEAM_NAME", "contract-test")
+    team_root = tmp_path / "teams"
+    monkeypatch.setattr("claude_anyteam.wrapper_server._cs_messaging.TEAMS_DIR", team_root)
+    monkeypatch.setattr("claude_anyteam.protocol_io._m.TEAMS_DIR", team_root)
+    return team_root
 
 
 def _clear_identity_env(monkeypatch) -> None:
@@ -138,6 +144,21 @@ def test_exposed_and_blocked_do_not_overlap():
 def test_exposed_count_includes_protocol_shadow_and_manifest_tools(identity):
     """Canary: fourteen tools is intentional: six protocol tools, the R13 manifest tool, and seven shadow tools."""
     assert len(_advertised_tool_names()) == 14
+
+
+def test_every_exposed_tool_has_visibility_category():
+    assert set(TOOL_CATEGORIES) == set(EXPOSED_TOOLS)
+
+
+def test_exposed_tool_handlers_are_instrumented(identity):
+    mcp = build_server()
+    tools = asyncio.run(mcp.list_tools())
+
+    for tool in tools:
+        assert (
+            getattr(tool.fn, "__anyteam_instrumented_category__", None)
+            == TOOL_CATEGORIES[tool.name]
+        )
 
 
 def test_identity_required_at_build_time(monkeypatch):
@@ -303,6 +324,56 @@ def test_mcp_anyteam_shell_exists_and_produces_output(identity):
 
     assert result == {"stdout": "shell-ok", "stderr": "", "exit_code": 0}
 
+
+def test_mcp_anyteam_shell_emits_started_and_completed_events(identity):
+    result = _call_tool("mcp_anyteam_shell", {"command": "printf shell-ok"})
+
+    assert result["exit_code"] == 0
+    events = pio.read_visibility_events("claude-anyteam", "contract-test")
+    assert [e.kind for e in events] == ["tool_event", "tool_event"]
+    assert [e.payload["phase"] for e in events] == ["started", "completed"]
+    assert [e.payload["tool_name"] for e in events] == [
+        "mcp_anyteam_shell",
+        "mcp_anyteam_shell",
+    ]
+    assert all(e.payload["category"] == "shadow_tool" for e in events)
+    assert events[0].payload["target"] == "printf shell-ok"
+    assert events[1].payload["status"] == "success"
+    assert events[1].payload["exit_code"] == 0
+    assert all(e.visibility.stderr and e.visibility.event_log for e in events)
+    assert not any(e.visibility.mailbox for e in events)
+
+
+def test_mcp_anyteam_shell_failure_emits_failed_event_and_visibility_degraded_mailbox(
+    identity,
+):
+    result = _call_tool(
+        "mcp_anyteam_shell",
+        {"command": "sh -c 'echo shell-bad >&2; exit 7'"},
+    )
+
+    assert result["exit_code"] == 7
+    events = pio.read_visibility_events("claude-anyteam", "contract-test")
+    tool_events = [e for e in events if e.kind == "tool_event"]
+    assert [e.payload["phase"] for e in tool_events] == ["started", "failed"]
+    failed = tool_events[-1]
+    assert failed.payload["tool_name"] == "mcp_anyteam_shell"
+    assert failed.payload["status"] == "error"
+    assert failed.payload["exit_code"] == 7
+    assert "shell-bad" in failed.payload["stderr_preview"]
+
+    degraded_events = [e for e in events if e.kind == "visibility_degraded"]
+    assert len(degraded_events) == 1
+    assert degraded_events[0].payload["tool_name"] == "mcp_anyteam_shell"
+    assert degraded_events[0].payload["failed_event_id"] == failed.event_id
+
+    inbox = identity / "claude-anyteam" / "inboxes" / "team-lead.json"
+    raw = json.loads(inbox.read_text(encoding="utf-8"))
+    assert len(raw) == 1
+    assert raw[0]["messageKind"] == "visibility_degraded"
+    body = json.loads(raw[0]["text"])
+    assert body["kind"] == "visibility_degraded"
+    assert body["payload"]["tool_name"] == "mcp_anyteam_shell"
 
 
 

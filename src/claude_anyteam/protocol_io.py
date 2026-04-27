@@ -287,6 +287,21 @@ def append_visibility_event(
     return envelope
 
 
+def append_event(
+    team: str,
+    agent: str,
+    event: VisibilityEvent | dict[str, Any],
+) -> VisibilityEvent:
+    """Compatibility alias for the R16/R18 roadmap name.
+
+    The implementation originally landed as ``append_visibility_event``; the
+    protocol-rev docs and later work items refer to the same helper as
+    ``append_event``. Keep both spellings wired to one append-only substrate.
+    """
+
+    return append_visibility_event(team, agent, event)
+
+
 def read_visibility_events(
     team: str,
     agent: str,

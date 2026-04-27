@@ -29,18 +29,23 @@ Legacy `CODEX_TEAMMATE_*` identity vars are still honored as fallbacks during th
 from __future__ import annotations
 
 import fnmatch
+import functools
+import inspect
 import logging
 import os
 import re
 import subprocess
 import sys
+import time
 import urllib.error
 import urllib.request
 from pathlib import Path
-from typing import Any, Literal
+from typing import Any, Callable, Literal, TypeVar, cast
 
 from .capability_manifest import CapabilityManifestCache
 from .env import LEGACY_NAME_ENV, LEGACY_TEAM_ENV, NAME_ENV, TEAM_ENV, env_first
+from .messages import VisibilityEvent
+from . import protocol_io
 from claude_teams import messaging as _cs_messaging  # type: ignore[import-untyped]
 from claude_teams import tasks as _cs_tasks  # type: ignore[import-untyped]
 from claude_teams import teams as _cs_teams  # type: ignore[import-untyped]
@@ -81,6 +86,39 @@ BLOCKED_TOOLS: tuple[str, ...] = (
     "process_shutdown_approved",
     "check_teammate",
 )
+
+ToolCategory = Literal["team_tool", "shadow_tool"]
+
+TEAM_TOOLS: frozenset[str] = frozenset(
+    {
+        "send_message",
+        "task_update",
+        "task_create",
+        "read_inbox",
+        "task_list",
+        "read_config",
+        "mcp_anyteam_capability_manifest",
+    }
+)
+
+SHADOW_TOOLS: frozenset[str] = frozenset(
+    {
+        "mcp_anyteam_shell",
+        "mcp_anyteam_read_file",
+        "mcp_anyteam_write_file",
+        "mcp_anyteam_edit_file",
+        "mcp_anyteam_list_directory",
+        "mcp_anyteam_search",
+        "mcp_anyteam_web_fetch",
+    }
+)
+
+TOOL_CATEGORIES: dict[str, ToolCategory] = {
+    **{name: "team_tool" for name in TEAM_TOOLS},
+    **{name: "shadow_tool" for name in SHADOW_TOOLS},
+}
+
+_F = TypeVar("_F", bound=Callable[..., Any])
 
 
 def _identity(argv: list[str] | None = None) -> tuple[str, str]:
@@ -159,6 +197,118 @@ def _entry_for(path: Path, *, base: Path | None = None) -> dict[str, Any]:
     }
 
 
+def _preview(value: Any, *, limit: int = 600) -> str | None:
+    if value is None:
+        return None
+    text = str(value)
+    if len(text) <= limit:
+        return text
+    return text[: limit - 1] + "…"
+
+
+def _tool_target(tool_name: str, bound_args: dict[str, Any]) -> str | None:
+    """Return a concise, non-secret-ish target label for visibility events."""
+
+    if tool_name == "send_message":
+        return f"to={bound_args.get('to')!r}"
+    if tool_name == "task_update":
+        return f"task_id={bound_args.get('task_id')!r}"
+    if tool_name == "task_create":
+        return _preview(bound_args.get("subject"), limit=160)
+    if tool_name == "mcp_anyteam_capability_manifest":
+        target = f"agent_name={bound_args.get('agent_name')!r}"
+        if bound_args.get("capability") is not None:
+            target += f" capability={bound_args.get('capability')!r}"
+        return target
+    if tool_name == "mcp_anyteam_shell":
+        return _preview(bound_args.get("command"), limit=240)
+    if tool_name in {
+        "mcp_anyteam_read_file",
+        "mcp_anyteam_write_file",
+        "mcp_anyteam_edit_file",
+        "mcp_anyteam_list_directory",
+    }:
+        return str(bound_args.get("path"))
+    if tool_name == "mcp_anyteam_search":
+        return (
+            f"pattern={_preview(bound_args.get('pattern'), limit=120)!r} "
+            f"path={bound_args.get('path', '.')!r}"
+        )
+    if tool_name == "mcp_anyteam_web_fetch":
+        return str(bound_args.get("url"))
+    return None
+
+
+def _bind_tool_arguments(
+    signature: inspect.Signature,
+    args: tuple[Any, ...],
+    kwargs: dict[str, Any],
+) -> dict[str, Any]:
+    try:
+        bound = signature.bind_partial(*args, **kwargs)
+        bound.apply_defaults()
+        return dict(bound.arguments)
+    except TypeError:
+        # Instrumentation is observational; never fail a tool because we
+        # couldn't build the human-readable target string.
+        return dict(kwargs)
+
+
+def _result_exit_code(result: Any) -> int | None:
+    if isinstance(result, dict):
+        exit_code = result.get("exit_code")
+        if isinstance(exit_code, int):
+            return exit_code
+    return None
+
+
+def _result_indicates_failure(tool_name: str, result: Any) -> bool:
+    # The shell wrapper intentionally returns stdout/stderr/exit_code for the
+    # backend to inspect instead of raising on non-zero exit. R18 still treats
+    # that as a failed wrapper-tool invocation for lead visibility.
+    exit_code = _result_exit_code(result)
+    return tool_name == "mcp_anyteam_shell" and exit_code not in (None, 0)
+
+
+def _tool_result_payload(result: Any) -> dict[str, Any]:
+    payload: dict[str, Any] = {}
+    exit_code = _result_exit_code(result)
+    if exit_code is not None:
+        payload["exit_code"] = exit_code
+    if isinstance(result, dict):
+        for source_key, payload_key in (
+            ("stdout", "stdout_preview"),
+            ("stderr", "stderr_preview"),
+            ("content", "content_preview"),
+            ("bytes", "bytes_read"),
+            ("bytes_written", "bytes_written"),
+            ("chars_written", "chars_written"),
+            ("replacements", "replacements"),
+            ("status", "http_status"),
+        ):
+            value = result.get(source_key)
+            if value not in (None, ""):
+                payload[payload_key] = (
+                    _preview(value) if payload_key.endswith("_preview") else value
+                )
+    return payload
+
+
+def _exception_payload(exc: BaseException) -> dict[str, Any]:
+    payload: dict[str, Any] = {
+        "error_class": exc.__class__.__name__,
+        "error": _preview(str(exc), limit=600) or exc.__class__.__name__,
+    }
+    if isinstance(exc, subprocess.TimeoutExpired):
+        payload["timeout_s"] = exc.timeout
+        payload["target"] = _preview(exc.cmd, limit=240)
+        if exc.stdout not in (None, b"", ""):
+            payload["stdout_preview"] = _preview(exc.stdout)
+        if exc.stderr not in (None, b"", ""):
+            payload["stderr_preview"] = _preview(exc.stderr)
+    return payload
+
+
 def build_server(argv: list[str] | None = None) -> FastMCP:
     """Construct the FastMCP app with the narrowed tools."""
     team, self_name = _identity(argv)
@@ -184,7 +334,218 @@ def build_server(argv: list[str] | None = None) -> FastMCP:
     )
     manifest_cache.load_startup()
 
+    visibility_seq = 0
+    wrapper_turn_id = f"wrapper-{os.getpid()}"
+
+    def _fanout_visibility_event(
+        event: VisibilityEvent,
+        *,
+        mailbox: bool = False,
+    ) -> None:
+        """Emit one visibility envelope to stderr/event-log and maybe mailbox.
+
+        The tool body is the user's requested action; visibility fan-out should
+        not make an otherwise-successful wrapper tool fail. Validation errors
+        happen before this helper constructs ``event``; storage/send failures
+        are logged to stderr and swallowed.
+        """
+
+        line = event.model_dump_json(by_alias=True, exclude_none=True)
+        print(line, file=sys.stderr, flush=True)
+        try:
+            protocol_io.append_event(team, self_name, event)
+        except Exception as e:  # pragma: no cover - defensive logging path
+            logger.warning("wrapper visibility event append failed: %s", e)
+        if mailbox:
+            try:
+                protocol_io.send_visibility_event_to_lead(
+                    team,
+                    self_name,
+                    event,
+                    summary=event.summary[:120],
+                )
+            except Exception as e:  # pragma: no cover - defensive logging path
+                logger.warning("wrapper visibility mailbox fan-out failed: %s", e)
+
+    def _make_event(
+        *,
+        kind: str,
+        severity: str,
+        summary: str,
+        payload: dict[str, Any],
+        mailbox: bool = False,
+    ) -> VisibilityEvent:
+        nonlocal visibility_seq
+        visibility_seq += 1
+        return VisibilityEvent.model_validate(
+            {
+                "kind": kind,
+                "event_id": f"{self_name}:{wrapper_turn_id}:{visibility_seq:06d}",
+                "team": team,
+                "agent": self_name,
+                "backend": "wrapper_mcp",
+                "turn_id": wrapper_turn_id,
+                "seq": visibility_seq,
+                "severity": severity,
+                "summary": summary[:200],
+                "visibility": {
+                    "mailbox": mailbox,
+                    "task_state": False,
+                    "event_log": True,
+                    "stderr": True,
+                },
+                "payload": payload,
+            }
+        )
+
+    def _emit_tool_event(
+        *,
+        tool_name: str,
+        category: ToolCategory,
+        phase: Literal["started", "completed", "failed"],
+        target: str | None,
+        started_at: float | None = None,
+        result: Any = None,
+        exc: BaseException | None = None,
+    ) -> VisibilityEvent:
+        payload: dict[str, Any] = {
+            "category": category,
+            "tool_name": tool_name,
+            "phase": phase,
+            "raw_backend_type": tool_name,
+        }
+        if target:
+            payload["target"] = target
+        if started_at is not None:
+            payload["duration_ms"] = max(0, int((time.monotonic() - started_at) * 1000))
+        if phase == "started":
+            summary = f"{tool_name} started"
+            severity = "info"
+        elif phase == "completed":
+            payload["status"] = "success"
+            payload.update(_tool_result_payload(result))
+            summary = f"{tool_name} completed"
+            severity = "info"
+        else:
+            payload["status"] = "error"
+            if exc is not None:
+                payload.update(_exception_payload(exc))
+            else:
+                payload.update(_tool_result_payload(result))
+            summary = f"{tool_name} failed"
+            severity = "error"
+        event = _make_event(
+            kind="tool_event",
+            severity=severity,
+            summary=summary,
+            payload=payload,
+        )
+        _fanout_visibility_event(event)
+        return event
+
+    def _emit_visibility_degraded(
+        *,
+        tool_name: str,
+        category: ToolCategory,
+        reason: str,
+        failed_event_id: str,
+    ) -> VisibilityEvent:
+        event = _make_event(
+            kind="visibility_degraded",
+            severity="warn",
+            summary=f"wrapper tool failed: {tool_name}",
+            mailbox=True,
+            payload={
+                "surface": "wrapper_tool",
+                "tool_name": tool_name,
+                "category": category,
+                "reason": reason,
+                "impact": "The lead can audit the failed wrapper tool call in the event log.",
+                "suggested_fix": (
+                    "Inspect the failed tool_event payload and retry or steer "
+                    "the teammate if needed."
+                ),
+                "failed_event_id": failed_event_id,
+            },
+        )
+        _fanout_visibility_event(event, mailbox=True)
+        return event
+
+    def instrumented_tool(category: ToolCategory) -> Callable[[_F], _F]:
+        def decorate(func: _F) -> _F:
+            tool_name = func.__name__
+            signature = inspect.signature(func)
+
+            @functools.wraps(func)
+            def wrapper(*args: Any, **kwargs: Any) -> Any:
+                bound_args = _bind_tool_arguments(signature, args, kwargs)
+                target = _tool_target(tool_name, bound_args)
+                started_at = time.monotonic()
+                _emit_tool_event(
+                    tool_name=tool_name,
+                    category=category,
+                    phase="started",
+                    target=target,
+                )
+                try:
+                    result = func(*args, **kwargs)
+                except Exception as exc:
+                    failed = _emit_tool_event(
+                        tool_name=tool_name,
+                        category=category,
+                        phase="failed",
+                        target=target,
+                        started_at=started_at,
+                        exc=exc,
+                    )
+                    _emit_visibility_degraded(
+                        tool_name=tool_name,
+                        category=category,
+                        reason=_preview(str(exc), limit=600) or exc.__class__.__name__,
+                        failed_event_id=failed.event_id,
+                    )
+                    raise
+
+                if _result_indicates_failure(tool_name, result):
+                    failed = _emit_tool_event(
+                        tool_name=tool_name,
+                        category=category,
+                        phase="failed",
+                        target=target,
+                        started_at=started_at,
+                        result=result,
+                    )
+                    exit_code = _result_exit_code(result)
+                    reason = (
+                        f"{tool_name} exited with code {exit_code}"
+                        if exit_code is not None
+                        else f"{tool_name} returned an error result"
+                    )
+                    _emit_visibility_degraded(
+                        tool_name=tool_name,
+                        category=category,
+                        reason=reason,
+                        failed_event_id=failed.event_id,
+                    )
+                    return result
+
+                _emit_tool_event(
+                    tool_name=tool_name,
+                    category=category,
+                    phase="completed",
+                    target=target,
+                    started_at=started_at,
+                    result=result,
+                )
+                return result
+
+            setattr(wrapper, "__anyteam_instrumented_category__", category)
+            return cast(_F, wrapper)
+
+        return decorate
+
     @mcp.tool
+    @instrumented_tool(category="team_tool")
     def mcp_anyteam_capability_manifest(
         agent_name: str,
         capability: str | None = None,
@@ -244,6 +605,7 @@ def build_server(argv: list[str] | None = None) -> FastMCP:
         return entry
 
     @mcp.tool
+    @instrumented_tool(category="team_tool")
     def send_message(
         to: str,
         body: str,
@@ -311,6 +673,7 @@ def build_server(argv: list[str] | None = None) -> FastMCP:
         return {"delivered_to": to, "sender": self_name}
 
     @mcp.tool
+    @instrumented_tool(category="team_tool")
     def task_update(
         task_id: str,
         active_form: str | None = None,
@@ -362,6 +725,7 @@ def build_server(argv: list[str] | None = None) -> FastMCP:
         }
 
     @mcp.tool
+    @instrumented_tool(category="team_tool")
     def task_create(subject: str, description: str) -> dict:
         """Create a new task in your team. Use when work you discovered
         during a task should be split off rather than bundled into the
@@ -383,6 +747,7 @@ def build_server(argv: list[str] | None = None) -> FastMCP:
         return {"id": t.id, "status": t.status, "subject": t.subject}
 
     @mcp.tool
+    @instrumented_tool(category="team_tool")
     def read_inbox(unread_only: bool = True) -> list[dict]:
         """Read your own inbox. Useful if you want to see whether a
         teammate replied to a clarifying question you sent.
@@ -402,6 +767,7 @@ def build_server(argv: list[str] | None = None) -> FastMCP:
         return [m.model_dump(by_alias=True, exclude_none=True) for m in msgs]
 
     @mcp.tool
+    @instrumented_tool(category="team_tool")
     def task_list() -> list[dict]:
         """List all tasks in your team with current status and owners."""
         try:
@@ -411,6 +777,7 @@ def build_server(argv: list[str] | None = None) -> FastMCP:
         return [t.model_dump(by_alias=True, exclude_none=True) for t in result]
 
     @mcp.tool
+    @instrumented_tool(category="shadow_tool")
     def mcp_anyteam_shell(
         command: str,
         cwd: str | None = None,
@@ -443,6 +810,7 @@ def build_server(argv: list[str] | None = None) -> FastMCP:
 
 
     @mcp.tool
+    @instrumented_tool(category="shadow_tool")
     def mcp_anyteam_read_file(path: str, offset: int = 0, limit: int | None = None) -> dict:
         """Read a local file as text with safe decoding fallback.
 
@@ -475,6 +843,7 @@ def build_server(argv: list[str] | None = None) -> FastMCP:
         }
 
     @mcp.tool
+    @instrumented_tool(category="shadow_tool")
     def mcp_anyteam_write_file(
         path: str,
         content: str,
@@ -509,6 +878,7 @@ def build_server(argv: list[str] | None = None) -> FastMCP:
         }
 
     @mcp.tool
+    @instrumented_tool(category="shadow_tool")
     def mcp_anyteam_list_directory(path: str, recursive: bool = False, glob: str | None = None) -> dict:
         """List directory entries with optional recursion and glob filtering.
 
@@ -536,6 +906,7 @@ def build_server(argv: list[str] | None = None) -> FastMCP:
         return {"path": str(root), "recursive": recursive, "glob": glob, "entries": entries}
 
     @mcp.tool
+    @instrumented_tool(category="shadow_tool")
     def mcp_anyteam_edit_file(path: str, old: str, new: str, replace_all: bool = False) -> dict:
         """Replace an exact string in a text file and return the replacement count.
 
@@ -564,6 +935,7 @@ def build_server(argv: list[str] | None = None) -> FastMCP:
         return {"path": str(file_path), "replacements": count if replace_all else 1, "encoding_read": encoding}
 
     @mcp.tool
+    @instrumented_tool(category="shadow_tool")
     def mcp_anyteam_search(
         pattern: str,
         path: str = ".",
@@ -606,6 +978,7 @@ def build_server(argv: list[str] | None = None) -> FastMCP:
         return {"pattern": pattern, "path": str(root), "regex": regex, "glob": glob, "matches": matches}
 
     @mcp.tool
+    @instrumented_tool(category="shadow_tool")
     def mcp_anyteam_web_fetch(
         url: str,
         method: str = "GET",
@@ -649,6 +1022,7 @@ def build_server(argv: list[str] | None = None) -> FastMCP:
             raise ToolError(str(e))
 
     @mcp.tool
+    @instrumented_tool(category="team_tool")
     def read_config() -> dict:
         """Read the team config — useful to discover teammate names and
         roles before sending messages. Member `prompt` fields are
