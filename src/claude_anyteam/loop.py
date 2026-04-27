@@ -294,6 +294,8 @@ def _handle_prose(state: LoopState, msg: Any) -> None:
                 model=s.model,
                 effort=s.effort,
                 overall_timeout_s=s.turn_timeout_s,
+                non_progress_warn_s=s.non_progress_warn_s,
+                non_progress_interrupt_s=s.non_progress_interrupt_s,
                 # No resume_thread_id — ephemeral, not chained to task lineage.
             )
         else:
@@ -970,10 +972,17 @@ def _execute_task_app_server(state: LoopState, task, prompt: str):
             )
         if task_state_requested:
             try:
+                active_form = event.summary[:120]
+                if (
+                    getattr(event, "kind", None) == "turn_progress"
+                    and payload.get("risk") == "timeout_possible"
+                    and payload.get("action_taken") == "turn_steer_sent"
+                ):
+                    active_form = f"running codex: {event.summary}"[:120]
                 pio.update_task(
                     s.team_name,
                     task.id,
-                    active_form=event.summary[:120],
+                    active_form=active_form,
                     metadata={
                         "visibility": {
                             "last_event_id": event.event_id,
@@ -1018,6 +1027,8 @@ def _execute_task_app_server(state: LoopState, task, prompt: str):
         model=s.model,
         effort=s.effort,
         overall_timeout_s=s.turn_timeout_s,
+        non_progress_warn_s=s.non_progress_warn_s,
+        non_progress_interrupt_s=s.non_progress_interrupt_s,
         resume_thread_id=state.app_server_last_thread_id,
         task_id=str(task.id),
         event_sink=_visibility_event_sink,

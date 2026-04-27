@@ -2,7 +2,7 @@
 
 Three subcommands of ``claude-anyteam``:
 
-  * ``team-agent``  — write per-teammate ``model``/``effort`` overrides at
+  * ``team-agent``  — write per-teammate ``model``/``effort``/watchdog overrides at
                       ``~/.claude/teams/<team>/agents/<agent>.json``. The spawn
                       shim reads this file and forwards the values to the
                       routed adapter (Codex, Gemini, Kimi).
@@ -42,7 +42,13 @@ EFFORT_CHOICES = ("minimal", "low", "medium", "high", "xhigh")
 
 # Whitelisted keys mirror spawn_shim._AGENT_CONFIG_KEYS; expanding this set
 # requires extending the shim too.
-AGENT_CONFIG_KEYS = ("model", "effort", "turn_timeout_s")
+AGENT_CONFIG_KEYS = (
+    "model",
+    "effort",
+    "turn_timeout_s",
+    "non_progress_warn_s",
+    "non_progress_interrupt_s",
+)
 
 # Default post-spawn agentType for codex-/gemini-/kimi- teammates. The Agent
 # tool spawns them with ``agentType="general-purpose"``, which fails wrapper
@@ -110,12 +116,15 @@ def _build_team_agent_parser() -> argparse.ArgumentParser:
         description=(
             "Write or update a per-teammate config file at "
             "~/.claude/teams/<team>/agents/<agent>.json. The spawn shim reads "
-            "this file and forwards --model/--effort to the routed adapter."
+            "this file and forwards model/effort/watchdog overrides to the "
+            "routed adapter."
         ),
         formatter_class=argparse.RawDescriptionHelpFormatter,
         epilog=(
             "Examples:\n"
             "  claude-anyteam team-agent codex-alice --team build --model gpt-5.5 --effort xhigh\n"
+            "  claude-anyteam team-agent codex-alice --team build --non-progress-warn-s 300 \\\n"
+            "    --non-progress-interrupt-s 420\n"
             "  claude-anyteam team-agent gemini-bob  --team build --model gemini-3.1-pro-preview --effort high\n"
             "  claude-anyteam team-agent kimi-cara   --team build --model kimi-for-coding\n"
             "  claude-anyteam team-agent codex-alice --team build --remove\n"
@@ -139,7 +148,24 @@ def _build_team_agent_parser() -> argparse.ArgumentParser:
             "Range [60, 3600], default 900. Forwarded to the adapter as "
             "--turn-timeout-s. Useful for teammates that run long pytest "
             "or build invocations; tighten for short-loop executor roles. "
-            "Codex-only today; v0.7.0 will unify across backends."
+            "Codex App Server-only today."
+        ),
+    )
+    p.add_argument(
+        "--non-progress-warn-s",
+        type=float,
+        help=(
+            "Codex App Server soft non-progress watchdog threshold in seconds. "
+            "Range [60, 900], default 300. Forwarded to the adapter as "
+            "--non-progress-warn-s."
+        ),
+    )
+    p.add_argument(
+        "--non-progress-interrupt-s",
+        type=float,
+        help=(
+            "Codex App Server opt-in hard non-progress interrupt threshold in "
+            "seconds. Range [60, 3600] when set; omitted by default."
         ),
     )
     p.add_argument(
@@ -175,15 +201,39 @@ def _team_agent_command(argv: list[str], *, stdout: TextIO | None = None, stderr
             err.write(f"failed to remove {path}: {exc}\n")
             return 1
 
-    if args.model is None and args.effort is None and args.turn_timeout_s is None:
+    if (
+        args.model is None
+        and args.effort is None
+        and args.turn_timeout_s is None
+        and args.non_progress_warn_s is None
+        and args.non_progress_interrupt_s is None
+    ):
         err.write(
-            "error: at least one of --model/--effort/--turn-timeout-s must be provided (or use --remove to delete)\n"
+            "error: at least one of --model/--effort/--turn-timeout-s/"
+            "--non-progress-warn-s/--non-progress-interrupt-s must be provided "
+            "(or use --remove to delete)\n"
         )
         return 2
 
     if args.turn_timeout_s is not None and not (60.0 <= args.turn_timeout_s <= 3600.0):
         err.write(
             f"error: --turn-timeout-s must be in [60, 3600] seconds, got {args.turn_timeout_s}\n"
+        )
+        return 2
+    if args.non_progress_warn_s is not None and not (
+        60.0 <= args.non_progress_warn_s <= 900.0
+    ):
+        err.write(
+            "error: --non-progress-warn-s must be in [60, 900] seconds, "
+            f"got {args.non_progress_warn_s}\n"
+        )
+        return 2
+    if args.non_progress_interrupt_s is not None and not (
+        60.0 <= args.non_progress_interrupt_s <= 3600.0
+    ):
+        err.write(
+            "error: --non-progress-interrupt-s must be in [60, 3600] seconds, "
+            f"got {args.non_progress_interrupt_s}\n"
         )
         return 2
 
@@ -196,6 +246,10 @@ def _team_agent_command(argv: list[str], *, stdout: TextIO | None = None, stderr
         config["effort"] = args.effort
     if args.turn_timeout_s is not None:
         config["turn_timeout_s"] = args.turn_timeout_s
+    if args.non_progress_warn_s is not None:
+        config["non_progress_warn_s"] = args.non_progress_warn_s
+    if args.non_progress_interrupt_s is not None:
+        config["non_progress_interrupt_s"] = args.non_progress_interrupt_s
 
     _write_atomic_json(path, config)
 
@@ -343,6 +397,8 @@ class _RosterRow:
     adapter_model: str | None = None
     adapter_effort: str | None = None
     adapter_turn_timeout_s: float | None = None
+    adapter_non_progress_warn_s: float | None = None
+    adapter_non_progress_interrupt_s: float | None = None
     config_source: str | None = None
     # 09 R11 / 08 §6.3 cheap capability flags; rich Agent Card
     # manifests are intentionally not expanded in the roster table.
@@ -394,6 +450,8 @@ def _roster_rows(cfg: dict[str, object], *, team: str | None = None, resolve: bo
         adapter_model: str | None = None
         adapter_effort: str | None = None
         adapter_turn_timeout_s: float | None = None
+        adapter_non_progress_warn_s: float | None = None
+        adapter_non_progress_interrupt_s: float | None = None
         config_source: str | None = None
         if resolve and team is not None:
             agent_cfg, source = _read_agent_config(team, name)
@@ -405,6 +463,18 @@ def _roster_rows(cfg: dict[str, object], *, team: str | None = None, resolve: bo
                     adapter_turn_timeout_s = float(tt)
                 except (TypeError, ValueError):
                     adapter_turn_timeout_s = None
+            npw = agent_cfg.get("non_progress_warn_s")
+            if npw is not None:
+                try:
+                    adapter_non_progress_warn_s = float(npw)
+                except (TypeError, ValueError):
+                    adapter_non_progress_warn_s = None
+            npi = agent_cfg.get("non_progress_interrupt_s")
+            if npi is not None:
+                try:
+                    adapter_non_progress_interrupt_s = float(npi)
+                except (TypeError, ValueError):
+                    adapter_non_progress_interrupt_s = None
             config_source = source
         raw_capabilities = m.get("capabilities", [])
         capabilities = (
@@ -423,6 +493,8 @@ def _roster_rows(cfg: dict[str, object], *, team: str | None = None, resolve: bo
                 adapter_model=adapter_model,
                 adapter_effort=adapter_effort,
                 adapter_turn_timeout_s=adapter_turn_timeout_s,
+                adapter_non_progress_warn_s=adapter_non_progress_warn_s,
+                adapter_non_progress_interrupt_s=adapter_non_progress_interrupt_s,
                 config_source=config_source,
                 capabilities=capabilities,
                 tmux_pane_id=str(m.get("tmuxPaneId", "")),
@@ -537,7 +609,13 @@ def _team_roster_command(argv: list[str], *, stdout: TextIO | None = None, stder
         # can confirm a team-agent write actually took effect. Silent when
         # no per-teammate config exists — defaults apply, no noise.
         adapter_suffix = ""
-        if r.adapter_model or r.adapter_effort or r.adapter_turn_timeout_s is not None:
+        if (
+            r.adapter_model
+            or r.adapter_effort
+            or r.adapter_turn_timeout_s is not None
+            or r.adapter_non_progress_warn_s is not None
+            or r.adapter_non_progress_interrupt_s is not None
+        ):
             parts = []
             if r.adapter_model:
                 parts.append(f"adapter_model={r.adapter_model}")
@@ -545,6 +623,15 @@ def _team_roster_command(argv: list[str], *, stdout: TextIO | None = None, stder
                 parts.append(f"adapter_effort={r.adapter_effort}")
             if r.adapter_turn_timeout_s is not None:
                 parts.append(f"adapter_turn_timeout_s={r.adapter_turn_timeout_s}")
+            if r.adapter_non_progress_warn_s is not None:
+                parts.append(
+                    f"adapter_non_progress_warn_s={r.adapter_non_progress_warn_s}"
+                )
+            if r.adapter_non_progress_interrupt_s is not None:
+                parts.append(
+                    "adapter_non_progress_interrupt_s="
+                    f"{r.adapter_non_progress_interrupt_s}"
+                )
             adapter_suffix = "  " + " ".join(parts)
         capabilities_suffix = f"  capabilities={_format_capabilities(r.capabilities)}"
         out.write(
@@ -657,6 +744,8 @@ def _team_config_command(argv: list[str], *, stdout: TextIO | None = None, stder
         "adapter_model": agent_cfg.get("model"),
         "adapter_effort": agent_cfg.get("effort"),
         "adapter_turn_timeout_s": agent_cfg.get("turn_timeout_s"),
+        "adapter_non_progress_warn_s": agent_cfg.get("non_progress_warn_s"),
+        "adapter_non_progress_interrupt_s": agent_cfg.get("non_progress_interrupt_s"),
         "config_source": source,
     }
 
@@ -670,7 +759,15 @@ def _team_config_command(argv: list[str], *, stdout: TextIO | None = None, stder
     if source is None:
         out.write("adapter: <no per-teammate config; defaults apply>\n")
     else:
-        out.write(f"adapter: model={resolved['adapter_model']!r} effort={resolved['adapter_effort']!r} turn_timeout_s={resolved['adapter_turn_timeout_s']!r}\n")
+        out.write(
+            "adapter: "
+            f"model={resolved['adapter_model']!r} "
+            f"effort={resolved['adapter_effort']!r} "
+            f"turn_timeout_s={resolved['adapter_turn_timeout_s']!r} "
+            f"non_progress_warn_s={resolved['adapter_non_progress_warn_s']!r} "
+            "non_progress_interrupt_s="
+            f"{resolved['adapter_non_progress_interrupt_s']!r}\n"
+        )
         out.write(f"source : {source}\n")
     return 0
 

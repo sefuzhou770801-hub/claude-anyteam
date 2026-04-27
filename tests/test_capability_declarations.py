@@ -38,14 +38,19 @@ def test_codex_app_server_backend_metadata_declares_expected_capabilities(tmp_pa
 
     assert metadata.capabilities == CODEX_APP_SERVER_CAPABILITIES
     assert "accepts_peer_steer" not in metadata.capabilities
+    assert "soft_non_progress_watchdog" in metadata.capabilities
     assert metadata.capability_manifest["turn_steer"]["authorization"] == "lead_only"
     assert metadata.capability_manifest["turn_steer"]["callable_from_peers"] is False
+    watchdog = metadata.capability_manifest["soft_non_progress_watchdog"]
+    assert watchdog["callable_from_peers"] is False
+    assert watchdog["schema"]["properties"]["non_progress_warn_s"]["default"] == 300
 
 
 def test_codex_exec_backend_metadata_declares_structured_output_only(tmp_path: Path):
     metadata = codex_loop._backend_metadata(_codex_settings(tmp_path, app_server=False))
 
     assert metadata.capabilities == CODEX_EXEC_CAPABILITIES
+    assert "soft_non_progress_watchdog" not in metadata.capabilities
 
 
 def test_gemini_acp_backend_metadata_accepts_peer_steer(tmp_path: Path):
@@ -63,6 +68,7 @@ def test_gemini_acp_backend_metadata_accepts_peer_steer(tmp_path: Path):
 
     assert metadata.capabilities == GEMINI_ACP_CAPABILITIES
     assert "accepts_peer_steer" in metadata.capabilities
+    assert "soft_non_progress_watchdog" not in metadata.capabilities
 
 
 def test_gemini_headless_backend_metadata_declares_no_capabilities(tmp_path: Path):
@@ -79,6 +85,7 @@ def test_gemini_headless_backend_metadata_declares_no_capabilities(tmp_path: Pat
     metadata = gemini_loop._backend_metadata(settings)
 
     assert metadata.capabilities == GEMINI_HEADLESS_CAPABILITIES == []
+    assert "soft_non_progress_watchdog" not in metadata.capabilities
 
 
 def test_kimi_headless_backend_metadata_declares_large_context_and_swarm(tmp_path: Path):
@@ -95,6 +102,7 @@ def test_kimi_headless_backend_metadata_declares_large_context_and_swarm(tmp_pat
 
     assert metadata.capabilities == KIMI_HEADLESS_CAPABILITIES
     assert metadata.capabilities == ["large_context", "native_swarm"]
+    assert "soft_non_progress_watchdog" not in metadata.capabilities
 
 
 def test_capability_taxonomy_rejects_unknown_flags():

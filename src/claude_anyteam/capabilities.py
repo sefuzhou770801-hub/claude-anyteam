@@ -21,6 +21,7 @@ CAPABILITY_NAMES = frozenset(
         "large_context",
         "accepts_peer_steer",
         "native_swarm",
+        "soft_non_progress_watchdog",
     }
 )
 
@@ -30,6 +31,7 @@ CODEX_APP_SERVER_CAPABILITIES = [
     "thread_fork",
     "live_tool_events",
     "structured_output",
+    "soft_non_progress_watchdog",
     # Q4 (per opus-arch-impl): Codex App Server is deliberately lead-only
     # for peer steer until the handler and runtime behavior are re-reviewed.
 ]
@@ -62,6 +64,7 @@ _CAPABILITY_DISPLAY_NAMES = {
     "large_context": "large context (`large_context`)",
     "accepts_peer_steer": "peer steer acceptance (`accepts_peer_steer`)",
     "native_swarm": "native swarm (`native_swarm`)",
+    "soft_non_progress_watchdog": "soft non-progress watchdog (`soft_non_progress_watchdog`)",
 }
 
 _BASE_CAPABILITY_MANIFEST: dict[str, dict[str, Any]] = {
@@ -186,6 +189,46 @@ _BASE_CAPABILITY_MANIFEST: dict[str, dict[str, Any]] = {
         "when_to_use": "Route broad exploration or parallelizable research to a teammate that can fan out internally.",
         "when_not_to": "Do not assume internal swarm activity is visible as separate team members or mailbox participants.",
         "failure_modes": ["SWARM_UNAVAILABLE", "SUBAGENT_LIMIT_REACHED", "SWARM_OUTPUT_COLLAPSED"],
+        "callable_from_peers": False,
+    },
+    "soft_non_progress_watchdog": {
+        "version": "1",
+        "schema": {
+            "type": "object",
+            "properties": {
+                "non_progress_warn_s": {
+                    "type": "number",
+                    "default": 300,
+                    "minimum": 60,
+                    "maximum": 900,
+                },
+                "non_progress_interrupt_s": {
+                    "type": ["number", "null"],
+                    "default": None,
+                    "minimum": 60,
+                    "maximum": 3600,
+                },
+            },
+        },
+        "description": (
+            "Self-monitor Codex App Server turns and emit a turn_progress warning "
+            "envelope when no visible checkpoint appears for the configured interval."
+        ),
+        "when_to_use": (
+            "Prefer this teammate for long-running Codex App Server tasks where the "
+            "lead needs a durable warning and checkpoint steer rather than waiting "
+            "silently for the wall-clock timeout."
+        ),
+        "when_not_to": (
+            "Not directly callable by peers, and not declared by Codex exec, "
+            "Gemini, or Kimi; those backends lack the same App Server polling "
+            "signal and should not pretend to support it."
+        ),
+        "failure_modes": [
+            "WATCHDOG_WARNING_SENT",
+            "WATCHDOG_STEER_FAILED",
+            "WATCHDOG_INTERRUPT_SENT",
+        ],
         "callable_from_peers": False,
     },
 }

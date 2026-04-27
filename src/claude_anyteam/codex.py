@@ -951,6 +951,7 @@ def app_server_invoke(
     codex_binary: str = "codex",
     overall_timeout_s: float = 900.0,
     non_progress_warn_s: float = 300.0,
+    non_progress_interrupt_s: float | None = None,
     steer_queue: "_SteerQueue | None" = None,
     mid_turn_hook: "Any | None" = None,
     resume_thread_id: str | None = None,
@@ -1165,6 +1166,7 @@ def app_server_invoke(
                 "prompt_kind": "task_complete" if schema is not None else "prose_reply",
                 "timeout_s": overall_timeout_s,
                 "non_progress_soft_s": non_progress_warn_s,
+                "non_progress_interrupt_s": non_progress_interrupt_s,
                 "cwd": str(cwd),
                 "model": model,
                 "effort": effort,
@@ -1175,20 +1177,24 @@ def app_server_invoke(
         # queued steers. Polling with a short timeout lets us interleave
         # steer injection with notification consumption.
         deadline = time.monotonic() + overall_timeout_s
-        # Soft non-progress watchdog (v0.6.0): if we see no observable
+        # Soft non-progress watchdog (v0.6.0/R20): if we see no observable
         # output for `non_progress_warn_s`, log a warning + send a single
-        # `turn/steer` checkpoint prompt to the model. We do NOT kill the
-        # turn — the wall-clock cap (`overall_timeout_s`) is the only
-        # interrupt. Only warn once per turn so we don't spam the lead or
-        # the model. "Observable output" = an agentMessage delta or a
-        # tool_call_event (post-v0.5.1 substring fix this includes host
-        # commandExecution / fileChange events from Codex App Server).
-        # See bug-triage/B9-visibility-parity-investigation.md §5.
+        # `turn/steer` checkpoint prompt to the model. By default we do NOT
+        # kill the turn — the wall-clock cap (`overall_timeout_s`) remains
+        # the only interrupt. R20 adds an opt-in hard early interrupt via
+        # `non_progress_interrupt_s`; it only fires after the soft watchdog
+        # has fired and no later checkpoint appears. Only warn once per turn
+        # so we don't spam the lead or the model. "Observable output" = an
+        # agentMessage delta or a tool_call_event (post-v0.5.1 substring fix
+        # this includes host commandExecution / fileChange events from Codex
+        # App Server). See bug-triage/B9-visibility-parity-investigation.md §5.
         turn_started_at = time.monotonic()
         last_progress_at = turn_started_at
         last_tool_count = 0
         last_message_len = 0
         non_progress_warned = False
+        non_progress_warned_at: float | None = None
+        non_progress_interrupted = False
         done = False
         while not done and time.monotonic() < deadline:
             # 1. Deliver any pending steers. Non-blocking pop.
@@ -1233,13 +1239,16 @@ def app_server_invoke(
             except Exception:
                 # No notification this iteration — check the soft watchdog.
                 # Triggers at most once per turn; doesn't kill, just warns
-                # the lead and nudges the model.
+                # the lead and nudges the model. The optional hard interrupt
+                # is checked separately below and is disabled by default.
+                now = time.monotonic()
                 if (
                     not non_progress_warned
-                    and (time.monotonic() - last_progress_at) >= non_progress_warn_s
+                    and (now - last_progress_at) >= non_progress_warn_s
                 ):
-                    elapsed_s = time.monotonic() - turn_started_at
-                    non_progress_s = time.monotonic() - last_progress_at
+                    elapsed_s = now - turn_started_at
+                    non_progress_s = now - last_progress_at
+                    warn_threshold_s = int(non_progress_warn_s)
                     logger.warn(
                         "app_server.non_progress",
                         turn_id=current_turn_id,
@@ -1252,7 +1261,7 @@ def app_server_invoke(
                         kind="turn_progress",
                         severity="warn",
                         summary=(
-                            f"no visible checkpoint for {int(non_progress_s)}s; "
+                            f"no visible checkpoint for {warn_threshold_s}s; "
                             "checkpoint steer sent"
                         ),
                         visibility={
@@ -1265,12 +1274,6 @@ def app_server_invoke(
                             "elapsed_s": int(elapsed_s),
                             "timeout_s": overall_timeout_s,
                             "risk": "timeout_possible",
-                            "app_server_events": len(events),
-                            "agent_message_bytes": len(last_message),
-                            "mcp_tool_calls": tool_call_events,
-                            "host_tool_events": tool_call_events,
-                            "artifact_delta_bytes": 0,
-                            "last_checkpoint_at": None,
                             "action_taken": "turn_steer_sent",
                         },
                     )
@@ -1279,13 +1282,13 @@ def app_server_invoke(
                             thread_id=thread_id,
                             expected_turn_id=current_turn_id,
                             text=(
-                                "Checkpoint: you have produced no observable "
-                                "output for several minutes. Summarize current "
-                                "state in a brief assistant message and end the "
-                                "turn now if you don't have a concrete next "
-                                "tool call. Hidden reasoning that doesn't reach "
-                                "a tool call or file edit is not durable across "
-                                "turn boundaries."
+                                "You have produced no externally visible "
+                                f"checkpoint for {warn_threshold_s} seconds. "
+                                "If you have useful findings or partial work, "
+                                "summarize them now and either write a small "
+                                "durable artifact or finish in the requested "
+                                "output format. Do not continue hidden "
+                                "reasoning without a visible checkpoint."
                             ),
                         )
                     except AppServerError as e:
@@ -1295,6 +1298,42 @@ def app_server_invoke(
                             error=str(e),
                         )
                     non_progress_warned = True
+                    non_progress_warned_at = now
+                elif (
+                    non_progress_interrupt_s is not None
+                    and non_progress_warned
+                    and not non_progress_interrupted
+                    and non_progress_warned_at is not None
+                    and last_progress_at <= non_progress_warned_at
+                    and (now - turn_started_at) >= non_progress_interrupt_s
+                ):
+                    elapsed_s = now - turn_started_at
+                    non_progress_interrupted = True
+                    logger.warn(
+                        "app_server.non_progress_interrupt",
+                        turn_id=current_turn_id,
+                        elapsed_s=int(elapsed_s),
+                        non_progress_interrupt_s=non_progress_interrupt_s,
+                    )
+                    try:
+                        client.turn_interrupt(
+                            thread_id=thread_id,
+                            turn_id=current_turn_id,
+                        )
+                    except AppServerError as e:
+                        logger.warn(
+                            "app_server.non_progress_interrupt_failed",
+                            turn_id=current_turn_id,
+                            error=str(e),
+                        )
+                    else:
+                        error = (
+                            "app_server turn interrupted after "
+                            f"{int(elapsed_s)}s with no visible checkpoint"
+                        )
+                        exit_code = 124
+                        done = True
+                        break
                 continue
             _record(notif)
             method = str(notif.get("method", ""))

@@ -22,12 +22,16 @@ from .env import (
     LEGACY_EFFORT_ENV,
     LEGACY_MODEL_ENV,
     LEGACY_NAME_ENV,
+    LEGACY_NON_PROGRESS_INTERRUPT_ENV,
+    LEGACY_NON_PROGRESS_WARN_ENV,
     LEGACY_POLL_ENV,
     LEGACY_PLAN_MODE_ENV,
     LEGACY_TEAM_ENV,
     LEGACY_TURN_TIMEOUT_ENV,
     MODEL_ENV,
     NAME_ENV,
+    NON_PROGRESS_INTERRUPT_ENV,
+    NON_PROGRESS_WARN_ENV,
     POLL_ENV,
     PLAN_MODE_ENV,
     TEAM_ENV,
@@ -73,6 +77,16 @@ class Settings:
     # running long pytest/build invocations can have a higher cap without
     # touching team-wide config. Range [60, 3600] enforced at parse time.
     turn_timeout_s: float = 900.0
+    # Codex App Server-only soft non-progress watchdog. It emits a
+    # turn_progress warning envelope and checkpoint steer after this many
+    # seconds with no App Server-visible progress. Range [60, 900]; default
+    # 300s per B9 §5 / 09 R20.
+    non_progress_warn_s: float = 300.0
+    # Optional Codex App Server-only hard early interrupt threshold. None is
+    # the default and means the watchdog never interrupts before the normal
+    # turn_timeout_s cap. When set, R20 only uses it after the soft watchdog
+    # has fired and no later checkpoint is observed.
+    non_progress_interrupt_s: float | None = None
 
 
 def from_env(overrides: dict[str, object] | None = None) -> Settings:
@@ -147,6 +161,54 @@ def from_env(overrides: dict[str, object] | None = None) -> Settings:
             f"turn_timeout_s must be in [60, 3600] seconds, got {turn_timeout_s}"
         )
 
+    non_progress_warn_raw = _pick(
+        overrides,
+        "non_progress_warn_s",
+        env_first(
+            os.environ,
+            NON_PROGRESS_WARN_ENV,
+            LEGACY_NON_PROGRESS_WARN_ENV,
+            default="300",
+        ),
+    )
+    try:
+        non_progress_warn_s = float(non_progress_warn_raw)
+    except (TypeError, ValueError) as e:
+        raise ValueError(
+            f"non_progress_warn_s must be numeric, got {non_progress_warn_raw!r}"
+        ) from e
+    if not (60.0 <= non_progress_warn_s <= 900.0):
+        raise ValueError(
+            "non_progress_warn_s must be in [60, 900] seconds, "
+            f"got {non_progress_warn_s}"
+        )
+
+    non_progress_interrupt_raw = _pick(
+        overrides,
+        "non_progress_interrupt_s",
+        env_first(
+            os.environ,
+            NON_PROGRESS_INTERRUPT_ENV,
+            LEGACY_NON_PROGRESS_INTERRUPT_ENV,
+        ),
+    )
+    non_progress_interrupt_s: float | None
+    if non_progress_interrupt_raw in (None, ""):
+        non_progress_interrupt_s = None
+    else:
+        try:
+            non_progress_interrupt_s = float(non_progress_interrupt_raw)
+        except (TypeError, ValueError) as e:
+            raise ValueError(
+                "non_progress_interrupt_s must be numeric when set, "
+                f"got {non_progress_interrupt_raw!r}"
+            ) from e
+        if not (60.0 <= non_progress_interrupt_s <= 3600.0):
+            raise ValueError(
+                "non_progress_interrupt_s must be in [60, 3600] seconds when set, "
+                f"got {non_progress_interrupt_s}"
+            )
+
     return Settings(
         team_name=str(team_name),
         agent_name=str(agent_name),
@@ -159,6 +221,8 @@ def from_env(overrides: dict[str, object] | None = None) -> Settings:
         model=model,
         effort=effort,
         turn_timeout_s=turn_timeout_s,
+        non_progress_warn_s=non_progress_warn_s,
+        non_progress_interrupt_s=non_progress_interrupt_s,
     )
 
 

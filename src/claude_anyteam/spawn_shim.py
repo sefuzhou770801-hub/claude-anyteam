@@ -101,7 +101,13 @@ def _resolve_binary(default_name: str, *env_vars: str, fallback_name: str | None
     return shutil.which(default_name) or (shutil.which(fallback_name) if fallback_name else None)
 
 
-_AGENT_CONFIG_KEYS = ("model", "effort", "turn_timeout_s")
+_AGENT_CONFIG_KEYS = (
+    "model",
+    "effort",
+    "turn_timeout_s",
+    "non_progress_warn_s",
+    "non_progress_interrupt_s",
+)
 
 
 def _agent_config_path(team_name: str, agent_name: str) -> str:
@@ -152,9 +158,9 @@ def _load_agent_config(team_name: str | None, agent_name: str | None) -> dict[st
     out: dict[str, str] = {}
     for key in _AGENT_CONFIG_KEYS:
         value = raw.get(key)
-        # Accept both string and numeric (for turn_timeout_s); stringify
-        # uniformly so the downstream argv builder can pass it as a CLI flag
-        # without further branching.
+        # Accept both string and numeric values; stringify uniformly so the
+        # downstream argv builder can pass it as a CLI flag without further
+        # branching.
         if isinstance(value, str) and value:
             out[key] = value
         elif isinstance(value, (int, float)):
@@ -251,7 +257,13 @@ def _require_binary(binary: str | None, label: str) -> str:
 
 
 
-def _adapter_argv(binary: str, parsed: ParsedArgs, *, include_effort: bool) -> tuple[list[str], dict[str, str]]:
+def _adapter_argv(
+    binary: str,
+    parsed: ParsedArgs,
+    *,
+    include_effort: bool,
+    include_watchdog: bool = False,
+) -> tuple[list[str], dict[str, str]]:
     argv = [binary, "--name", parsed.agent_name]
     if parsed.team_name is not None:
         argv.extend(["--team", parsed.team_name])
@@ -264,6 +276,12 @@ def _adapter_argv(binary: str, parsed: ParsedArgs, *, include_effort: bool) -> t
         argv.extend(["--effort", agent_config["effort"]])
     if "turn_timeout_s" in agent_config:
         argv.extend(["--turn-timeout-s", agent_config["turn_timeout_s"]])
+    if include_watchdog and "non_progress_warn_s" in agent_config:
+        argv.extend(["--non-progress-warn-s", agent_config["non_progress_warn_s"]])
+    if include_watchdog and "non_progress_interrupt_s" in agent_config:
+        argv.extend(
+            ["--non-progress-interrupt-s", agent_config["non_progress_interrupt_s"]]
+        )
     return argv, agent_config
 
 def main(argv: list[str] | None = None) -> int:
@@ -290,7 +308,9 @@ def main(argv: list[str] | None = None) -> int:
             _resolve_binary(PRIMARY_BINARY, BINARY_ENV, LEGACY_BINARY_ENV, fallback_name=LEGACY_BINARY),
             PRIMARY_BINARY,
         )
-        adapter_argv, agent_config = _adapter_argv(binary, parsed, include_effort=True)
+        adapter_argv, agent_config = _adapter_argv(
+            binary, parsed, include_effort=True, include_watchdog=True
+        )
         _log_dispatch("codex", parsed.agent_name, binary, agent_config or None)
         os.execv(binary, adapter_argv)
         return 0

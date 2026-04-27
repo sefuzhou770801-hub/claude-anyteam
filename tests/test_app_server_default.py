@@ -37,6 +37,8 @@ def test_default_app_server_is_on():
     """Task #21 default flip: no flag, no env → app_server=True."""
     s = from_env(overrides=_baseline_overrides())
     assert s.app_server is True
+    assert s.non_progress_warn_s == 300.0
+    assert s.non_progress_interrupt_s is None
 
 
 def test_env_opt_out_honored():
@@ -129,3 +131,54 @@ def test_cli_help_mentions_app_server_default():
     assert "no-app-server" in help_text
     # The help prose mentions default behavior.
     assert "default: on" in help_text or "default on" in help_text.lower()
+
+
+def test_non_progress_env_and_overrides_are_honored():
+    os.environ["CLAUDE_ANYTEAM_NON_PROGRESS_WARN_S"] = "420"
+    os.environ["CLAUDE_ANYTEAM_NON_PROGRESS_INTERRUPT_S"] = "600"
+    try:
+        s = from_env(overrides=_baseline_overrides())
+        assert s.non_progress_warn_s == 420.0
+        assert s.non_progress_interrupt_s == 600.0
+
+        overrides = _baseline_overrides() | {
+            "non_progress_warn_s": 120,
+            "non_progress_interrupt_s": 240,
+        }
+        s = from_env(overrides=overrides)
+        assert s.non_progress_warn_s == 120.0
+        assert s.non_progress_interrupt_s == 240.0
+    finally:
+        del os.environ["CLAUDE_ANYTEAM_NON_PROGRESS_WARN_S"]
+        del os.environ["CLAUDE_ANYTEAM_NON_PROGRESS_INTERRUPT_S"]
+
+
+def test_non_progress_warn_range_is_validated():
+    with pytest.raises(ValueError, match="non_progress_warn_s"):
+        from_env(overrides=_baseline_overrides() | {"non_progress_warn_s": 59})
+    with pytest.raises(ValueError, match="non_progress_warn_s"):
+        from_env(overrides=_baseline_overrides() | {"non_progress_warn_s": 901})
+
+
+def test_non_progress_interrupt_range_is_validated():
+    with pytest.raises(ValueError, match="non_progress_interrupt_s"):
+        from_env(overrides=_baseline_overrides() | {"non_progress_interrupt_s": 59})
+    with pytest.raises(ValueError, match="non_progress_interrupt_s"):
+        from_env(overrides=_baseline_overrides() | {"non_progress_interrupt_s": 3601})
+
+
+def test_cli_parses_non_progress_flags():
+    ns = cli_mod._parse_args(
+        [
+            "--team",
+            "t",
+            "--name",
+            "a",
+            "--non-progress-warn-s",
+            "180",
+            "--non-progress-interrupt-s",
+            "420",
+        ]
+    )
+    assert ns.non_progress_warn_s == 180
+    assert ns.non_progress_interrupt_s == 420

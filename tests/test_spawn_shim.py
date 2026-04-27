@@ -362,6 +362,34 @@ def test_agent_config_forwards_model_and_effort(monkeypatch, tmp_path, capsys):
     assert log["agent_config"] == {"model": "gpt-5.5", "effort": "xhigh"}
 
 
+def test_agent_config_forwards_non_progress_watchdog_flags(monkeypatch, tmp_path, capsys):
+    _write_agent_config(
+        tmp_path,
+        "build",
+        "codex-alice",
+        {"non_progress_warn_s": 180, "non_progress_interrupt_s": 420},
+    )
+    calls, stderr = _codex_argv_for(monkeypatch, tmp_path, "build", "codex-alice", capsys)
+
+    _, argv = calls[0]
+    assert argv == [
+        "/usr/local/bin/claude-anyteam",
+        "--name",
+        "codex-alice",
+        "--team",
+        "build",
+        "--non-progress-warn-s",
+        "180",
+        "--non-progress-interrupt-s",
+        "420",
+    ]
+    log = json.loads(stderr.strip())
+    assert log["agent_config"] == {
+        "non_progress_warn_s": "180",
+        "non_progress_interrupt_s": "420",
+    }
+
+
 def test_agent_config_forwards_model_only(monkeypatch, tmp_path, capsys):
     _write_agent_config(tmp_path, "t", "codex-bob", {"model": "gpt-5.4-mini"})
     calls, _ = _codex_argv_for(monkeypatch, tmp_path, "t", "codex-bob", capsys)
@@ -495,6 +523,37 @@ def test_gemini_dispatch_forwards_model_and_effort(monkeypatch, tmp_path, capsys
         "--effort",
         "xhigh",
     ]
+
+
+def test_gemini_dispatch_does_not_forward_codex_watchdog_flags(monkeypatch, tmp_path, capsys):
+    _write_agent_config(
+        tmp_path,
+        "t",
+        "gemini-pro",
+        {"non_progress_warn_s": 180, "non_progress_interrupt_s": 420},
+    )
+    calls = _record_execv(monkeypatch)
+    monkeypatch.setenv("HOME", str(tmp_path))
+    monkeypatch.setenv("CLAUDE_ANYTEAM_GEMINI_BINARY", "/custom/gemini-anyteam")
+    monkeypatch.setattr(
+        sys,
+        "argv",
+        ["/shim", "--agent-name", "gemini-pro", "--team-name", "t"],
+    )
+    monkeypatch.setattr(
+        spawn_shim.shutil,
+        "which",
+        lambda name: {"/custom/gemini-anyteam": "/custom/gemini-anyteam"}.get(name),
+    )
+
+    assert spawn_shim.main() == 0
+    _, argv = calls[0]
+    assert "--non-progress-warn-s" not in argv
+    assert "--non-progress-interrupt-s" not in argv
+    assert json.loads(capsys.readouterr().err)["agent_config"] == {
+        "non_progress_warn_s": "180",
+        "non_progress_interrupt_s": "420",
+    }
 
 
 def test_kimi_dispatch_for_kimi_prefix(monkeypatch, capsys):

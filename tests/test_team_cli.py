@@ -60,6 +60,30 @@ def test_team_agent_effort_only_omits_model(fake_home):
     assert cfg == {"effort": "high"}
 
 
+def test_team_agent_writes_non_progress_watchdog_keys(fake_home, capsys):
+    rc = cli_main(
+        [
+            "team-agent",
+            "codex-alice",
+            "--team",
+            "build",
+            "--non-progress-warn-s",
+            "180",
+            "--non-progress-interrupt-s",
+            "420",
+        ]
+    )
+    assert rc == 0
+    cfg = json.loads(_agent_path(fake_home, "build", "codex-alice").read_text())
+    assert cfg == {
+        "non_progress_warn_s": 180.0,
+        "non_progress_interrupt_s": 420.0,
+    }
+    out = capsys.readouterr().out
+    assert "non_progress_warn_s=180.0" in out
+    assert "non_progress_interrupt_s=420.0" in out
+
+
 def test_team_agent_neither_model_nor_effort_is_an_error(fake_home, capsys):
     rc = cli_main(["team-agent", "codex-alice", "--team", "build"])
     assert rc == 2
@@ -122,6 +146,34 @@ def test_team_agent_invalid_effort_is_rejected(fake_home, capsys):
     with pytest.raises(SystemExit) as exc:
         cli_main(["team-agent", "codex-alice", "--team", "build", "--effort", "absurd"])
     assert exc.value.code == 2
+
+
+def test_team_agent_invalid_non_progress_values_are_rejected(fake_home, capsys):
+    rc = cli_main(
+        [
+            "team-agent",
+            "codex-alice",
+            "--team",
+            "build",
+            "--non-progress-warn-s",
+            "30",
+        ]
+    )
+    assert rc == 2
+    assert "--non-progress-warn-s" in capsys.readouterr().err
+
+    rc = cli_main(
+        [
+            "team-agent",
+            "codex-alice",
+            "--team",
+            "build",
+            "--non-progress-interrupt-s",
+            "30",
+        ]
+    )
+    assert rc == 2
+    assert "--non-progress-interrupt-s" in capsys.readouterr().err
 
 
 # --------------------------------------------------------------------------- #

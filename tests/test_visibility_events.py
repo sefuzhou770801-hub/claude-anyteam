@@ -60,6 +60,7 @@ class _FakeClient:
     def __init__(self, *args, notifications: list[dict] | None = None, **kwargs):
         self.notifications = _NotificationQueue(notifications or [])
         self.steers: list[dict] = []
+        self.interrupts: list[dict] = []
 
     def start(self):
         pass
@@ -78,7 +79,7 @@ class _FakeClient:
         return kwargs["expected_turn_id"]
 
     def turn_interrupt(self, **kwargs):
-        pass
+        self.interrupts.append(kwargs)
 
     def close(self):
         pass
@@ -436,3 +437,165 @@ def test_app_server_no_checkpoint_after_300s_emits_turn_progress(monkeypatch):
     assert progress[0].visibility.mailbox is True
     assert progress[0].visibility.task_state is True
     assert created[0].steers, "watchdog should send checkpoint turn/steer"
+    assert created[0].interrupts == []
+
+
+def test_app_server_watchdog_fans_out_to_event_log_mailbox_and_active_form(
+    events_root: Path,
+    monkeypatch,
+):
+    notifications = [
+        {"__raise__": True},
+        {"method": "turn/completed", "params": {"turn": {"status": "ok"}}},
+    ]
+    created: list[_FakeClient] = []
+
+    def make_client(*args, **kwargs):
+        client = _FakeClient(*args, notifications=notifications, **kwargs)
+        created.append(client)
+        return client
+
+    ticks = iter([0, 0, 0, 300, 301])
+
+    def fake_monotonic():
+        try:
+            return next(ticks)
+        except StopIteration:
+            return 301
+
+    update_calls: list[tuple[tuple, dict]] = []
+    with (
+        patch.object(app_server_mod, "AppServerClient", make_client),
+        patch.object(loop_mod.pio, "read_own_inbox", return_value=[]),
+        patch.object(
+            loop_mod.pio,
+            "update_task",
+            side_effect=lambda *a, **k: update_calls.append((a, k)),
+        ),
+        monkeypatch.context() as m,
+    ):
+        m.setattr(codex_mod.time, "monotonic", fake_monotonic)
+        result = loop_mod._execute_task_app_server(
+            loop_mod.LoopState(settings=_settings()),
+            SimpleNamespace(id="16"),
+            "long task",
+        )
+
+    assert result.exit_code == 0
+    events = [
+        e for e in pio.read_events("team-x", "codex-runtime")
+        if e.kind == "turn_progress" and e.severity == "warn"
+    ]
+    assert len(events) == 1
+    assert events[0].summary == "no visible checkpoint for 300s; checkpoint steer sent"
+    assert events[0].payload == {
+        "elapsed_s": 300,
+        "timeout_s": 900.0,
+        "risk": "timeout_possible",
+        "action_taken": "turn_steer_sent",
+    }
+    assert created[0].steers, "soft watchdog should checkpoint steer"
+    assert created[0].interrupts == []
+    assert any(
+        kwargs.get("active_form")
+        == "running codex: no visible checkpoint for 300s; checkpoint steer sent"
+        for _, kwargs in update_calls
+    )
+    lead_inbox = json.loads(
+        (events_root / "team-x" / "inboxes" / "team-lead.json").read_text()
+    )
+    warnings = [
+        message
+        for message in lead_inbox
+        if message.get("messageKind") == "turn_progress"
+        and json.loads(message["text"])["event_id"] == events[0].event_id
+    ]
+    assert len(warnings) == 1
+
+
+def test_app_server_watchdog_does_not_interrupt_without_opt_in(monkeypatch):
+    notifications = [
+        {"__raise__": True},
+        {"__raise__": True},
+        {"method": "turn/completed", "params": {"turn": {"status": "ok"}}},
+    ]
+    created: list[_FakeClient] = []
+
+    def make_client(*args, **kwargs):
+        client = _FakeClient(*args, notifications=notifications, **kwargs)
+        created.append(client)
+        return client
+
+    ticks = iter([0, 0, 0, 300, 350, 420, 421])
+
+    def fake_monotonic():
+        try:
+            return next(ticks)
+        except StopIteration:
+            return 421
+
+    with (
+        patch.object(app_server_mod, "AppServerClient", make_client),
+        monkeypatch.context() as m,
+    ):
+        m.setattr(codex_mod.time, "monotonic", fake_monotonic)
+        result = codex_mod.app_server_invoke(
+            task_prompt="long task",
+            cwd=Path("/tmp"),
+            schema=None,
+            settings_team="team-x",
+            settings_agent="codex-runtime",
+            task_id="16",
+            overall_timeout_s=900,
+            non_progress_warn_s=300,
+        )
+
+    assert result.exit_code == 0
+    assert created[0].steers, "soft watchdog should still steer"
+    assert created[0].interrupts == []
+
+
+def test_app_server_watchdog_interrupts_only_when_opted_in(monkeypatch):
+    notifications = [
+        {"__raise__": True},
+        {"__raise__": True},
+        {"method": "turn/completed", "params": {"turn": {"status": "ok"}}},
+    ]
+    created: list[_FakeClient] = []
+
+    def make_client(*args, **kwargs):
+        client = _FakeClient(*args, notifications=notifications, **kwargs)
+        created.append(client)
+        return client
+
+    ticks = iter([0, 0, 0, 300, 350, 420])
+
+    def fake_monotonic():
+        try:
+            return next(ticks)
+        except StopIteration:
+            return 420
+
+    with (
+        patch.object(app_server_mod, "AppServerClient", make_client),
+        monkeypatch.context() as m,
+    ):
+        m.setattr(codex_mod.time, "monotonic", fake_monotonic)
+        result = codex_mod.app_server_invoke(
+            task_prompt="long task",
+            cwd=Path("/tmp"),
+            schema=None,
+            settings_team="team-x",
+            settings_agent="codex-runtime",
+            task_id="16",
+            overall_timeout_s=900,
+            non_progress_warn_s=300,
+            non_progress_interrupt_s=420,
+        )
+
+    assert result.exit_code == 124
+    assert "interrupted" in (result.error or "")
+    assert created[0].steers, "soft watchdog fires before hard interrupt"
+    assert created[0].interrupts == [
+        {"thread_id": "thread-1", "turn_id": "turn-1"}
+    ]
