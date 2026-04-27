@@ -14,6 +14,7 @@ from dataclasses import dataclass, field
 from typing import Any
 
 from claude_anyteam import logger, protocol_io as pio
+from claude_anyteam.auth_preflight import AuthPreflightFailure
 from claude_anyteam.capability_manifest import CapabilityManifestCache
 from claude_anyteam.capabilities import (
     GEMINI_ACP_CAPABILITIES,
@@ -108,6 +109,9 @@ def run(settings: GeminiSettings) -> int:
                 gemini_binary=settings.gemini_binary,
                 state=previous_state,
             )
+        startup_phase = "auth_preflight"
+        _backend_auth_preflight(settings, gemini_home=gemini_home)
+        if settings.backend == "acp":
             crash_hygiene.mark_adapter_start(
                 gemini_home,
                 team=settings.team_name,
@@ -148,28 +152,49 @@ def run(settings: GeminiSettings) -> int:
                 backend=settings.backend,
                 error=str(e),
             )
-            error_class = "adapter_startup_crash"
-            # Startup failures happen before the first inbox poll/turn, so
-            # fan out an envelope directly instead of relying on task/prose
-            # fallbacks that never run.
-            try:
-                pio.emit_adapter_startup_crash(
-                    team=settings.team_name,
-                    agent=settings.agent_name,
-                    backend="gemini",
-                    phase=startup_phase,
-                    error=e,
-                    payload={
-                        "transport": settings.backend,
-                        "gemini_binary": settings.gemini_binary,
-                        "gemini_home": str(gemini_home),
-                        "cwd": str(settings.cwd),
-                        "model": settings.model,
-                        "effort": settings.effort,
-                    },
-                )
-            except Exception as emit_exc:
-                logger.debug("gemini.startup.visibility_emit_failed", error=str(emit_exc))
+            if isinstance(e, AuthPreflightFailure):
+                error_class = "auth_failure"
+                try:
+                    pio.emit_auth_preflight_failure(
+                        team=settings.team_name,
+                        agent=settings.agent_name,
+                        backend="gemini",
+                        error=e,
+                        payload={
+                            "phase": startup_phase,
+                            "transport": settings.backend,
+                            "gemini_binary": settings.gemini_binary,
+                            "gemini_home": str(gemini_home),
+                            "cwd": str(settings.cwd),
+                            "model": settings.model,
+                            "effort": settings.effort,
+                        },
+                    )
+                except Exception as emit_exc:
+                    logger.debug("gemini.auth_preflight.visibility_emit_failed", error=str(emit_exc))
+            else:
+                error_class = "adapter_startup_crash"
+                # Startup failures happen before the first inbox poll/turn, so
+                # fan out an envelope directly instead of relying on task/prose
+                # fallbacks that never run.
+                try:
+                    pio.emit_adapter_startup_crash(
+                        team=settings.team_name,
+                        agent=settings.agent_name,
+                        backend="gemini",
+                        phase=startup_phase,
+                        error=e,
+                        payload={
+                            "transport": settings.backend,
+                            "gemini_binary": settings.gemini_binary,
+                            "gemini_home": str(gemini_home),
+                            "cwd": str(settings.cwd),
+                            "model": settings.model,
+                            "effort": settings.effort,
+                        },
+                    )
+                except Exception as emit_exc:
+                    logger.debug("gemini.startup.visibility_emit_failed", error=str(emit_exc))
         # Persist a structured incident so the lead can find this via
         # `claude-anyteam diagnose`. Particularly important for Gemini
         # cold-start failures where the adapter exits before its first
@@ -207,6 +232,18 @@ def _backend_feature_test(settings: GeminiSettings) -> None:
         acp_invoke.feature_test(settings.gemini_binary)
     else:
         headless_invoke.feature_test(settings.gemini_binary)
+
+
+def _backend_auth_preflight(settings: GeminiSettings, *, gemini_home) -> None:
+    headless_invoke.credential_preflight(
+        gemini_binary=settings.gemini_binary,
+        cwd=settings.cwd,
+        team=settings.team_name,
+        agent_name=settings.agent_name,
+        model=settings.model,
+        effort=settings.effort,
+        gemini_home=gemini_home,
+    )
 
 
 def _backend_run(

@@ -21,6 +21,11 @@ from pathlib import Path
 from typing import Any
 
 from claude_anyteam import logger
+from claude_anyteam.auth_preflight import (
+    AuthPreflightFailure,
+    classify_auth_error,
+    subprocess_diagnostic,
+)
 from claude_anyteam.codex import CodexResult, PLAN_SCHEMA, TASK_COMPLETE_SCHEMA
 from claude_anyteam.env import identity_env
 from claude_anyteam.headless_visibility import HeadlessTurnVisibility, coerce_stream_text
@@ -261,6 +266,103 @@ def feature_test(kimi_binary: str = "kimi") -> None:
         wrapper_binary=str(Path(resolved_wrapper).resolve()),
         info=(info.stdout or info.stderr).strip(),
     )
+
+
+def credential_preflight(
+    *,
+    kimi_binary: str = "kimi",
+    cwd: Path,
+    team: str,
+    agent_name: str,
+    model: str | None = None,
+    effort: str | None = None,
+    kimi_home: Path | None = None,
+    thinking: str = "auto",
+    timeout_s: float = 45.0,
+) -> None:
+    """Run a cheap Kimi API probe in the adapter's isolated HOME.
+
+    Kimi's local ``info``/``--help`` checks do not validate MOONSHOT_API_KEY or
+    OAuth token freshness.  This tiny ``--print`` call fails spawn before
+    registration when the remote API returns 401/quota errors.
+    """
+
+    real_home = os.environ.get("HOME")
+    home = kimi_home or default_kimi_home(team, agent_name)
+    mcp_config = write_mcp_config(home, team=team, agent_name=agent_name, real_home=real_home)
+    args = [
+        kimi_binary,
+        "--print",
+        "--output-format=stream-json",
+        "--work-dir",
+        str(cwd),
+        "--mcp-config-file",
+        str(mcp_config),
+        *(_thinking_args(thinking=thinking, effort=effort)),
+    ]
+    if model:
+        args.extend(["--model", model])
+    args.extend(["-p", "ping"])
+
+    sub_env = dict(os.environ)
+    sub_env["HOME"] = str(home)
+    sub_env.setdefault("KIMI_CLI_NO_AUTO_UPDATE", "1")
+    if real_home:
+        sub_env["CLAUDE_ANYTEAM_REAL_HOME"] = real_home
+    sub_env = identity_env(sub_env, team=team, name=agent_name)
+
+    logger.info(
+        "kimi.auth_preflight.start",
+        cwd=str(cwd),
+        kimi_home=str(home),
+        model=model,
+        effort=effort,
+        thinking=thinking,
+    )
+    try:
+        proc = subprocess.run(
+            args,
+            cwd=str(cwd),
+            capture_output=True,
+            text=True,
+            timeout=timeout_s,
+            check=False,
+            env=sub_env,
+            stdin=subprocess.DEVNULL,
+        )
+    except subprocess.TimeoutExpired as exc:
+        detail = subprocess_diagnostic(
+            args,
+            returncode=None,
+            stdout=coerce_stream_text(getattr(exc, "stdout", None) or getattr(exc, "output", None)),
+            stderr=coerce_stream_text(getattr(exc, "stderr", None)),
+        )
+        raise RuntimeError(f"Kimi auth preflight timed out after {timeout_s}s\n{detail}") from exc
+    except (subprocess.SubprocessError, OSError) as exc:
+        raise RuntimeError(f"could not run Kimi auth preflight {kimi_binary!r}: {exc}") from exc
+
+    diagnostic = subprocess_diagnostic(
+        args,
+        returncode=proc.returncode,
+        stdout=proc.stdout,
+        stderr=proc.stderr,
+    )
+    if proc.returncode != 0:
+        classified = classify_auth_error(diagnostic)
+        if classified is not None:
+            error_class, reset_after = classified
+            raise AuthPreflightFailure(
+                backend="kimi",
+                error_class=error_class,
+                error_message=diagnostic,
+                reset_after_seconds=reset_after,
+                cmd=args,
+                returncode=proc.returncode,
+                stdout=proc.stdout,
+                stderr=proc.stderr,
+            )
+        raise RuntimeError(f"Kimi auth preflight exited {proc.returncode}\n{diagnostic}")
+    logger.info("kimi.auth_preflight.ok", model=model, thinking=thinking)
 
 
 def _loads_json_line(line: str) -> dict[str, Any] | None:

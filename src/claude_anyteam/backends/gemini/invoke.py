@@ -12,6 +12,11 @@ from pathlib import Path
 from typing import Any
 
 from claude_anyteam import logger
+from claude_anyteam.auth_preflight import (
+    AuthPreflightFailure,
+    classify_auth_error,
+    subprocess_diagnostic,
+)
 from claude_anyteam.codex import CodexResult, PLAN_SCHEMA, TASK_COMPLETE_SCHEMA
 from claude_anyteam.env import identity_env
 from claude_anyteam.headless_visibility import HeadlessTurnVisibility, coerce_stream_text
@@ -361,6 +366,111 @@ def feature_test(gemini_binary: str = "gemini") -> None:
     if missing:
         raise RuntimeError(f"Gemini CLI is missing required flags {missing}; found version {(version.stdout or version.stderr).strip()}")
     logger.info("gemini.version", binary=resolved, version=(version.stdout or version.stderr).strip())
+
+
+def credential_preflight(
+    *,
+    gemini_binary: str = "gemini",
+    cwd: Path,
+    team: str,
+    agent_name: str,
+    model: str | None = None,
+    effort: str | None = None,
+    gemini_home: Path | None = None,
+    timeout_s: float = 45.0,
+) -> None:
+    """Run a cheap Gemini API probe in the same HOME used by the adapter.
+
+    ``feature_test`` intentionally only validates the local CLI surface.  This
+    probe validates remote auth/quota before the teammate registers and enters
+    the poll loop, preventing long silent stress-run stalls when the Gemini API
+    rejects the configured account/model.
+    """
+
+    real_home = os.environ.get("HOME")
+    home = gemini_home or _default_gemini_home(team, agent_name)
+    settings_path = write_mcp_settings(
+        home,
+        team=team,
+        agent_name=agent_name,
+        real_home=real_home,
+        cwd=cwd,
+    )
+    launch_model = model
+    if model and effort:
+        launch_model = inject_effort_alias(settings_path, model=model, effort=effort) or model
+
+    args = [
+        gemini_binary,
+        "--prompt",
+        "ping",
+        "--output-format",
+        "stream-json",
+        "--approval-mode",
+        "yolo",
+    ]
+    if launch_model:
+        args.extend(["--model", launch_model])
+
+    sub_env = dict(os.environ)
+    sub_env["HOME"] = str(home)
+    sub_env.setdefault("GEMINI_CLI_NO_RELAUNCH", "true")
+    if real_home:
+        sub_env["CLAUDE_ANYTEAM_REAL_HOME"] = real_home
+    sub_env = identity_env(sub_env, team=team, name=agent_name)
+
+    logger.info(
+        "gemini.auth_preflight.start",
+        cwd=str(cwd),
+        gemini_home=str(home),
+        model=model,
+        effort=effort,
+        effective_model=launch_model,
+    )
+    try:
+        proc = subprocess.run(
+            args,
+            cwd=str(cwd),
+            capture_output=True,
+            text=True,
+            timeout=timeout_s,
+            check=False,
+            env=sub_env,
+            stdin=subprocess.DEVNULL,
+        )
+    except subprocess.TimeoutExpired as exc:
+        detail = subprocess_diagnostic(
+            args,
+            returncode=None,
+            stdout=coerce_stream_text(getattr(exc, "stdout", None) or getattr(exc, "output", None)),
+            stderr=coerce_stream_text(getattr(exc, "stderr", None)),
+        )
+        raise RuntimeError(f"Gemini auth preflight timed out after {timeout_s}s\n{detail}") from exc
+    except (subprocess.SubprocessError, OSError) as exc:
+        raise RuntimeError(f"could not run Gemini auth preflight {gemini_binary!r}: {exc}") from exc
+
+    diagnostic = subprocess_diagnostic(
+        args,
+        returncode=proc.returncode,
+        stdout=proc.stdout,
+        stderr=proc.stderr,
+    )
+    if proc.returncode != 0:
+        classified = classify_auth_error(diagnostic)
+        if classified is not None:
+            error_class, reset_after = classified
+            raise AuthPreflightFailure(
+                backend="gemini",
+                error_class=error_class,
+                error_message=diagnostic,
+                reset_after_seconds=reset_after,
+                cmd=args,
+                returncode=proc.returncode,
+                stdout=proc.stdout,
+                stderr=proc.stderr,
+            )
+        raise RuntimeError(f"Gemini auth preflight exited {proc.returncode}\n{diagnostic}")
+    logger.info("gemini.auth_preflight.ok", model=model, effective_model=launch_model)
 
 
 def _extract_json_candidate(text: str) -> str:

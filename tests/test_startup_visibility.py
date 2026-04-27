@@ -64,7 +64,10 @@ def _raise_wrapped_probe_failure(binary: str, stderr: str) -> None:
 
 
 def _lead_visibility_messages(root: Path, *, team: str = "team-x") -> list[dict[str, Any]]:
-    raw = json.loads((root / team / "inboxes" / "team-lead.json").read_text())
+    path = root / team / "inboxes" / "team-lead.json"
+    if not path.exists():
+        return []
+    raw = json.loads(path.read_text())
     return [
         json.loads(message["text"])
         for message in raw
@@ -137,3 +140,158 @@ def test_gemini_feature_test_startup_crash_fans_out_visibility_degraded(
     assert len(lead_events) == 1
     assert lead_events[0]["kind"] == "visibility_degraded"
     assert lead_events[0]["payload"]["raw_backend_error"] == event.payload["raw_backend_error"]
+
+
+@pytest.mark.parametrize(
+    ("stderr", "expected_class", "expected_reset"),
+    [
+        (
+            "TerminalQuotaError: You have exhausted your capacity on this model. "
+            "Your quota will reset after 2h6m13s.",
+            "quota_exhausted",
+            7573,
+        ),
+        (
+            "Gemini API error 401: invalid API key / authentication failed",
+            "invalid_authentication",
+            None,
+        ),
+    ],
+)
+def test_gemini_auth_preflight_failure_fans_out_auth_visibility_degraded(
+    events_root: Path,
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    stderr: str,
+    expected_class: str,
+    expected_reset: int | None,
+) -> None:
+    monkeypatch.setattr(gemini_loop, "_backend_feature_test", lambda _settings: None)
+
+    def fake_run(args: list[str], **kwargs: Any) -> subprocess.CompletedProcess[str]:
+        assert args[:3] == ["gemini-broken", "--prompt", "ping"]
+        assert kwargs["stdin"] is subprocess.DEVNULL
+        return subprocess.CompletedProcess(args, 1, stdout="", stderr=stderr)
+
+    monkeypatch.setattr(gemini_loop.headless_invoke.subprocess, "run", fake_run)
+
+    assert gemini_loop.run(_gemini_settings(tmp_path)) == 1
+
+    events = pio.read_events("team-x", "gemini-a")
+    assert len(events) == 1
+    event = events[0]
+    assert event.kind == "visibility_degraded"
+    assert event.backend == "gemini"
+    assert event.payload["surface"] == "adapter_spawn_auth_preflight"
+    assert event.payload["phase"] == "auth_preflight"
+    assert event.payload["reason"] == "auth_failure"
+    assert event.payload["backend"] == "gemini"
+    assert event.payload["error_class"] == expected_class
+    assert stderr in event.payload["error_message"]
+    if expected_reset is None:
+        assert "reset_after_seconds" not in event.payload
+    else:
+        assert event.payload["reset_after_seconds"] == expected_reset
+
+    lead_events = _lead_visibility_messages(events_root)
+    assert len(lead_events) == 1
+    assert lead_events[0]["event_id"] == event.event_id
+    assert lead_events[0]["payload"]["reason"] == "auth_failure"
+
+
+def test_kimi_auth_preflight_failure_fans_out_auth_visibility_degraded(
+    events_root: Path,
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    monkeypatch.setattr(kimi_loop, "_backend_feature_test", lambda _settings: None)
+    stderr = (
+        "APIStatusError: Error code: 401 - {'error': {'message': "
+        "'Invalid Authentication'}} (MOONSHOT_API_KEY)"
+    )
+
+    def fake_run(args: list[str], **kwargs: Any) -> subprocess.CompletedProcess[str]:
+        assert args[:2] == ["kimi-broken", "--print"]
+        assert args[-2:] == ["-p", "ping"]
+        assert kwargs["stdin"] is subprocess.DEVNULL
+        return subprocess.CompletedProcess(args, 1, stdout="", stderr=stderr)
+
+    monkeypatch.setattr(kimi_loop.headless_invoke.subprocess, "run", fake_run)
+
+    assert kimi_loop.run(_kimi_settings(tmp_path)) == 1
+
+    events = pio.read_events("team-x", "kimi-a")
+    assert len(events) == 1
+    event = events[0]
+    assert event.kind == "visibility_degraded"
+    assert event.backend == "kimi"
+    assert event.payload["surface"] == "adapter_spawn_auth_preflight"
+    assert event.payload["phase"] == "auth_preflight"
+    assert event.payload["reason"] == "auth_failure"
+    assert event.payload["backend"] == "kimi"
+    assert event.payload["error_class"] == "invalid_authentication"
+    assert stderr in event.payload["error_message"]
+    assert "reset_after_seconds" not in event.payload
+
+    lead_events = _lead_visibility_messages(events_root)
+    assert len(lead_events) == 1
+    assert lead_events[0]["event_id"] == event.event_id
+    assert lead_events[0]["payload"]["reason"] == "auth_failure"
+
+
+@pytest.mark.parametrize("backend", ["acp", "headless"])
+def test_gemini_auth_preflight_success_emits_no_degraded_envelope_and_spawns(
+    events_root: Path,
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    backend: str,
+) -> None:
+    settings = _gemini_settings(tmp_path)
+    settings = GeminiSettings(
+        **{**settings.__dict__, "backend": backend}  # type: ignore[arg-type]
+    )
+    entered_loop: list[str] = []
+    monkeypatch.setattr(gemini_loop, "_backend_feature_test", lambda _settings: None)
+    monkeypatch.setattr(gemini_loop, "register", lambda *_args, **_kwargs: {"name": settings.agent_name})
+    monkeypatch.setattr(gemini_loop.CapabilityManifestCache, "load_startup", lambda self: None)
+    monkeypatch.setattr(gemini_loop.signal, "signal", lambda *_args, **_kwargs: None)
+    monkeypatch.setattr(gemini_loop, "_main_loop", lambda state: entered_loop.append(state.settings.backend))
+
+    def fake_run(args: list[str], **_kwargs: Any) -> subprocess.CompletedProcess[str]:
+        assert args[:3] == ["gemini-broken", "--prompt", "ping"]
+        return subprocess.CompletedProcess(args, 0, stdout='{"type":"result","status":"success"}\n', stderr="")
+
+    monkeypatch.setattr(gemini_loop.headless_invoke.subprocess, "run", fake_run)
+
+    assert gemini_loop.run(settings) == 0
+
+    assert entered_loop == [backend]
+    assert pio.read_events("team-x", "gemini-a") == []
+    assert _lead_visibility_messages(events_root) == []
+
+
+def test_kimi_auth_preflight_success_emits_no_degraded_envelope_and_spawns(
+    events_root: Path,
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    settings = _kimi_settings(tmp_path)
+    entered_loop: list[str] = []
+    monkeypatch.setattr(kimi_loop, "_backend_feature_test", lambda _settings: None)
+    monkeypatch.setattr(kimi_loop, "register", lambda *_args, **_kwargs: {"name": settings.agent_name})
+    monkeypatch.setattr(kimi_loop.CapabilityManifestCache, "load_startup", lambda self: None)
+    monkeypatch.setattr(kimi_loop.signal, "signal", lambda *_args, **_kwargs: None)
+    monkeypatch.setattr(kimi_loop, "_main_loop", lambda state: entered_loop.append(state.settings.backend))
+
+    def fake_run(args: list[str], **_kwargs: Any) -> subprocess.CompletedProcess[str]:
+        assert args[:2] == ["kimi-broken", "--print"]
+        assert args[-2:] == ["-p", "ping"]
+        return subprocess.CompletedProcess(args, 0, stdout='{"role":"assistant","content":"pong"}\n', stderr="")
+
+    monkeypatch.setattr(kimi_loop.headless_invoke.subprocess, "run", fake_run)
+
+    assert kimi_loop.run(settings) == 0
+
+    assert entered_loop == ["headless"]
+    assert pio.read_events("team-x", "kimi-a") == []
+    assert _lead_visibility_messages(events_root) == []

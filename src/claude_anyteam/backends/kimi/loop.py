@@ -14,6 +14,7 @@ from dataclasses import dataclass, field
 from typing import Any
 
 from claude_anyteam import logger, protocol_io as pio
+from claude_anyteam.auth_preflight import AuthPreflightFailure
 from claude_anyteam.capability_manifest import CapabilityManifestCache
 from claude_anyteam.capabilities import KIMI_HEADLESS_CAPABILITIES, assert_known_capabilities, rich_capability_manifest
 from claude_anyteam.messages import CapabilityManifestUpdatedIn, PlanApprovalRequestIn, ShutdownRequestIn, SteerIn, parse_protocol_text
@@ -78,6 +79,8 @@ def run(settings: KimiSettings) -> int:
     startup_complete = False
     try:
         _backend_feature_test(settings)
+        startup_phase = "auth_preflight"
+        _backend_auth_preflight(settings)
         startup_phase = "registration"
         register(settings, _backend_metadata(settings))
         startup_phase = "capability_manifest_load"
@@ -105,29 +108,51 @@ def run(settings: KimiSettings) -> int:
             error_class = "adapter_crash"
         else:
             logger.error("kimi.startup.crash", phase=startup_phase, error=str(e))
-            error_class = "adapter_startup_crash"
-            # Startup failures happen before the first inbox poll/turn, so
-            # fan out an envelope directly instead of relying on task/prose
-            # fallbacks that never run.
-            try:
-                pio.emit_adapter_startup_crash(
-                    team=settings.team_name,
-                    agent=settings.agent_name,
-                    backend="kimi",
-                    phase=startup_phase,
-                    error=e,
-                    payload={
-                        "transport": settings.backend,
-                        "kimi_binary": settings.kimi_binary,
-                        "kimi_home": str(settings.kimi_home) if settings.kimi_home else None,
-                        "cwd": str(settings.cwd),
-                        "model": settings.model,
-                        "effort": settings.effort,
-                        "thinking": settings.thinking,
-                    },
-                )
-            except Exception as emit_exc:
-                logger.debug("kimi.startup.visibility_emit_failed", error=str(emit_exc))
+            if isinstance(e, AuthPreflightFailure):
+                error_class = "auth_failure"
+                try:
+                    pio.emit_auth_preflight_failure(
+                        team=settings.team_name,
+                        agent=settings.agent_name,
+                        backend="kimi",
+                        error=e,
+                        payload={
+                            "phase": startup_phase,
+                            "transport": settings.backend,
+                            "kimi_binary": settings.kimi_binary,
+                            "kimi_home": str(settings.kimi_home) if settings.kimi_home else None,
+                            "cwd": str(settings.cwd),
+                            "model": settings.model,
+                            "effort": settings.effort,
+                            "thinking": settings.thinking,
+                        },
+                    )
+                except Exception as emit_exc:
+                    logger.debug("kimi.auth_preflight.visibility_emit_failed", error=str(emit_exc))
+            else:
+                error_class = "adapter_startup_crash"
+                # Startup failures happen before the first inbox poll/turn, so
+                # fan out an envelope directly instead of relying on task/prose
+                # fallbacks that never run.
+                try:
+                    pio.emit_adapter_startup_crash(
+                        team=settings.team_name,
+                        agent=settings.agent_name,
+                        backend="kimi",
+                        phase=startup_phase,
+                        error=e,
+                        payload={
+                            "transport": settings.backend,
+                            "kimi_binary": settings.kimi_binary,
+                            "kimi_home": str(settings.kimi_home) if settings.kimi_home else None,
+                            "cwd": str(settings.cwd),
+                            "model": settings.model,
+                            "effort": settings.effort,
+                            "thinking": settings.thinking,
+                        },
+                    )
+                except Exception as emit_exc:
+                    logger.debug("kimi.startup.visibility_emit_failed", error=str(emit_exc))
         # Persist a structured incident so the lead can find this via
         # `claude-anyteam diagnose`. Same crash-hygiene pattern as
         # Codex/Gemini — adapter crashes that would otherwise only
@@ -160,6 +185,21 @@ def _backend_feature_test(settings: KimiSettings) -> None:
     if settings.backend == "acp":
         raise NotImplementedError("Plan B deferred to follow-up PR")
     headless_invoke.feature_test(settings.kimi_binary)
+
+
+def _backend_auth_preflight(settings: KimiSettings) -> None:
+    if settings.backend == "acp":
+        raise NotImplementedError("Plan B deferred to follow-up PR")
+    headless_invoke.credential_preflight(
+        kimi_binary=settings.kimi_binary,
+        cwd=settings.cwd,
+        team=settings.team_name,
+        agent_name=settings.agent_name,
+        model=settings.model,
+        effort=settings.effort,
+        kimi_home=settings.kimi_home,
+        thinking=settings.thinking,
+    )
 
 
 def _backend_run(

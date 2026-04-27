@@ -21,6 +21,7 @@ from claude_teams.models import InboxMessage as _InboxMessage  # type: ignore[im
 from claude_teams.models import TaskFile as _TaskFile  # type: ignore[import-untyped]
 
 from . import logger
+from .auth_preflight import AuthPreflightFailure
 from .messages import (
     IdleNotificationOut,
     PermissionRequestOut,
@@ -539,6 +540,91 @@ def emit_adapter_startup_crash(
             backend=backend,
             agent=agent,
             phase=phase,
+            event_log_appended=appended,
+            error=str(e),
+        )
+    return envelope
+
+
+def emit_auth_preflight_failure(
+    *,
+    team: str,
+    agent: str,
+    backend: str,
+    error: AuthPreflightFailure,
+    payload: dict[str, Any] | None = None,
+) -> VisibilityEvent:
+    """Emit the spawn-time auth-failure ``visibility_degraded`` envelope.
+
+    This is deliberately separate from the generic startup-crash helper: bad
+    Gemini/Kimi credentials and exhausted quota are external constraints, not
+    adapter bugs.  They should therefore carry the stable machine-readable
+    ``reason=auth_failure`` and backend error class required by the stress
+    harness so the lead can see the failure before any turn loop starts.
+    """
+
+    event_payload: dict[str, Any] = {
+        "surface": "adapter_spawn_auth_preflight",
+        "reason": "auth_failure",
+        "backend": error.backend or backend,
+        "error_class": error.error_class,
+        "error_message": error.error_message,
+    }
+    if error.reset_after_seconds is not None:
+        event_payload["reset_after_seconds"] = error.reset_after_seconds
+    if payload:
+        event_payload.update(payload)
+    event_payload["raw_backend_error"] = _exception_wire_details(error)
+
+    event_id = f"{agent}:auth-preflight:{int(time.time() * 1000)}"
+    envelope = VisibilityEvent(
+        kind="visibility_degraded",
+        event_id=event_id,
+        team=team,
+        agent=agent,
+        backend=backend,
+        seq=0,
+        severity="error",
+        summary=(
+            f"{backend} auth preflight failed: {error.error_class}"
+        )[:300],
+        visibility={
+            "mailbox": True,
+            "task_state": False,
+            "event_log": True,
+            "stderr": True,
+        },
+        payload=event_payload,
+    )
+
+    logger.error(
+        "visibility.event",
+        kind=envelope.kind,
+        event_id=envelope.event_id,
+        seq=envelope.seq,
+        severity=envelope.severity,
+        summary=envelope.summary,
+        visibility_event=envelope.model_dump(by_alias=True, exclude_none=True),
+    )
+
+    appended = False
+    try:
+        append_event(team, agent, envelope)
+        appended = True
+    except Exception as e:
+        logger.warn(
+            "visibility.auth_preflight_event_log_failed",
+            backend=backend,
+            agent=agent,
+            error=str(e),
+        )
+    try:
+        send_visibility_event_to_lead(team, agent, envelope)
+    except Exception as e:
+        logger.warn(
+            "visibility.auth_preflight_mailbox_failed",
+            backend=backend,
+            agent=agent,
             event_log_appended=appended,
             error=str(e),
         )
