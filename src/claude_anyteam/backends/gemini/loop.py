@@ -254,6 +254,7 @@ def _backend_run(
     resume_session_id: str | None = None,
     ephemeral: bool = False,
     task_id: str | None = None,
+    event_sink=None,
 ):
     s = state.settings
     runner = acp_invoke if s.backend == "acp" else headless_invoke
@@ -276,6 +277,7 @@ def _backend_run(
     else:
         kwargs["resume_session_id"] = resume_session_id
         kwargs["task_id"] = task_id
+    kwargs["event_sink"] = event_sink
     return runner.run(prompt, **kwargs)
 
 
@@ -285,8 +287,12 @@ def _main_loop(state: GeminiLoopState) -> None:
     idle_last_sent_at: float | None = None
     while not state.approved_shutdown:
         messages = pio.read_own_inbox(s.team_name, s.agent_name, s.agent_name)
-        for m in messages:
-            _handle_message(state, m)
+        for kind, group in _partition_inbox(messages):
+            if kind == "prose":
+                _handle_prose_batch(state, group)
+            else:
+                for m in group:
+                    _handle_message(state, m)
             if state.approved_shutdown:
                 return
 
@@ -333,6 +339,21 @@ def _handle_message(state: GeminiLoopState, msg: Any) -> None:
         _handle_steer(state, payload, msg)
     else:
         logger.debug("gemini.inbox.protocol_noop", type=payload.__class__.__name__)
+
+
+def _partition_inbox(messages: list[Any]) -> list[tuple[str, list[Any]]]:
+    """Group consecutive prose inbox messages while preserving protocol order."""
+    groups: list[tuple[str, list[Any]]] = []
+    for m in messages:
+        is_prose = parse_protocol_text(m.text) is None
+        if is_prose:
+            if groups and groups[-1][0] == "prose":
+                groups[-1][1].append(m)
+            else:
+                groups.append(("prose", [m]))
+        else:
+            groups.append(("protocol", [m]))
+    return groups
 
 
 def _peer_prompt_fragments(state: GeminiLoopState) -> str:
@@ -434,6 +455,94 @@ def _steer_prefix_for_task(state: GeminiLoopState, task: Any) -> str:
     return "\n".join(lines)
 
 
+def _prose_visibility_event_sink(state: GeminiLoopState):
+    """Build the prose-turn visibility sink for Gemini headless/ACP invocations."""
+    s = state.settings
+
+    def _sink(event) -> None:
+        try:
+            pio.append_event(s.team_name, s.agent_name, event)
+        except Exception as e:
+            logger.warn(
+                "gemini.visibility.append_fail",
+                kind=getattr(event, "kind", None),
+                error=str(e),
+                surface="prose",
+            )
+        visibility = getattr(event, "visibility", None)
+        if getattr(visibility, "mailbox", False):
+            try:
+                pio.send_visibility_event_to_lead(
+                    s.team_name,
+                    s.agent_name,
+                    event,
+                    summary=event.summary[:120],
+                )
+            except Exception as e:
+                logger.warn(
+                    "gemini.visibility.mailbox_fail",
+                    kind=getattr(event, "kind", None),
+                    error=str(e),
+                    surface="prose",
+                )
+
+    return _sink
+
+
+def _invoke_gemini_prose(
+    state: GeminiLoopState,
+    *,
+    prompt: str,
+    event_sink,
+):
+    """Run one ephemeral Gemini turn for prose handling and capture crashes."""
+    try:
+        return (
+            _backend_run(
+                state,
+                prompt,
+                ephemeral=True,
+                event_sink=event_sink,
+            ),
+            None,
+        )
+    except Exception as e:
+        return None, e
+
+
+def _prose_fallback_reply(
+    state: GeminiLoopState,
+    *,
+    sender: str,
+    result: Any,
+) -> str:
+    """Build the diagnostics-backed fallback reply for one sender."""
+    from claude_anyteam import diagnostics
+
+    s = state.settings
+    error_class = diagnostics.classify_failure(result)
+    incident_id = diagnostics.record_incident(
+        team=s.team_name,
+        agent=s.agent_name,
+        backend="gemini",
+        error_class=error_class,
+        summary=(getattr(result, "error", None) or "no reply produced"),
+        sender=sender,
+        payload={
+            "exit_code": (result.exit_code if result is not None else None),
+            "tool_call_events": (
+                getattr(result, "tool_call_events", 0) if result is not None else 0
+            ),
+            "error": (getattr(result, "error", None) if result is not None else None),
+        },
+    )
+    return diagnostics.fallback_message(
+        backend="gemini",
+        incident_id=incident_id,
+        error_class=error_class,
+    )
+
+
 def _handle_prose(state: GeminiLoopState, msg: Any) -> None:
     s = state.settings
     sender = getattr(msg, "from_", "unknown")
@@ -445,48 +554,124 @@ def _handle_prose(state: GeminiLoopState, msg: Any) -> None:
         peer_prompt_fragments=_peer_prompt_fragments(state),
     )
     reply: str | None = None
-    result = None
-    try:
-        result = _backend_run(state, prompt, ephemeral=True)
+    result, exc = _invoke_gemini_prose(
+        state,
+        prompt=prompt,
+        event_sink=_prose_visibility_event_sink(state),
+    )
+    if exc is not None:
+        logger.warn("gemini.prose.crash", sender=sender, error=str(exc))
+    elif result is not None:
         if pio.should_skip_prose_fallback(result):
             logger.info("gemini.prose.delivered_via_tool", sender=sender, tool_calls=getattr(result, "tool_call_events", 0))
             return
         if result.exit_code == 0 and result.last_message:
             reply = result.last_message
-    except Exception as e:
-        logger.warn("gemini.prose.crash", sender=sender, error=str(e))
+        else:
+            logger.warn(
+                "gemini.prose.fail",
+                sender=sender,
+                exit_code=result.exit_code,
+                error=getattr(result, "error", None),
+            )
 
     if reply is None:
-        # Capture full error context to a diagnostic file and embed the
-        # incident_id in the user-facing reply. Same pattern as the Codex
-        # path in src/claude_anyteam/loop.py — broadly applicable across
-        # backends so the lead can run
-        # `claude-anyteam diagnose --incident <id>` regardless of which
-        # routed teammate hit the problem.
-        from claude_anyteam import diagnostics
-        error_class = diagnostics.classify_failure(result)
-        incident_id = diagnostics.record_incident(
-            team=s.team_name,
-            agent=s.agent_name,
-            backend="gemini",
-            error_class=error_class,
-            summary=(getattr(result, "error", None) or "no reply produced"),
-            sender=sender,
-            payload={
-                "exit_code": (result.exit_code if result is not None else None),
-                "tool_call_events": (getattr(result, "tool_call_events", 0) if result is not None else 0),
-                "error": (getattr(result, "error", None) if result is not None else None),
-            },
-        )
-        reply = diagnostics.fallback_message(
-            backend="gemini",
-            incident_id=incident_id,
-            error_class=error_class,
-        )
+        reply = _prose_fallback_reply(state, sender=sender, result=result)
     try:
         pio.send_prose(s.team_name, s.agent_name, sender, reply, summary="prose_reply")
+        logger.info("gemini.prose.reply_sent", sender=sender)
     except Exception as e:
         logger.warn("gemini.prose.reply_send_fail", sender=sender, error=str(e))
+
+
+def _handle_prose_batch(state: GeminiLoopState, messages: list[Any]) -> None:
+    """Handle consecutive prose messages with one ephemeral Gemini invocation."""
+    if not messages:
+        return
+    if len(messages) == 1:
+        _handle_prose(state, messages[0])
+        return
+
+    s = state.settings
+    senders = [getattr(m, "from_", "unknown") for m in messages]
+    logger.info("gemini.inbox.prose_batch", count=len(messages), senders=senders)
+
+    body_blocks = "\n\n".join(
+        f"[from {getattr(m, 'from_', 'unknown')}]: {m.text}" for m in messages
+    )
+    peer_section = _peer_prompt_fragments(state)
+    peer_tail = f"{peer_section}\n\n" if peer_section else ""
+    prompt = (
+        f"You are {s.agent_name}, a Gemini CLI teammate on the {s.team_name} team. "
+        f"You received {len(messages)} direct messages in this drain "
+        f"(senders: {', '.join(sorted(set(senders)))}). Read each below "
+        f"and reply to each sender independently using the "
+        f"mcp_anyteam_send_message MCP tool — call "
+        f"mcp_anyteam_send_message(to=<sender>, body=<your reply>) once per "
+        f"sender. Do not execute code unless explicitly asked.\n\n"
+        f"# Messages\n{body_blocks}\n\n"
+        f"{peer_tail}"
+        f"Do not produce a structured JSON object; address each sender via "
+        f"the mcp_anyteam_send_message tool. Final assistant prose, if any, "
+        f"is informational only — the per-sender deliveries happen via the tool."
+    )
+
+    result, exc = _invoke_gemini_prose(
+        state,
+        prompt=prompt,
+        event_sink=_prose_visibility_event_sink(state),
+    )
+    if exc is not None:
+        logger.warn("gemini.prose_batch.crash", error=str(exc), count=len(messages))
+    elif result is not None and result.exit_code != 0:
+        logger.warn(
+            "gemini.prose_batch.fail",
+            exit_code=result.exit_code,
+            error=getattr(result, "error", None),
+            count=len(messages),
+        )
+
+    success = (
+        exc is None
+        and result is not None
+        and result.exit_code == 0
+        and pio.should_skip_prose_fallback(result)
+    )
+    if success:
+        logger.info(
+            "gemini.prose_batch.delivered_via_tool",
+            count=len(messages),
+            tool_calls=getattr(result, "tool_call_events", 0),
+        )
+        return
+
+    if exc is None and result is not None and result.exit_code == 0 and result.last_message:
+        text = result.last_message
+        for m in messages:
+            sender = getattr(m, "from_", "unknown")
+            try:
+                pio.send_prose(
+                    s.team_name, s.agent_name, sender, text, summary="prose_reply"
+                )
+                logger.info("gemini.prose_batch.reply_sent", sender=sender)
+            except Exception as e:
+                logger.warn(
+                    "gemini.prose_batch.reply_send_fail", sender=sender, error=str(e)
+                )
+        return
+
+    for m in messages:
+        sender = getattr(m, "from_", "unknown")
+        reply = _prose_fallback_reply(state, sender=sender, result=result)
+        try:
+            pio.send_prose(
+                s.team_name, s.agent_name, sender, reply, summary="prose_reply"
+            )
+            logger.info("gemini.prose_batch.fallback_sent", sender=sender)
+        except Exception as e:
+            logger.warn(
+                "gemini.prose_batch.fallback_send_fail", sender=sender, error=str(e)
+            )
 
 
 def _handle_shutdown(state: GeminiLoopState, payload: ShutdownRequestIn) -> None:

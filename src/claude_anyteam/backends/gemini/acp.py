@@ -9,6 +9,7 @@ import signal
 import subprocess
 import threading
 import time
+from collections.abc import Callable
 from pathlib import Path
 from typing import Any
 
@@ -16,6 +17,7 @@ from claude_anyteam import logger
 from claude_anyteam.codex import CodexResult, PLAN_SCHEMA, TASK_COMPLETE_SCHEMA
 from claude_anyteam.env import identity_env
 from claude_anyteam.headless_visibility import HeadlessTurnVisibility
+from claude_anyteam.messages import VisibilityEvent
 from claude_anyteam.schema_validation import load_schema, parse_and_validate
 
 from . import crash_hygiene, invoke
@@ -354,6 +356,7 @@ def run(
     ephemeral: bool = False,
     trust_mode: str = "trusted",
     task_id: str | None = None,
+    event_sink: Callable[[VisibilityEvent], None] | None = None,
 ) -> CodexResult:
     if trust_mode not in TRUST_TO_ACP_MODE:
         raise ValueError(f"Gemini trust mode must be trusted, default, or plan, got {trust_mode!r}")
@@ -404,6 +407,7 @@ def run(
             "ephemeral": ephemeral,
             "gemini_home": str(home),
         },
+        event_sink=event_sink,
     )
 
     def _terminal_visibility(

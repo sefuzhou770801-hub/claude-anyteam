@@ -18,6 +18,7 @@ import tempfile
 import uuid
 from datetime import datetime, timezone
 from pathlib import Path
+from collections.abc import Callable
 from typing import Any
 
 from claude_anyteam import logger
@@ -29,6 +30,7 @@ from claude_anyteam.auth_preflight import (
 from claude_anyteam.codex import CodexResult, PLAN_SCHEMA, TASK_COMPLETE_SCHEMA
 from claude_anyteam.env import identity_env
 from claude_anyteam.headless_visibility import HeadlessTurnVisibility, coerce_stream_text
+from claude_anyteam.messages import VisibilityEvent
 from claude_anyteam.schema_validation import inline_schema_prompt_fragment, load_schema, parse_and_validate
 
 WRAPPER_SERVER_ALIAS = "anyteam"
@@ -520,6 +522,7 @@ def _run_once(
     kimi_home: Path | None,
     thinking: str,
     task_id: str | None,
+    event_sink: Callable[[VisibilityEvent], None] | None = None,
     retry_error: str | None = None,
 ) -> CodexResult:
     team, agent = wrapper_identity or ("default", "kimi")
@@ -578,6 +581,7 @@ def _run_once(
         resume_session_id=resume_session_id,
         task_id=task_id,
         extra_payload={"thinking": thinking},
+        event_sink=event_sink,
     )
     try:
         proc = subprocess.run(
@@ -678,6 +682,7 @@ def run(
     kimi_home: Path | None = None,
     thinking: str = "auto",
     task_id: str | None = None,
+    event_sink: Callable[[VisibilityEvent], None] | None = None,
 ) -> CodexResult:
     """Single Kimi invocation.
 
@@ -703,4 +708,5 @@ def run(
         kimi_home=kimi_home,
         thinking=thinking,
         task_id=task_id,
+        event_sink=event_sink,
     )

@@ -6,6 +6,7 @@ from unittest.mock import patch
 
 from claude_anyteam.backends.kimi import loop
 from claude_anyteam.backends.kimi.config import KimiSettings
+from claude_anyteam.codex import CodexResult
 
 
 def _settings(tmp_path: Path) -> KimiSettings:
@@ -17,6 +18,22 @@ def _settings(tmp_path: Path) -> KimiSettings:
         color="cyan",
         plan_mode_required=False,
         kimi_binary="kimi",
+    )
+
+
+def _prose_result(
+    text: str = "",
+    *,
+    exit_code: int = 0,
+    tool_call_events: int = 0,
+) -> CodexResult:
+    return CodexResult(
+        exit_code=exit_code,
+        structured=None,
+        last_message=text,
+        events=[],
+        tool_call_events=tool_call_events,
+        error=None if exit_code == 0 else "failed",
     )
 
 
@@ -35,6 +52,100 @@ def test_backend_run_drops_resume_session_for_ephemeral_invocations(tmp_path: Pa
 
     assert calls[0]["resume_session_id"] is None
     assert calls[1]["resume_session_id"] == "durable-session"
+
+
+def test_main_loop_batches_five_idle_peer_dms_into_one_kimi_invocation(tmp_path: Path, monkeypatch):
+    """5 peer prose DMs in one idle inbox drain -> one Kimi invocation."""
+    state = loop.KimiLoopState(settings=_settings(tmp_path))
+    messages = [
+        SimpleNamespace(from_=f"peer-{idx}", text=f"hello {idx}", summary="dm")
+        for idx in range(5)
+    ]
+    invocations: list[dict] = []
+
+    def fake_backend_run(_state, prompt: str, **kwargs):
+        invocations.append({"prompt": prompt, **kwargs})
+        _state.approved_shutdown = True
+        return _prose_result(tool_call_events=5)
+
+    monkeypatch.setattr(loop.pio, "read_own_inbox", lambda *a: messages)
+    monkeypatch.setattr(loop, "_backend_run", fake_backend_run)
+    monkeypatch.setattr(loop.pio, "send_prose", lambda *a, **k: None)
+
+    loop._main_loop(state)
+
+    assert len(invocations) == 1
+    prompt = invocations[0]["prompt"]
+    assert prompt.count("[from peer-") == 5
+    assert invocations[0]["ephemeral"] is True
+
+
+def test_handle_prose_batch_preserves_per_sender_fallback_on_crash(tmp_path: Path, monkeypatch):
+    state = loop.KimiLoopState(settings=_settings(tmp_path))
+    messages = [
+        SimpleNamespace(from_="peer-a", text="hi", summary="dm"),
+        SimpleNamespace(from_="peer-b", text="yo", summary="dm"),
+        SimpleNamespace(from_="peer-c", text="?", summary="dm"),
+    ]
+    sent: list[tuple[str, str]] = []
+
+    def crashing_backend_run(*_args, **_kwargs):
+        raise RuntimeError("kimi crashed")
+
+    monkeypatch.setattr(loop, "_backend_run", crashing_backend_run)
+    monkeypatch.setattr(
+        loop.pio,
+        "send_prose",
+        lambda team, sender, to, text, summary: sent.append((to, text)),
+    )
+
+    loop._handle_prose_batch(state, messages)
+
+    assert sorted(to for to, _ in sent) == ["peer-a", "peer-b", "peer-c"]
+    for _, text in sent:
+        assert "incident=" in text
+        assert "adapter=kimi" in text
+
+
+def test_handle_prose_batch_single_message_uses_fast_path(tmp_path: Path, monkeypatch):
+    state = loop.KimiLoopState(settings=_settings(tmp_path))
+    msg = SimpleNamespace(from_="peer-solo", text="just one", summary="dm")
+    calls: list[object] = []
+
+    monkeypatch.setattr(loop, "_handle_prose", lambda _state, _msg: calls.append(_msg))
+
+    loop._handle_prose_batch(state, [msg])
+
+    assert calls == [msg]
+
+
+def test_kimi_prose_paths_pass_visibility_event_sink(tmp_path: Path, monkeypatch):
+    state = loop.KimiLoopState(settings=_settings(tmp_path))
+    invocations: list[dict] = []
+
+    def fake_backend_run(_state, _prompt: str, **kwargs):
+        invocations.append(kwargs)
+        return _prose_result("reply")
+
+    monkeypatch.setattr(loop, "_backend_run", fake_backend_run)
+    monkeypatch.setattr(loop.pio, "send_prose", lambda *a, **k: None)
+
+    loop._handle_prose_batch(
+        state,
+        [SimpleNamespace(from_="peer-one", text="one", summary="dm")],
+    )
+    loop._handle_prose_batch(
+        state,
+        [
+            SimpleNamespace(from_="peer-two", text="two", summary="dm"),
+            SimpleNamespace(from_="peer-three", text="three", summary="dm"),
+        ],
+    )
+
+    assert len(invocations) == 2
+    assert all(call["ephemeral"] is True for call in invocations)
+    assert all(call["event_sink"] is not None for call in invocations)
+    assert all(callable(call["event_sink"]) for call in invocations)
 
 
 def test_kimi_mark_blocked_skips_when_task_already_completed(tmp_path: Path):

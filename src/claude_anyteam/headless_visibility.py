@@ -13,6 +13,7 @@ import json
 from dataclasses import dataclass
 from pathlib import Path
 from types import SimpleNamespace
+from collections.abc import Callable
 from typing import Any
 
 from . import logger
@@ -202,6 +203,7 @@ class HeadlessTurnVisibility:
     seq: int = 0
     mode: str = "task"
     prompt_kind: str = "task_complete"
+    event_sink: Callable[[VisibilityEvent], None] | None = None
 
     @classmethod
     def start(
@@ -219,6 +221,7 @@ class HeadlessTurnVisibility:
         resume_session_id: str | None,
         task_id: str | None = None,
         extra_payload: dict[str, Any] | None = None,
+        event_sink: Callable[[VisibilityEvent], None] | None = None,
     ) -> "HeadlessTurnVisibility":
         prompt_kind = prompt_kind_for_schema(schema)
         mode = "prose" if schema is None else "task"
@@ -232,6 +235,7 @@ class HeadlessTurnVisibility:
             started_at=time.monotonic(),
             mode=mode,
             prompt_kind=prompt_kind,
+            event_sink=event_sink,
         )
         payload: dict[str, Any] = {
             "mode": mode,
@@ -286,16 +290,28 @@ class HeadlessTurnVisibility:
                 "payload": payload,
             }
         )
-        try:
-            pio.append_event(self.team, self.agent, event)
-        except Exception as exc:
-            logger.warn(
-                "headless_visibility.append_fail",
-                backend=self.backend,
-                kind=kind,
-                agent=self.agent,
-                error=str(exc),
-            )
+        if self.event_sink is not None:
+            try:
+                self.event_sink(event)
+            except Exception as exc:
+                logger.warn(
+                    "headless_visibility.event_sink_failed",
+                    backend=self.backend,
+                    kind=kind,
+                    agent=self.agent,
+                    error=str(exc),
+                )
+        else:
+            try:
+                pio.append_event(self.team, self.agent, event)
+            except Exception as exc:
+                logger.warn(
+                    "headless_visibility.append_fail",
+                    backend=self.backend,
+                    kind=kind,
+                    agent=self.agent,
+                    error=str(exc),
+                )
         return event
 
     def terminal(

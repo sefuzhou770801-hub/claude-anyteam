@@ -210,6 +210,7 @@ def _backend_run(
     resume_session_id: str | None = None,
     ephemeral: bool = False,
     task_id: str | None = None,
+    event_sink=None,
 ):
     s = state.settings
     if s.backend == "acp":
@@ -227,6 +228,7 @@ def _backend_run(
         "thinking": s.thinking,
         "resume_session_id": resume_session_id,
         "task_id": task_id,
+        "event_sink": event_sink,
     }
     return headless_invoke.run(prompt, **kwargs)
 
@@ -237,8 +239,12 @@ def _main_loop(state: KimiLoopState) -> None:
     idle_last_sent_at: float | None = None
     while not state.approved_shutdown:
         messages = pio.read_own_inbox(s.team_name, s.agent_name, s.agent_name)
-        for m in messages:
-            _handle_message(state, m)
+        for kind, group in _partition_inbox(messages):
+            if kind == "prose":
+                _handle_prose_batch(state, group)
+            else:
+                for m in group:
+                    _handle_message(state, m)
             if state.approved_shutdown:
                 return
 
@@ -286,6 +292,28 @@ def _handle_message(state: KimiLoopState, msg: Any) -> None:
         _handle_steer(state, payload, msg)
     else:
         logger.debug("kimi.inbox.protocol_noop", type=payload.__class__.__name__)
+
+
+def _partition_inbox(messages: list[Any]) -> list[tuple[str, list[Any]]]:
+    """Group consecutive prose inbox messages while preserving protocol order.
+
+    Mirrors the Codex #18 prose-handler cascade fix: a burst of N plain-text
+    peer DMs in one drain becomes one prose batch instead of N independent
+    Kimi invocations. Protocol messages stay one-per-dispatch so shutdown,
+    plan, capability-manifest, and steer handling retain their idempotent
+    control flow.
+    """
+    groups: list[tuple[str, list[Any]]] = []
+    for m in messages:
+        is_prose = parse_protocol_text(m.text) is None
+        if is_prose:
+            if groups and groups[-1][0] == "prose":
+                groups[-1][1].append(m)
+            else:
+                groups.append(("prose", [m]))
+        else:
+            groups.append(("protocol", [m]))
+    return groups
 
 
 def _peer_prompt_fragments(state: KimiLoopState) -> str:
@@ -387,6 +415,100 @@ def _steer_prefix_for_task(state: KimiLoopState, task: Any) -> str:
     return "\n".join(lines)
 
 
+def _prose_visibility_event_sink(state: KimiLoopState):
+    """Build the prose-turn visibility sink for Kimi headless invocations.
+
+    Kimi's headless runner emits normalized ``turn_started`` / ``tool_event`` /
+    ``turn_completed`` envelopes through ``HeadlessTurnVisibility``. Passing an
+    explicit sink here mirrors Codex #18's prose-mode visibility wiring and
+    keeps prose-time activity on the same event-log surface as task turns.
+    """
+    s = state.settings
+
+    def _sink(event) -> None:
+        try:
+            pio.append_event(s.team_name, s.agent_name, event)
+        except Exception as e:
+            logger.warn(
+                "kimi.visibility.append_fail",
+                kind=getattr(event, "kind", None),
+                error=str(e),
+                surface="prose",
+            )
+        visibility = getattr(event, "visibility", None)
+        if getattr(visibility, "mailbox", False):
+            try:
+                pio.send_visibility_event_to_lead(
+                    s.team_name,
+                    s.agent_name,
+                    event,
+                    summary=event.summary[:120],
+                )
+            except Exception as e:
+                logger.warn(
+                    "kimi.visibility.mailbox_fail",
+                    kind=getattr(event, "kind", None),
+                    error=str(e),
+                    surface="prose",
+                )
+
+    return _sink
+
+
+def _invoke_kimi_prose(
+    state: KimiLoopState,
+    *,
+    prompt: str,
+    event_sink,
+):
+    """Run one ephemeral Kimi turn for prose handling and capture crashes."""
+    try:
+        return (
+            _backend_run(
+                state,
+                prompt,
+                ephemeral=True,
+                event_sink=event_sink,
+            ),
+            None,
+        )
+    except Exception as e:
+        return None, e
+
+
+def _prose_fallback_reply(
+    state: KimiLoopState,
+    *,
+    sender: str,
+    result: Any,
+) -> str:
+    """Build the diagnostics-backed fallback reply for one sender."""
+    from claude_anyteam import diagnostics
+
+    s = state.settings
+    error_class = diagnostics.classify_failure(result)
+    incident_id = diagnostics.record_incident(
+        team=s.team_name,
+        agent=s.agent_name,
+        backend="kimi",
+        error_class=error_class,
+        summary=(getattr(result, "error", None) or "no reply produced"),
+        sender=sender,
+        payload={
+            "exit_code": (result.exit_code if result is not None else None),
+            "tool_call_events": (
+                getattr(result, "tool_call_events", 0) if result is not None else 0
+            ),
+            "error": (getattr(result, "error", None) if result is not None else None),
+        },
+    )
+    return diagnostics.fallback_message(
+        backend="kimi",
+        incident_id=incident_id,
+        error_class=error_class,
+    )
+
+
 def _handle_prose(state: KimiLoopState, msg: Any) -> None:
     s = state.settings
     sender = getattr(msg, "from_", "unknown")
@@ -399,46 +521,122 @@ def _handle_prose(state: KimiLoopState, msg: Any) -> None:
         peer_prompt_fragments=_peer_prompt_fragments(state),
     )
     reply: str | None = None
-    result = None
-    try:
-        result = _backend_run(state, prompt, ephemeral=True)
+    result, exc = _invoke_kimi_prose(
+        state,
+        prompt=prompt,
+        event_sink=_prose_visibility_event_sink(state),
+    )
+    if exc is not None:
+        logger.warn("kimi.prose.crash", sender=sender, error=str(exc))
+    elif result is not None:
         if pio.should_skip_prose_fallback(result):
             logger.info("kimi.prose.delivered_via_tool", sender=sender, tool_calls=getattr(result, "tool_call_events", 0))
             return
         if result.exit_code == 0 and result.last_message:
             reply = result.last_message
-    except Exception as e:
-        logger.warn("kimi.prose.crash", sender=sender, error=str(e))
+        else:
+            logger.warn(
+                "kimi.prose.fail",
+                sender=sender,
+                exit_code=result.exit_code,
+                error=getattr(result, "error", None),
+            )
     if reply is None:
-        # See diagnostics module + Codex/Gemini loops — same pattern across
-        # all three backends so the lead can grep / diagnose without
-        # per-backend knowledge.
-        from claude_anyteam import diagnostics
-        error_class = diagnostics.classify_failure(result)
-        incident_id = diagnostics.record_incident(
-            team=s.team_name,
-            agent=s.agent_name,
-            backend="kimi",
-            error_class=error_class,
-            summary=(getattr(result, "error", None) or "no reply produced"),
-            sender=sender,
-            payload={
-                "exit_code": (result.exit_code if result is not None else None),
-                "tool_call_events": (getattr(result, "tool_call_events", 0) if result is not None else 0),
-                "error": (getattr(result, "error", None) if result is not None else None),
-            },
-        )
-        reply = diagnostics.fallback_message(
-            backend="kimi",
-            incident_id=incident_id,
-            error_class=error_class,
-        )
+        reply = _prose_fallback_reply(state, sender=sender, result=result)
     try:
         pio.send_prose(s.team_name, s.agent_name, sender, reply, summary="prose_reply")
+        logger.info("kimi.prose.reply_sent", sender=sender)
     except Exception as e:
         logger.warn("kimi.prose.reply_send_fail", sender=sender, error=str(e))
 
 
+def _handle_prose_batch(state: KimiLoopState, messages: list[Any]) -> None:
+    """Handle consecutive prose messages with one ephemeral Kimi invocation."""
+    if not messages:
+        return
+    if len(messages) == 1:
+        _handle_prose(state, messages[0])
+        return
+
+    s = state.settings
+    senders = [getattr(m, "from_", "unknown") for m in messages]
+    logger.info("kimi.inbox.prose_batch", count=len(messages), senders=senders)
+
+    body_blocks = "\n\n".join(
+        f"[from {getattr(m, 'from_', 'unknown')}]: {m.text}" for m in messages
+    )
+    peer_section = _peer_prompt_fragments(state)
+    peer_tail = f"{peer_section}\n\n" if peer_section else ""
+    prompt = (
+        f"You are {s.agent_name}, a Kimi CLI teammate on the {s.team_name} team. "
+        f"You received {len(messages)} direct messages in this drain "
+        f"(senders: {', '.join(sorted(set(senders)))}). Read each below "
+        f"and reply to each sender independently using the send_message MCP "
+        f"tool — call send_message(to=<sender>, body=<your reply>) once per "
+        f"sender. Do not execute code unless explicitly asked.\n\n"
+        f"# Messages\n{body_blocks}\n\n"
+        f"{peer_tail}"
+        f"Do not produce a structured JSON object; address each sender via "
+        f"the send_message tool. Final assistant prose, if any, is "
+        f"informational only — the per-sender deliveries happen via the tool."
+    )
+
+    result, exc = _invoke_kimi_prose(
+        state,
+        prompt=prompt,
+        event_sink=_prose_visibility_event_sink(state),
+    )
+    if exc is not None:
+        logger.warn("kimi.prose_batch.crash", error=str(exc), count=len(messages))
+    elif result is not None and result.exit_code != 0:
+        logger.warn(
+            "kimi.prose_batch.fail",
+            exit_code=result.exit_code,
+            error=getattr(result, "error", None),
+            count=len(messages),
+        )
+
+    success = (
+        exc is None
+        and result is not None
+        and result.exit_code == 0
+        and pio.should_skip_prose_fallback(result)
+    )
+    if success:
+        logger.info(
+            "kimi.prose_batch.delivered_via_tool",
+            count=len(messages),
+            tool_calls=getattr(result, "tool_call_events", 0),
+        )
+        return
+
+    if exc is None and result is not None and result.exit_code == 0 and result.last_message:
+        text = result.last_message
+        for m in messages:
+            sender = getattr(m, "from_", "unknown")
+            try:
+                pio.send_prose(
+                    s.team_name, s.agent_name, sender, text, summary="prose_reply"
+                )
+                logger.info("kimi.prose_batch.reply_sent", sender=sender)
+            except Exception as e:
+                logger.warn(
+                    "kimi.prose_batch.reply_send_fail", sender=sender, error=str(e)
+                )
+        return
+
+    for m in messages:
+        sender = getattr(m, "from_", "unknown")
+        reply = _prose_fallback_reply(state, sender=sender, result=result)
+        try:
+            pio.send_prose(
+                s.team_name, s.agent_name, sender, reply, summary="prose_reply"
+            )
+            logger.info("kimi.prose_batch.fallback_sent", sender=sender)
+        except Exception as e:
+            logger.warn(
+                "kimi.prose_batch.fallback_send_fail", sender=sender, error=str(e)
+            )
 
 
 def _handle_shutdown(state: KimiLoopState, payload: ShutdownRequestIn) -> None:
