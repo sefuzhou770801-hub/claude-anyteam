@@ -23,6 +23,7 @@ Safety properties:
 from __future__ import annotations
 
 import json
+import os
 import signal
 import time
 from dataclasses import dataclass, field
@@ -254,7 +255,16 @@ def _handle_message(state: LoopState, msg: Any) -> None:
 
 
 def _peer_prompt_fragments(state: LoopState) -> str:
-    """Return cached R14 peer capability prompt fragments for this turn."""
+    """Return cached R14 peer capability prompt fragments for this turn.
+
+    Honors the S10a ablation knob ``CLAUDE_ANYTEAM_DISABLE_PEER_PROMPT_FRAGMENTS=1``
+    per references/external-claude-code-re/proto-rev-execution-log/specs/
+    S10-ablation-implementation-spec.md §2 — when set, returns empty string
+    so peer-capability fragments are absent from the system prompt without
+    touching the cache or substrate.
+    """
+    if os.environ.get("CLAUDE_ANYTEAM_DISABLE_PEER_PROMPT_FRAGMENTS") == "1":
+        return ""
     if state.peer_manifest_cache is None:
         return ""
     try:

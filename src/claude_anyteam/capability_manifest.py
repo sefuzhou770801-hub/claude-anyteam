@@ -299,6 +299,15 @@ class CapabilityManifestCache:
         # Load the complete local Agent Card cache. Adapter consumers usually
         # read peers from it; wrapper MCP can also answer questions about the
         # caller's own manifest without a special case.
+        #
+        # S10b ablation per S10-ablation-implementation-spec.md §1: when
+        # ``CLAUDE_ANYTEAM_DISABLE_MANIFEST_CACHE=1``, skip the load so peers
+        # have no manifest data even if the JSON files exist on disk. This
+        # tests R12+R13+R14 jointly — does the manifest layer do real work?
+        if os.environ.get("CLAUDE_ANYTEAM_DISABLE_MANIFEST_CACHE") == "1":
+            logger.info("capability_manifest.cache_disabled_by_env")
+            self.manifests = {}
+            return
         self.manifests = load_manifest_cache(self.team_root)
 
     def refresh_from_inbox(self, *, unread_only: bool = False) -> int:
@@ -312,6 +321,10 @@ class CapabilityManifestCache:
         )
 
     def apply_update(self, update: CapabilityManifestUpdatedIn) -> bool:
+        # S10b ablation: no-op when manifest cache is disabled — incoming
+        # capability updates are silently dropped so peers remain unaware.
+        if os.environ.get("CLAUDE_ANYTEAM_DISABLE_MANIFEST_CACHE") == "1":
+            return False
         return apply_update_to_cache(
             self.manifests,
             self.team_root,

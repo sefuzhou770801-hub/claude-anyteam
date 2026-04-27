@@ -564,6 +564,12 @@ def build_server(argv: list[str] | None = None) -> FastMCP:
         """
         if not agent_name:
             raise ToolError("agent_name must not be empty; use read_config() to discover teammate names")
+        # S10b ablation per S10-ablation-implementation-spec.md §1: when the
+        # manifest cache is disabled, the wrapper MCP returns an empty Agent
+        # Card so peers see no capability data at all even if their wrapper
+        # bypasses the cache layer directly.
+        if os.environ.get("CLAUDE_ANYTEAM_DISABLE_MANIFEST_CACHE") == "1":
+            return {}
         try:
             cfg = _cs_teams.read_config(team)
         except FileNotFoundError:
