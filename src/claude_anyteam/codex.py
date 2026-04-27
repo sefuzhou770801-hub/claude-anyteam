@@ -484,6 +484,8 @@ def run(
     if wrapper_identity is not None:
         team_name, agent_name = wrapper_identity
         sub_env = identity_env(os.environ, team=team_name, name=agent_name)
+        if task_id is not None:
+            sub_env["CLAUDE_ANYTEAM_TASK_ID"] = str(task_id)
 
     logger.info(
         "codex.invoke",
@@ -1122,11 +1124,15 @@ def app_server_invoke(
     # "connection closed: initialize response"). CLI args sidestep the
     # env-forwarding question entirely; the wrapper's `_identity()` resolves
     # CLI flags first, then env as fallback for backward compat.
+    wrapper_args = ["--team", settings_team, "--name", settings_agent]
+    if task_id is not None:
+        wrapper_args += ["--task-id", str(task_id)]
+
     mcp_config = {
         "mcp_servers": {
             "claude_anyteam_wrapper": {
                 "command": wrapper_binary,
-                "args": ["--team", settings_team, "--name", settings_agent],
+                "args": wrapper_args,
             }
         }
     }

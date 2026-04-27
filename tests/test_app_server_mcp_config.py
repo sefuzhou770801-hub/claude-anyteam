@@ -15,7 +15,9 @@ from claude_anyteam import app_server as app_server_mod
 from claude_anyteam import codex as codex_mod
 
 
-def _capture_thread_start_config(*, settings_team: str, settings_agent: str) -> dict:
+def _capture_thread_start_config(
+    *, settings_team: str, settings_agent: str, task_id: str | None = None
+) -> dict:
     """Invoke app_server_invoke with enough mocking that no real Codex
     runs, and capture the `config` dict passed to `thread_start`."""
     captured: dict = {}
@@ -69,6 +71,7 @@ def _capture_thread_start_config(*, settings_team: str, settings_agent: str) -> 
             schema=None,
             settings_team=settings_team,
             settings_agent=settings_agent,
+            task_id=task_id,
         )
     return captured["thread_start_kwargs"]["config"]
 
@@ -88,6 +91,19 @@ def test_mcp_config_wrapper_args_include_team_and_name():
     assert mcp["args"][team_idx + 1] == "claude-anyteam"
     name_idx = mcp["args"].index("--name")
     assert mcp["args"][name_idx + 1] == "codex-alice"
+
+
+def test_mcp_config_wrapper_args_include_task_id_when_available():
+    """Task id scopes wrapper manifest-query freshness to the active task turn."""
+    config = _capture_thread_start_config(
+        settings_team="claude-anyteam",
+        settings_agent="codex-alice",
+        task_id="58",
+    )
+    mcp = config["mcp_servers"]["claude_anyteam_wrapper"]
+    assert "--task-id" in mcp["args"]
+    task_idx = mcp["args"].index("--task-id")
+    assert mcp["args"][task_idx + 1] == "58"
 
 
 def test_mcp_config_wrapper_command_is_resolved_path():

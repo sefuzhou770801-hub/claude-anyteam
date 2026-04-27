@@ -22,6 +22,7 @@ overrides on `codex exec`. Lifetime matches the Codex invocation.
 Environment:
 - `CLAUDE_ANYTEAM_TEAM` — our team name (required).
 - `CLAUDE_ANYTEAM_NAME` — our teammate name within the team (required).
+- `CLAUDE_ANYTEAM_TASK_ID` — optional task-turn scope for manifest freshness.
 
 Legacy `CODEX_TEAMMATE_*` identity vars are still honored as fallbacks during the rebrand.
 """
@@ -54,6 +55,9 @@ from fastmcp import FastMCP
 from fastmcp.exceptions import ToolError
 
 logger = logging.getLogger("claude_anyteam.wrapper")
+
+TASK_ID_ENV = "CLAUDE_ANYTEAM_TASK_ID"
+LEGACY_TASK_ID_ENV = "CODEX_TEAMMATE_TASK_ID"
 
 
 class PeerSteerManifestCheckError(ToolError):
@@ -210,6 +214,26 @@ def _identity(argv: list[str] | None = None) -> tuple[str, str]:
     return team, name
 
 
+def _task_id_scope(argv: list[str] | None = None) -> str | None:
+    """Resolve the optional task id used to scope manifest-query freshness."""
+
+    task_id: str | None = None
+    args = list(argv) if argv is not None else sys.argv[1:]
+    i = 0
+    while i < len(args):
+        tok = args[i]
+        if tok == "--task-id" and i + 1 < len(args):
+            task_id = args[i + 1]
+            i += 2
+        elif tok.startswith("--task-id="):
+            task_id = tok.split("=", 1)[1]
+            i += 1
+        else:
+            i += 1
+
+    return task_id or env_first(os.environ, TASK_ID_ENV, LEGACY_TASK_ID_ENV)
+
+
 
 def _decode_bytes(data: bytes) -> tuple[str, str]:
     """Decode arbitrary file/HTTP bytes without raising on bad text."""
@@ -351,6 +375,7 @@ def _exception_payload(exc: BaseException) -> dict[str, Any]:
 def build_server(argv: list[str] | None = None) -> FastMCP:
     """Construct the FastMCP app with the narrowed tools."""
     team, self_name = _identity(argv)
+    wrapper_task_id = _task_id_scope(argv)
 
     mcp = FastMCP(
         name="claude-anyteam-wrapper",
@@ -375,8 +400,7 @@ def build_server(argv: list[str] | None = None) -> FastMCP:
 
     visibility_seq = 0
     wrapper_turn_id = f"wrapper-{os.getpid()}"
-    tool_call_seq = 0
-    manifest_query_seq_by_recipient: dict[str, int] = {}
+    manifest_query_task_by_recipient: dict[str, str] = {}
 
     def _fanout_visibility_event(
         event: VisibilityEvent,
@@ -513,13 +537,13 @@ def build_server(argv: list[str] | None = None) -> FastMCP:
         return event
 
     def _record_manifest_query(agent_name: str) -> None:
-        manifest_query_seq_by_recipient[agent_name] = tool_call_seq
+        manifest_query_task_by_recipient[agent_name] = wrapper_task_id or wrapper_turn_id
 
     def _recent_manifest_query(agent_name: str) -> bool:
-        last_seq = manifest_query_seq_by_recipient.get(agent_name)
-        if last_seq is None:
+        last_task_id = manifest_query_task_by_recipient.get(agent_name)
+        if last_task_id is None:
             return False
-        return (tool_call_seq - last_seq) <= _peer_steer_manifest_max_age_turns()
+        return last_task_id == (wrapper_task_id or wrapper_turn_id)
 
     def _manifest_accepts_peer_steer(manifest: Any) -> bool:
         if not isinstance(manifest, dict):
@@ -618,8 +642,6 @@ def build_server(argv: list[str] | None = None) -> FastMCP:
 
             @functools.wraps(func)
             def wrapper(*args: Any, **kwargs: Any) -> Any:
-                nonlocal tool_call_seq
-                tool_call_seq += 1
                 bound_args = _bind_tool_arguments(signature, args, kwargs)
                 target = _tool_target(tool_name, bound_args)
                 started_at = time.monotonic()

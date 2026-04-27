@@ -159,6 +159,26 @@ def test_fresh_exec_still_includes_schema_and_cwd():
     assert "resume" not in argv
 
 
+def test_codex_exec_sets_task_id_env_for_wrapper(events_root, tmp_path):
+    captured: dict = {}
+
+    def fake_run(args, **kwargs):
+        captured["env"] = kwargs.get("env")
+        return subprocess.CompletedProcess(args, 0, stdout="", stderr="")
+
+    with patch.object(codex_mod.subprocess, "run", side_effect=fake_run):
+        codex_mod.run(
+            prompt="noop",
+            cwd=tmp_path,
+            schema=None,
+            codex_binary="codex",
+            wrapper_identity=("team-x", "codex-a"),
+            task_id="58",
+        )
+
+    assert captured["env"]["CLAUDE_ANYTEAM_TASK_ID"] == "58"
+
+
 def test_codex_exec_emits_headless_turn_digest(events_root, tmp_path):
     stdout = "\n".join([
         json.dumps({"type": "thread.started", "thread_id": "thread-1"}),

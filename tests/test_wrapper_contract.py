@@ -753,7 +753,7 @@ def test_wrapper_peer_steer_allowed_with_recent_manifest_query(
     assert _wrapper_refusals() == []
 
 
-def test_wrapper_peer_steer_max_age_turns_respected(
+def test_wrapper_peer_steer_manifest_query_stays_fresh_after_intervening_tools(
     identity,
     monkeypatch,
 ):
@@ -766,15 +766,15 @@ def test_wrapper_peer_steer_max_age_turns_respected(
     )
     _call_existing_tool(mcp, "read_config", {})
 
-    with pytest.raises(Exception, match="manifest_not_queried"):
-        _call_existing_tool(
-            mcp,
-            "send_message",
-            {"to": "peer-a", "body": _steer_body(), "summary": "peer steer"},
-        )
+    result = _call_existing_tool(
+        mcp,
+        "send_message",
+        {"to": "peer-a", "body": _steer_body(), "summary": "peer steer"},
+    )
 
-    assert _peer_a_inbox(identity) == []
-    assert len(_wrapper_refusals()) == 1
+    assert result == {"delivered_to": "peer-a", "sender": "contract-test"}
+    assert len(_peer_a_inbox(identity)) == 1
+    assert _wrapper_refusals() == []
 
 
 def test_wrapper_enforce_disabled_ablation(
