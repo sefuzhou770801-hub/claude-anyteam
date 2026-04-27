@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import json
 from pathlib import Path
+from types import SimpleNamespace
 from unittest.mock import patch
 
 import pytest
@@ -9,7 +10,9 @@ from claude_teams import messaging as cs_messaging  # type: ignore[import-untype
 
 from claude_anyteam import app_server as app_server_mod
 from claude_anyteam import codex as codex_mod
+from claude_anyteam import loop as loop_mod
 from claude_anyteam import protocol_io as pio
+from claude_anyteam.config import Settings
 from claude_anyteam.messages import VisibilityEvent
 
 
@@ -36,6 +39,19 @@ def _event(kind: str, seq: int, **overrides) -> VisibilityEvent:
     }
     data.update(overrides)
     return VisibilityEvent.model_validate(data)
+
+
+def _settings() -> Settings:
+    return Settings(
+        team_name="team-x",
+        agent_name="codex-runtime",
+        cwd=Path("/tmp").resolve(),
+        poll_interval_s=0.01,
+        color="cyan",
+        plan_mode_required=False,
+        codex_binary="codex",
+        app_server=True,
+    )
 
 
 class _FakeClient:
@@ -125,7 +141,7 @@ def test_send_visibility_event_to_lead_sets_message_kind(events_root: Path):
     assert body["payload"] == {}
 
 
-def test_app_server_command_execution_writes_tool_event_to_event_log(events_root: Path):
+def test_app_server_command_execution_writes_tool_event_to_event_log_and_active_form(events_root: Path):
     notifications = [
         {
             "method": "item/completed",
@@ -145,21 +161,24 @@ def test_app_server_command_execution_writes_tool_event_to_event_log(events_root
     def make_client(*args, **kwargs):
         return _FakeClient(*args, notifications=notifications, **kwargs)
 
+    update_calls: list[tuple[tuple, dict]] = []
     with patch.object(app_server_mod, "AppServerClient", make_client):
-        result = codex_mod.app_server_invoke(
-            task_prompt="run tests",
-            cwd=Path("/tmp"),
-            schema=None,
-            settings_team="team-x",
-            settings_agent="codex-runtime",
-            task_id="16",
-            event_sink=lambda event: pio.append_visibility_event(
-                "team-x", "codex-runtime", event
+        with (
+            patch.object(loop_mod.pio, "read_own_inbox", return_value=[]),
+            patch.object(
+                loop_mod.pio,
+                "update_task",
+                side_effect=lambda *a, **k: update_calls.append((a, k)),
             ),
-        )
+        ):
+            result = loop_mod._execute_task_app_server(
+                loop_mod.LoopState(settings=_settings()),
+                SimpleNamespace(id="16"),
+                "run tests",
+            )
 
     assert result.exit_code == 0
-    events = pio.read_visibility_events("team-x", "codex-runtime")
+    events = pio.read_events("team-x", "codex-runtime")
     tool_events = [e for e in events if e.kind == "tool_event"]
     assert len(tool_events) == 1
     payload = tool_events[0].payload
@@ -170,6 +189,205 @@ def test_app_server_command_execution_writes_tool_event_to_event_log(events_root
     assert payload["exit_code"] == 0
     assert all(e.visibility.event_log for e in events)
     assert not any(e.visibility.stderr and not e.visibility.event_log for e in events)
+    assert any(
+        kwargs.get("active_form")
+        == "commandExecution: uv run pytest tests/test_visibility_events.py"[:120]
+        for _, kwargs in update_calls
+    )
+
+
+def test_app_server_file_changes_write_artifact_events(events_root: Path):
+    notifications = [
+        {
+            "method": "item/completed",
+            "params": {
+                "item": {
+                    "type": "fileChange",
+                    "path": path,
+                    "action": action,
+                    "bytesDelta": bytes_delta,
+                }
+            },
+        }
+        for path, action, bytes_delta in (
+            ("src/a.py", "created", 11),
+            ("src/b.py", "modified", -3),
+            ("tests/test_c.py", "deleted", -42),
+        )
+    ] + [{"method": "turn/completed", "params": {"turn": {"status": "ok"}}}]
+
+    def make_client(*args, **kwargs):
+        return _FakeClient(*args, notifications=notifications, **kwargs)
+
+    with patch.object(app_server_mod, "AppServerClient", make_client):
+        result = codex_mod.app_server_invoke(
+            task_prompt="edit files",
+            cwd=Path("/tmp"),
+            schema=None,
+            settings_team="team-x",
+            settings_agent="codex-runtime",
+            task_id="16",
+            event_sink=lambda event: pio.append_event(
+                "team-x", "codex-runtime", event
+            ),
+        )
+
+    assert result.exit_code == 0
+    artifact_events = [
+        e for e in pio.read_events("team-x", "codex-runtime")
+        if e.kind == "artifact_event"
+    ]
+    assert len(artifact_events) == 3
+    assert [
+        (
+            event.payload["path"],
+            event.payload["action"],
+            event.payload["bytes_delta"],
+            event.payload["raw_backend_type"],
+        )
+        for event in artifact_events
+    ] == [
+        ("src/a.py", "created", 11, "fileChange"),
+        ("src/b.py", "modified", -3, "fileChange"),
+        ("tests/test_c.py", "deleted", -42, "fileChange"),
+    ]
+
+
+def test_app_server_web_search_writes_host_tool_event(events_root: Path):
+    notifications = [
+        {
+            "method": "item/completed",
+            "params": {
+                "item": {
+                    "type": "webSearch",
+                    "query": "R17 visibility parity",
+                    "status": "completed",
+                }
+            },
+        },
+        {"method": "turn/completed", "params": {"turn": {"status": "ok"}}},
+    ]
+
+    def make_client(*args, **kwargs):
+        return _FakeClient(*args, notifications=notifications, **kwargs)
+
+    with patch.object(app_server_mod, "AppServerClient", make_client):
+        result = codex_mod.app_server_invoke(
+            task_prompt="search web",
+            cwd=Path("/tmp"),
+            schema=None,
+            settings_team="team-x",
+            settings_agent="codex-runtime",
+            task_id="16",
+            event_sink=lambda event: pio.append_event(
+                "team-x", "codex-runtime", event
+            ),
+        )
+
+    assert result.exit_code == 0
+    tool_events = [
+        e for e in pio.read_events("team-x", "codex-runtime")
+        if e.kind == "tool_event"
+    ]
+    assert len(tool_events) == 1
+    payload = tool_events[0].payload
+    assert payload["category"] == "host_tool"
+    assert payload["tool_name"] == "webSearch"
+    assert payload["raw_backend_type"] == "webSearch"
+    assert payload["target"] == "R17 visibility parity"
+    assert payload["status"] == "success"
+
+
+@pytest.mark.parametrize(
+    ("item", "expected_kind"),
+    [
+        ({"type": "agentMessage", "text": "checkpoint ready"}, "turn_progress"),
+        ({"type": "imageGeneration", "prompt": "draw a frog"}, "tool_event"),
+        ({"type": "plan", "text": "1. inspect\n2. patch"}, "turn_progress"),
+        ({"type": "error", "message": "backend failed"}, "turn_warning"),
+    ],
+)
+def test_app_server_recognized_items_emit_normalized_envelopes(
+    events_root: Path,
+    item: dict,
+    expected_kind: str,
+):
+    notifications = [
+        {"method": "item/completed", "params": {"item": item}},
+        {"method": "turn/completed", "params": {"turn": {"status": "ok"}}},
+    ]
+
+    def make_client(*args, **kwargs):
+        return _FakeClient(*args, notifications=notifications, **kwargs)
+
+    with patch.object(app_server_mod, "AppServerClient", make_client):
+        result = codex_mod.app_server_invoke(
+            task_prompt="exercise event",
+            cwd=Path("/tmp"),
+            schema=None,
+            settings_team="team-x",
+            settings_agent="codex-runtime",
+            task_id="16",
+            event_sink=lambda event: pio.append_event(
+                "team-x", "codex-runtime", event
+            ),
+        )
+
+    assert result.exit_code == 0
+    matched = [
+        e
+        for e in pio.read_events("team-x", "codex-runtime")
+        if e.kind == expected_kind
+        and e.payload.get("raw_backend_type") == item["type"]
+    ]
+    assert matched, f"{item['type']} should emit a {expected_kind}"
+
+
+def test_app_server_without_event_sink_keeps_stderr_visibility(capsys):
+    notifications = [
+        {
+            "method": "item/completed",
+            "params": {
+                "item": {
+                    "type": "commandExecution",
+                    "command": "uv run pytest",
+                    "exitCode": 0,
+                }
+            },
+        },
+        {"method": "turn/completed", "params": {"turn": {"status": "ok"}}},
+    ]
+
+    def make_client(*args, **kwargs):
+        return _FakeClient(*args, notifications=notifications, **kwargs)
+
+    with patch.object(app_server_mod, "AppServerClient", make_client):
+        result = codex_mod.app_server_invoke(
+            task_prompt="run tests",
+            cwd=Path("/tmp"),
+            schema=None,
+            settings_team="team-x",
+            settings_agent="codex-runtime",
+            task_id="16",
+        )
+
+    assert result.exit_code == 0
+    stderr_records = [
+        json.loads(line)
+        for line in capsys.readouterr().err.splitlines()
+        if line.strip()
+    ]
+    visibility_records = [
+        record
+        for record in stderr_records
+        if record.get("msg") == "visibility.event"
+    ]
+    assert any(
+        record["visibility_event"]["kind"] == "tool_event"
+        and record["visibility_event"]["payload"]["raw_backend_type"]
+        == "commandExecution"
+        for record in visibility_records
+    )
 
 
 def test_app_server_no_checkpoint_after_300s_emits_turn_progress(monkeypatch):

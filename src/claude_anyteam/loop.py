@@ -49,6 +49,9 @@ from .messages import (
 from .registration import BackendMetadata, deregister, register
 
 
+APP_SERVER_TASK_STATE_SAMPLE_EVERY = 5
+
+
 @dataclass
 class LoopState:
     settings: Settings
@@ -863,6 +866,7 @@ def _execute_task_app_server(state: LoopState, task, prompt: str):
     steer_queue = codex_mod.SteerQueue(
         capabilities=_backend_metadata(s).capabilities,
     )
+    sampled_task_events = 0
 
     def _mid_turn_hook() -> None:
         # Drain own inbox. Prose messages become steer fragments; shutdown
@@ -926,8 +930,35 @@ def _execute_task_app_server(state: LoopState, task, prompt: str):
         flags (B9 §6.2-§6.4); backend-native names remain in payload fields.
         """
 
+        nonlocal sampled_task_events
+        visibility = getattr(event, "visibility", None)
+        task_state_requested = getattr(visibility, "task_state", False)
+        payload = getattr(event, "payload", {}) or {}
+        if (
+            not task_state_requested
+            and getattr(event, "kind", None) == "tool_event"
+            and payload.get("category") == "host_tool"
+            and payload.get("phase") == "completed"
+            and payload.get("status", "success") == "success"
+        ):
+            sampled_task_events += 1
+            task_state_requested = (
+                sampled_task_events == 1
+                or sampled_task_events % APP_SERVER_TASK_STATE_SAMPLE_EVERY == 0
+            )
+
+        if task_state_requested and not getattr(visibility, "task_state", False):
+            event = event.model_copy(
+                update={
+                    "visibility": event.visibility.model_copy(
+                        update={"task_state": True}
+                    )
+                }
+            )
+            visibility = getattr(event, "visibility", None)
+
         try:
-            pio.append_visibility_event(s.team_name, s.agent_name, event)
+            pio.append_event(s.team_name, s.agent_name, event)
         except Exception as e:
             logger.warn(
                 "visibility.append_fail",
@@ -935,13 +966,12 @@ def _execute_task_app_server(state: LoopState, task, prompt: str):
                 kind=getattr(event, "kind", None),
                 error=str(e),
             )
-        visibility = getattr(event, "visibility", None)
-        if getattr(visibility, "task_state", False):
+        if task_state_requested:
             try:
                 pio.update_task(
                     s.team_name,
                     task.id,
-                    active_form=f"running codex: {event.summary[:160]}",
+                    active_form=event.summary[:120],
                     metadata={
                         "visibility": {
                             "last_event_id": event.event_id,

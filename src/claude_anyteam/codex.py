@@ -93,6 +93,9 @@ _TOOL_CALL_TYPE_SUBSTRINGS = (
     "commandexecution",    # Codex App Server host shell
     "filechange",          # Codex App Server host file writes
     "websearch",           # Codex App Server web search
+    "imagegeneration",     # Codex App Server image generation
+    "imagegen",            # observed/possible abbreviated image tool spelling
+    "imageview",           # Codex App Server image view
 )
 
 # Tool names our wrapper MCP server advertises. If any event payload
@@ -662,7 +665,12 @@ def _item_exit_code(item: dict[str, Any]) -> int | None:
 def _item_status(item: dict[str, Any], *, exit_code: int | None) -> str | None:
     value = _first_present(item, "status", "outcome", "state")
     if isinstance(value, str) and value:
-        return value
+        normalized = value.strip().lower()
+        if normalized in {"success", "succeeded", "ok", "complete", "completed"}:
+            return "success"
+        if normalized in {"error", "failed", "failure"}:
+            return "error"
+        return normalized
     if exit_code is not None:
         return "success" if exit_code == 0 else "error"
     return None
@@ -709,6 +717,28 @@ def _visibility_for_app_server_item(
     item_n = _normalise(raw_type)
     raw_preview = _json_preview(item)
 
+    if "agentmessage" in item_n:
+        text = str(_first_present(item, "text", "message", "content") or "")
+        preview = text[:500] if text else None
+        summary = (
+            f"{raw_type}: {preview[:120]}"
+            if preview
+            else f"{raw_type}: message update"
+        )
+        payload = {
+            "raw_backend_type": raw_type,
+            "raw_event_preview": raw_preview,
+            "agent_message_bytes": len(text),
+            "message_preview": preview,
+        }
+        payload = {k: v for k, v in payload.items() if v is not None}
+        return make_event(
+            kind="turn_progress",
+            severity="info",
+            summary=summary[:200],
+            payload=payload,
+        )
+
     if "filechange" in item_n:
         path = _first_present(item, "path", "file", "filePath", "filename") or ""
         action = _artifact_action(item)
@@ -733,6 +763,12 @@ def _visibility_for_app_server_item(
             kind="artifact_event",
             severity="info",
             summary=summary,
+            visibility={
+                "mailbox": False,
+                "task_state": True,
+                "event_log": True,
+                "stderr": True,
+            },
             payload=payload,
         )
 
@@ -741,6 +777,12 @@ def _visibility_for_app_server_item(
             kind="turn_progress",
             severity="info",
             summary=f"{raw_type}: plan updated",
+            visibility={
+                "mailbox": False,
+                "task_state": True,
+                "event_log": True,
+                "stderr": True,
+            },
             payload={
                 "raw_backend_type": raw_type,
                 "raw_event_preview": raw_preview,
@@ -757,6 +799,12 @@ def _visibility_for_app_server_item(
             kind="turn_warning",
             severity="error",
             summary=summary[:200],
+            visibility={
+                "mailbox": True,
+                "task_state": True,
+                "event_log": True,
+                "stderr": True,
+            },
             payload={
                 "raw_backend_type": raw_type,
                 "raw_event_preview": raw_preview,
@@ -773,6 +821,8 @@ def _visibility_for_app_server_item(
             "toolcall",
             "tooluse",
             "imagegeneration",
+            "imagegen",
+            "imageview",
         )
     )
     if not tool_like:
@@ -785,13 +835,14 @@ def _visibility_for_app_server_item(
     }
     exit_code = _item_exit_code(item)
     status = _item_status(item, exit_code=exit_code)
+    phase = _phase_from_method(method, item)
     tool_name = raw_type
     if "mcp" in item_n or "toolcall" in item_n or "tooluse" in item_n:
         tool_name = _tool_name_from_event(fake_ev) or raw_type
     payload = {
         "category": "mcp_tool" if "mcp" in item_n else "host_tool",
         "tool_name": tool_name,
-        "phase": _phase_from_method(method, item),
+        "phase": phase,
         "target": _item_target(item),
         "status": status,
         "exit_code": exit_code,
@@ -804,10 +855,17 @@ def _visibility_for_app_server_item(
     payload = {k: v for k, v in payload.items() if v is not None}
     target = payload.get("target")
     summary = f"{raw_type}: {target}" if target else raw_type
+    failed = phase == "failed" or status == "error"
     return make_event(
         kind="tool_event",
-        severity="error" if payload.get("phase") == "failed" else "info",
+        severity="error" if failed else "info",
         summary=summary[:200],
+        visibility={
+            "mailbox": failed,
+            "task_state": failed,
+            "event_log": True,
+            "stderr": True,
+        },
         payload=payload,
     )
 
@@ -907,6 +965,25 @@ def app_server_invoke(
                 "payload": payload,
             }
         )
+        if event.visibility.stderr:
+            log_payload = {
+                "kind": event.kind,
+                "event_id": event.event_id,
+                "seq": event.seq,
+                "severity": event.severity,
+                "summary": event.summary,
+                "visibility_event": event.model_dump(
+                    by_alias=True, exclude_none=True
+                ),
+            }
+            if event.severity == "error":
+                logger.error("visibility.event", **log_payload)
+            elif event.severity == "warn":
+                logger.warn("visibility.event", **log_payload)
+            elif event.severity == "debug":
+                logger.debug("visibility.event", **log_payload)
+            else:
+                logger.info("visibility.event", **log_payload)
         if event_sink is not None:
             try:
                 event_sink(event)
@@ -1006,6 +1083,12 @@ def app_server_invoke(
             kind="turn_started",
             severity="info",
             summary="Codex App Server turn started",
+            visibility={
+                "mailbox": False,
+                "task_state": True,
+                "event_log": True,
+                "stderr": True,
+            },
             payload={
                 "mode": "task" if task_id is not None else "prose",
                 "prompt_kind": "task_complete" if schema is not None else "prose_reply",

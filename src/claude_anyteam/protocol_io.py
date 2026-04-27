@@ -316,6 +316,39 @@ def read_visibility_events(
     return out
 
 
+def append_event(
+    team: str,
+    agent: str,
+    event: VisibilityEvent | dict[str, Any],
+) -> VisibilityEvent:
+    """Compatibility alias for the R16/R17 roadmap helper name.
+
+    The implementation landed as ``append_visibility_event``; 09 R17 and 07
+    §7 call the primitive ``append_event``. Keep both spellings so backend
+    fan-out code can use the protocol name without breaking existing tests
+    and callers from the R16 catch-up.
+    """
+
+    return append_visibility_event(team, agent, event)
+
+
+def read_events(
+    team: str,
+    agent: str,
+    *,
+    since_seq: int | None = None,
+    limit: int | None = None,
+) -> list[VisibilityEvent]:
+    """Compatibility alias for ``read_visibility_events``."""
+
+    return read_visibility_events(
+        team,
+        agent,
+        since_seq=since_seq,
+        limit=limit,
+    )
+
+
 def send_visibility_event_to_lead(
     team: str,
     sender: str,
