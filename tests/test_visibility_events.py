@@ -142,6 +142,58 @@ def test_send_visibility_event_to_lead_sets_message_kind(events_root: Path):
     assert body["payload"] == {}
 
 
+def test_emit_coupling_conflict_writes_visibility_degraded_payload(events_root: Path):
+    task = SimpleNamespace(id="7", coupling="tight")
+    manifest = {
+        "agent_name": "kimi-runtime",
+        "capability_version": "1",
+        "transport": "kimi-headless",
+        "coupling_regime": "loose",
+        "coupling": {"intent": "loose_parallel"},
+    }
+
+    event = pio.emit_coupling_conflict_if_needed(
+        team="team-x",
+        agent="kimi-runtime",
+        backend="kimi_headless",
+        task=task,
+        manifest=manifest,
+    )
+
+    assert event is not None
+    assert event.kind == "visibility_degraded"
+    assert event.task_id == "7"
+    assert event.payload["surface"] == "coupling_intent_conflict"
+    assert event.payload["task_id"] == "7"
+    assert event.payload["requested_coupling"] == "tight"
+    assert event.payload["backend_coupling_regime"] == "loose"
+    assert event.payload["backend_coupling_intent"] == "loose_parallel"
+    assert "task.coupling" in event.payload["suggested_fix"]
+    [logged] = pio.read_events("team-x", "kimi-runtime")
+    assert logged.event_id == event.event_id
+
+    raw = json.loads((events_root / "team-x" / "inboxes" / "team-lead.json").read_text())
+    assert raw[0]["messageKind"] == "visibility_degraded"
+    body = json.loads(raw[0]["text"])
+    assert body["payload"] == event.payload
+
+
+def test_emit_coupling_conflict_if_needed_skips_matching_manifest(events_root: Path):
+    task = SimpleNamespace(id="8", coupling={"intent": "loose_parallel"})
+    manifest = {"coupling_regime": "loose", "coupling": {"intent": "loose_parallel"}}
+
+    event = pio.emit_coupling_conflict_if_needed(
+        team="team-x",
+        agent="kimi-runtime",
+        backend="kimi_headless",
+        task=task,
+        manifest=manifest,
+    )
+
+    assert event is None
+    assert pio.read_events("team-x", "kimi-runtime") == []
+
+
 def test_app_server_command_execution_writes_tool_event_to_event_log_and_active_form(events_root: Path):
     notifications = [
         {

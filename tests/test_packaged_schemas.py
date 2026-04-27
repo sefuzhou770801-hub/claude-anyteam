@@ -17,6 +17,7 @@ REQUIRED_SCHEMAS = (
     "plan.schema.json",
     "permission_request.schema.json",
     "permission_response.schema.json",
+    "capability_manifest.schema.json",
 )
 
 

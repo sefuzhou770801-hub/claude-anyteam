@@ -154,6 +154,7 @@ def test_register_writes_manifest_and_broadcasts_update(tmp_path: Path, monkeypa
         capability_version="1",
         transport="codex-exec",
         host_tool_surface="codex-native",
+        coupling_regime="loose",
     )
     registration_mod.register(_settings(team, "codex-a", tmp_path), metadata)
 
@@ -163,6 +164,8 @@ def test_register_writes_manifest_and_broadcasts_update(tmp_path: Path, monkeypa
     assert manifest["capability_version"] == "1"
     assert manifest["agent_name"] == "codex-a"
     assert manifest["transport"] == "codex-exec"
+    assert manifest["coupling_regime"] == "loose"
+    assert manifest["coupling"]["intent"] == "loose_parallel"
     assert manifest["capabilities"]["structured_output"]["schema"] == {"type": "object"}
 
     peer_inbox = json.loads((base / team / "inboxes" / "peer.json").read_text(encoding="utf-8"))

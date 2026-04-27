@@ -115,6 +115,7 @@ def update_task(
     add_blocks: list[str] | None = None,
     add_blocked_by: list[str] | None = None,
     metadata: dict | None = None,
+    coupling: dict | str | None = None,
     base_dir: Path | None = None,
 ) -> TaskFile:
     team_dir = _tasks_dir(base_dir) / team_name
@@ -194,6 +195,13 @@ def update_task(
             task.active_form = active_form
         if owner is not None:
             task.owner = owner
+        if coupling is not None:
+            task.coupling = TaskFile(
+                id=task.id,
+                subject=task.subject,
+                description=task.description,
+                coupling=coupling,
+            ).coupling
 
         if add_blocks:
             existing = set(task.blocks)

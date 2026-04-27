@@ -167,6 +167,44 @@ def test_kimi_mark_blocked_skips_when_task_already_completed(tmp_path: Path):
     assert send_calls == []
 
 
+def test_kimi_tight_task_on_loose_backend_emits_conflict_and_claims(tmp_path: Path):
+    state = loop.KimiLoopState(
+        settings=_settings(tmp_path),
+        self_capability_manifest={
+            "agent_name": "a",
+            "coupling_regime": "loose",
+            "coupling": {"intent": "loose_parallel"},
+        },
+    )
+    task = SimpleNamespace(
+        id="7",
+        subject="tight coordination",
+        description="needs mid-turn coordination",
+        status="pending",
+        owner="a",
+        blocked_by=[],
+        coupling="tight",
+    )
+    emitted: list[dict] = []
+
+    with (
+        patch.object(loop.pio, "list_tasks", return_value=[task]),
+        patch.object(loop.pio, "claim_task", return_value=task),
+        patch.object(
+            loop.pio,
+            "emit_coupling_conflict_if_needed",
+            side_effect=lambda **kwargs: emitted.append(kwargs),
+        ),
+    ):
+        claimed = loop._find_and_claim(state)
+
+    assert claimed is task
+    assert state.in_flight_task == "7"
+    assert emitted[0]["backend"] == "kimi_headless"
+    assert emitted[0]["manifest"] == state.self_capability_manifest
+    assert emitted[0]["task"] is task
+
+
 def test_execute_task_survives_backend_run_exception(tmp_path: Path, monkeypatch):
     """Regression for parity finding #6 — a subprocess crash inside
     _backend_run (OSError, FileNotFoundError, etc.) must NOT propagate to

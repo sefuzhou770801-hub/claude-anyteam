@@ -580,6 +580,7 @@ def task_update(
     add_blocks: list[str] | None = None,
     add_blocked_by: list[str] | None = None,
     metadata: dict | None = None,
+    coupling: dict | str | None = None,
 ) -> dict:
     """Update a task's fields. Setting owner auto-notifies the assignee via
     inbox. Setting status to 'deleted' removes the task file from disk.
@@ -604,6 +605,7 @@ def task_update(
             add_blocks=add_blocks,
             add_blocked_by=add_blocked_by,
             metadata=metadata,
+            coupling=coupling,
         )
     except FileNotFoundError:
         raise ToolError(f"Task {task_id!r} not found in team {team_name!r}")
@@ -611,7 +613,7 @@ def task_update(
         raise ToolError(str(e))
     if owner is not None and task.owner is not None and task.status != "deleted":
         messaging.send_task_assignment(team_name, task, assigned_by="team-lead")
-    return {"id": task.id, "status": task.status}
+    return {"id": task.id, "status": task.status, "coupling": task.coupling}
 
 
 @mcp.tool

@@ -47,6 +47,37 @@ def test_create_task_with_metadata(tmp_claude_dir, team_tasks_dir):
     assert raw["metadata"] == {"key": "val"}
 
 
+def test_create_task_with_coupling_alias_canonicalizes(tmp_claude_dir, team_tasks_dir):
+    task = create_task(
+        "test-team",
+        "Sub",
+        "desc",
+        coupling="tight",
+        base_dir=tmp_claude_dir,
+    )
+
+    raw = json.loads((team_tasks_dir / f"{task.id}.json").read_text())
+    assert task.coupling["intent"] == "tight_peer_loop"
+    assert raw["coupling"]["intent"] == "tight_peer_loop"
+
+
+def test_update_task_changes_coupling(tmp_claude_dir, team_tasks_dir):
+    task = create_task("test-team", "Sub", "desc", base_dir=tmp_claude_dir)
+
+    updated = update_task(
+        "test-team",
+        task.id,
+        coupling="loose",
+        base_dir=tmp_claude_dir,
+    )
+
+    assert updated.coupling["intent"] == "loose_parallel"
+    assert (
+        get_task("test-team", task.id, base_dir=tmp_claude_dir).coupling["intent"]
+        == "loose_parallel"
+    )
+
+
 def test_get_task_round_trip(tmp_claude_dir, team_tasks_dir):
     created = create_task(
         "test-team", "Sub", "desc", active_form="do the thing", base_dir=tmp_claude_dir

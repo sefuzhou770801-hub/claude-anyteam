@@ -239,6 +239,7 @@ def update_task(
     status: str | None = None,
     active_form: str | None = None,
     metadata: dict[str, Any] | None = None,
+    coupling: dict | str | None = None,
 ) -> _TaskFile:
     return _t.update_task(
         team,
@@ -246,6 +247,7 @@ def update_task(
         status=status,
         active_form=active_form,
         metadata=metadata,
+        coupling=coupling,
     )
 
 

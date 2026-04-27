@@ -53,6 +53,7 @@ class FakeTask:
     status: str = "pending"
     owner: str | None = None
     blocked_by: list[str] = field(default_factory=list)
+    coupling: dict | str | None = None
 
 
 # ---- _handle_message / shutdown ----------------------------------------------
@@ -481,6 +482,47 @@ def test_claim_treats_empty_string_owner_as_unassigned():
     assert attempts == ["9"]
     assert result is not None
     assert state.in_flight_task == "9"
+
+
+def test_claim_emits_coupling_conflict_without_blocking_dispatch():
+    state = LoopState(
+        settings=_settings_no_app_server(),  # codex_exec manifest declares loose
+        self_capability_manifest={
+            "agent_name": "a",
+            "coupling_regime": "loose",
+            "coupling": {"intent": "loose_parallel"},
+        },
+    )
+    tasks = [
+        FakeTask(id="7", status="pending", owner="a", coupling="tight"),
+    ]
+    emitted: list[dict] = []
+
+    def fake_claim(team, tid, owner, active_form):
+        return tasks[0]
+
+    def fake_emit(**kwargs):
+        emitted.append(kwargs)
+        return None
+
+    with (
+        patch.object(loop_mod.pio, "list_tasks", return_value=tasks),
+        patch.object(loop_mod.pio, "claim_task", side_effect=fake_claim),
+        patch.object(loop_mod.pio, "emit_coupling_conflict_if_needed", side_effect=fake_emit),
+    ):
+        result = _find_and_claim(state)
+
+    assert result is tasks[0]
+    assert state.in_flight_task == "7"
+    assert emitted == [
+        {
+            "team": "t",
+            "agent": "a",
+            "backend": "codex_exec",
+            "task": tasks[0],
+            "manifest": state.self_capability_manifest,
+        }
+    ]
 
 
 def test_claim_skips_blocked_tasks():
