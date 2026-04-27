@@ -239,6 +239,67 @@ def test_command_for_member_constructs_claude_invocation(tmp_path: Path) -> None
     assert str(sandbox / "repo") in cmd[3]
 
 
+def test_command_for_member_passes_explicit_gemini_binary(monkeypatch, tmp_path: Path) -> None:
+    """§3 spawn-correctness: gemini members must pass --gemini-binary with the
+    absolute path resolved at construction time, NOT default to PATH-resolved
+    `gemini` (which under stress-spawn context can shadow with a sibling
+    `gemini-anyteam` shim that doesn't accept --version, killing S3 at the
+    feature_test step). Filed as task #42 from the S3 launch failure."""
+    fake_gemini = tmp_path / "fake_gemini"
+    fake_gemini.write_text("#!/bin/sh\necho gemini 2.5\n", encoding="utf-8")
+    fake_gemini.chmod(0o755)
+    monkeypatch.setattr(run_scenario.shutil, "which", lambda name: str(fake_gemini) if name == "gemini" else None)
+
+    cmd = run_scenario._command_for_member(
+        {"name": "gemini-tgt-a", "agent_type": "gemini", "model": "gemini-2.5-pro", "transport": "acp"},
+        "stress-S3-test",
+        tmp_path,
+    )
+
+    assert cmd is not None
+    assert "--gemini-binary" in cmd, "gemini spawn must pass --gemini-binary explicitly"
+    assert cmd[cmd.index("--gemini-binary") + 1] == str(fake_gemini), \
+        "gemini-binary must be an absolute path, not a name to PATH-resolve"
+    assert "--model" in cmd
+    assert cmd[cmd.index("--model") + 1] == "gemini-2.5-pro"
+
+
+def test_command_for_member_passes_explicit_kimi_binary(monkeypatch, tmp_path: Path) -> None:
+    """Same §3 spawn-correctness as gemini: kimi members must pass --kimi-binary
+    explicitly. Defensive: kimi-cli could resolve to a sibling shim under PATH
+    pressure too. Same fix shape per task #42."""
+    fake_kimi = tmp_path / "fake_kimi"
+    fake_kimi.write_text("#!/bin/sh\necho kimi-cli 0.1\n", encoding="utf-8")
+    fake_kimi.chmod(0o755)
+    monkeypatch.setattr(run_scenario.shutil, "which", lambda name: str(fake_kimi) if name == "kimi" else None)
+
+    cmd = run_scenario._command_for_member(
+        {"name": "kimi-tgt-a", "agent_type": "kimi", "model": "kimi-k2"},
+        "stress-S4-test",
+        tmp_path,
+    )
+
+    assert cmd is not None
+    assert "--kimi-binary" in cmd, "kimi spawn must pass --kimi-binary explicitly"
+    assert cmd[cmd.index("--kimi-binary") + 1] == str(fake_kimi)
+    assert "--backend" in cmd  # default headless transport
+
+
+def test_command_for_member_raises_when_backend_binary_missing(monkeypatch, tmp_path: Path) -> None:
+    """Fail loud if the gemini/kimi binary isn't on PATH — better than silently
+    spawning a broken adapter that wastes 1800s on a feature_test timeout."""
+    monkeypatch.setattr(run_scenario.shutil, "which", lambda name: None)
+
+    with pytest.raises(FileNotFoundError) as exc_info:
+        run_scenario._command_for_member(
+            {"name": "gemini-tgt-a", "agent_type": "gemini"},
+            "stress-test",
+            tmp_path,
+        )
+    assert "gemini" in str(exc_info.value)
+    assert "not found on PATH" in str(exc_info.value)
+
+
 def test_archive_paths(isolated_protocol_roots, fake_scorers, tmp_path: Path) -> None:
     rc, out, _ = _invoke(tmp_path, "S1")
 

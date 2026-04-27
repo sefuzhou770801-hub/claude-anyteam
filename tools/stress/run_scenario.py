@@ -360,6 +360,28 @@ def apply_agent_type_patches(team_name: str, members: Iterable[Mapping[str, Any]
     cs_teams.write_config(team_name, config)
 
 
+def _resolve_backend_binary(name: str) -> str:
+    """Resolve a backend's CLI binary via shutil.which, raising loud if missing.
+
+    The stress harness defaults `gemini`/`kimi`/`claude` settings to PATH
+    name lookup, but PATH ordering in the spawn context can resolve to
+    sibling claude-anyteam shim binaries (e.g. ``gemini-anyteam``) that
+    don't accept ``--version``. S3 (homogeneous-gemini) hung 20+ minutes
+    with this exact failure on 2026-04-27 (task #42).
+
+    By passing the absolute path explicitly via ``--gemini-binary`` /
+    ``--kimi-binary``, the spawned adapter's feature_test runs against
+    the real Gemini/Kimi CLI rather than whatever PATH happens to surface.
+    """
+    path = shutil.which(name)
+    if path is None:
+        raise FileNotFoundError(
+            f"backend binary {name!r} not found on PATH; cannot construct spawn command. "
+            f"Install the {name} CLI or set its location explicitly in the scenario member spec."
+        )
+    return path
+
+
 def _command_for_member(member: Mapping[str, Any], team_name: str, sandbox: Path) -> list[str] | None:
     agent_type = member.get("agent_type")
     name = str(member["name"])
@@ -387,6 +409,7 @@ def _command_for_member(member: Mapping[str, Any], team_name: str, sandbox: Path
         return cmd
     if agent_type == "gemini":
         cmd = [*base, "claude_anyteam.backends.gemini.cli", "--team", team_name, "--name", name, "--cwd", cwd]
+        cmd += ["--gemini-binary", _resolve_backend_binary("gemini")]
         if member.get("model"):
             cmd += ["--model", str(member["model"])]
         if member.get("effort"):
@@ -396,6 +419,7 @@ def _command_for_member(member: Mapping[str, Any], team_name: str, sandbox: Path
         return cmd
     if agent_type == "kimi":
         cmd = [*base, "claude_anyteam.backends.kimi.cli", "--team", team_name, "--name", name, "--cwd", cwd]
+        cmd += ["--kimi-binary", _resolve_backend_binary("kimi")]
         if member.get("model"):
             cmd += ["--model", str(member["model"])]
         if member.get("effort"):
