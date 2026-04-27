@@ -173,10 +173,15 @@ def test_codex_task_prompt_excludes_self():
 def test_r14_fragment_instructs_manifest_query():
     fragment = _fragment()
 
-    assert "Before invoking gemini-peer's primitive" in fragment
+    assert "REQUIRED capability lookup before peer steering" in fragment
+    assert "MUST query mcp_anyteam_capability_manifest" in fragment
+    assert "before any peer-steer attempt to gemini-peer" in fragment
     assert "`mcp_anyteam_capability_manifest('gemini-peer', '<primitive>')`" in fragment
     assert "verify acceptance" in fragment
     assert "delivery_mode/expiry_semantics" in fragment
+    assert "peer steers will be rejected" in fragment
+    assert "waste a turn" in fragment
+    assert "visibility_degraded noise" in fragment
     assert "turn_steer" in fragment
 
 
@@ -200,7 +205,7 @@ def test_homogeneous_paired_still_emits_manifest_lookup():
 
     fragment = cache.peer_prompt_fragments_for(SELF)
 
-    assert "Before invoking codex-pair-b's primitive" in fragment
+    assert "before any peer-steer attempt to codex-pair-b" in fragment
     assert "`mcp_anyteam_capability_manifest('codex-pair-b', '<primitive>')`" in fragment
 
 

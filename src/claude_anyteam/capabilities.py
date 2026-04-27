@@ -365,10 +365,20 @@ def peer_prompt_fragment(agent_name: str, card: dict[str, Any]) -> str:
         if block:
             blocks.append(block)
     manifest_lookup = (
-        f"## {agent_name}: capability lookup workflow\n"
-        f"- Before invoking {agent_name}'s primitive (e.g., `turn_steer`), "
-        f"call `mcp_anyteam_capability_manifest('{agent_name}', '<primitive>')` "
-        f"to verify acceptance and review delivery_mode/expiry_semantics."
+        f"## {agent_name}: REQUIRED capability lookup before peer steering\n"
+        f"- ACTION REQUIRED: MUST query mcp_anyteam_capability_manifest "
+        f"before any peer-steer attempt to {agent_name}. Call it as "
+        f"`mcp_anyteam_capability_manifest('{agent_name}', '<primitive>')` "
+        f"for primitives such as `turn_steer`; do this even when the "
+        f"capability summary below appears to mention the primitive.\n"
+        f"- Use the manifest response to verify acceptance "
+        f"(`callable_from_peers`/authorization) and review "
+        f"delivery_mode/expiry_semantics before sending the steer.\n"
+        f"- Consequence: if you skip the manifest query, peer steers will be "
+        f"rejected, you waste a turn, the peer pays about 5s of rejection "
+        f"cost, and the run emits visibility_degraded noise. If the manifest "
+        f"does not explicitly allow peer steering, route the request through "
+        f"team-lead instead."
     )
     return "\n\n".join([manifest_lookup, *blocks])
 
