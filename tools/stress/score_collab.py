@@ -1,0 +1,714 @@
+#!/usr/bin/env python3
+"""Score Phase-3 collaboration metrics from visibility event logs.
+
+The scorer is intentionally read-only: it consumes the R16/R17 visibility
+substrate and emits post-run JSON scorecards for §3 peer efficiency metrics.
+"""
+
+from __future__ import annotations
+
+import argparse
+import ast
+import json
+import statistics
+import sys
+from collections import Counter, defaultdict
+from dataclasses import dataclass
+from datetime import datetime, timezone
+from pathlib import Path
+from typing import Any, Iterable
+
+from claude_anyteam import protocol_io as pio
+from claude_anyteam.messages import VisibilityEvent
+from claude_teams import messaging as cs_messaging  # type: ignore[import-untyped]
+
+SCHEMA_VERSION = 1
+TEAM_LEAD = "team-lead"
+RTT_CAP_SECONDS = 600.0
+DELIVERED_STEER_VALUES = {"delivered_mid_turn", "delivered_next_turn"}
+KNOWN_STEER_VALUES = {
+    "delivered_mid_turn",
+    "delivered_next_turn",
+    "queued",
+    "expired",
+    "dropped",
+}
+SEMANTIC_LABELS = ("ask", "answer", "handoff", "fyi", "other")
+SEMANTIC_PREFIXES = {
+    "ask:": "ask",
+    "answer:": "answer",
+    "handoff:": "handoff",
+    "fyi:": "fyi",
+}
+
+
+@dataclass(frozen=True)
+class SendMessageEvent:
+    event: VisibilityEvent
+    sender: str
+    recipient: str | None
+    timestamp: datetime | None
+    semantic: str
+
+    @property
+    def is_peer(self) -> bool:
+        return bool(self.recipient) and self.recipient not in {TEAM_LEAD, self.sender, "*"}
+
+
+@dataclass(frozen=True)
+class TerminalEvent:
+    event: VisibilityEvent
+    timestamp: datetime | None
+    collision: bool
+
+
+@dataclass
+class RttResult:
+    by_pair: dict[tuple[str, str], list[float]]
+    unmatched_by_pair: Counter[tuple[str, str]]
+    self_dm_warnings: int = 0
+
+
+@dataclass
+class CollabDataset:
+    events_by_agent: dict[str, list[VisibilityEvent]]
+    events_dir: Path
+
+
+class ScoreInputError(RuntimeError):
+    pass
+
+
+class ScoreOutputError(RuntimeError):
+    pass
+
+
+def warn(message: str) -> None:
+    print(f"score_collab: warning: {message}", file=sys.stderr)
+
+
+def parse_timestamp(value: str | None) -> datetime | None:
+    if not value:
+        return None
+    try:
+        dt = datetime.fromisoformat(value.replace("Z", "+00:00"))
+        if dt.tzinfo is None:
+            dt = dt.replace(tzinfo=timezone.utc)
+        return dt
+    except ValueError:
+        warn(f"invalid timestamp {value!r}; event skipped for time-based metrics")
+        return None
+
+
+def stats(samples: Iterable[float], *, include_unmatched: int | None = None) -> dict[str, Any]:
+    values = sorted(float(v) for v in samples)
+    out: dict[str, Any] = {
+        "mean": round(statistics.mean(values), 3) if values else None,
+        "median": round(statistics.median(values), 3) if values else None,
+        "p95": (
+            round(statistics.quantiles(values, n=20)[18], 3)
+            if len(values) >= 5
+            else None
+        ),
+        "samples": len(values),
+    }
+    if include_unmatched is not None:
+        out["unmatched_send_count"] = int(include_unmatched)
+    return out
+
+
+def ratio(numerator: int, denominator: int) -> float | None:
+    if denominator == 0:
+        return None
+    return round(numerator / denominator, 3)
+
+
+def classify_semantic(summary: str | None, payload: dict[str, Any]) -> str:
+    """Coarse semantic label for peer-DM summaries."""
+
+    candidates = (
+        payload.get("message_summary"),
+        payload.get("summary"),
+        payload.get("tool_summary"),
+        summary,
+    )
+    text = " ".join(str(candidate) for candidate in candidates if candidate).strip().lower()
+    if not text:
+        return "other"
+    for candidate in candidates:
+        candidate_text = str(candidate or "").strip().lower()
+        for prefix, label in SEMANTIC_PREFIXES.items():
+            if candidate_text.startswith(prefix):
+                return label
+    if any(token in text for token in ("handoff", "hand off", "take over", "delegate", "passing to")):
+        return "handoff"
+    if any(token in text for token in ("answer", "answered", "reply", "response", "resolved", "confirmed")):
+        return "answer"
+    if "?" in text or any(token in text for token in ("ask", "question", "clarify", "need", "can you", "could you", "please review", "help")):
+        return "ask"
+    if any(token in text for token in ("fyi", "heads up", "status", "update", "note", "progress")):
+        return "fyi"
+    return "other"
+
+
+def _tool_name(event: VisibilityEvent) -> str | None:
+    payload = event.payload or {}
+    value = payload.get("tool_name") or payload.get("name") or payload.get("raw_backend_type")
+    return str(value) if value is not None else None
+
+
+def is_send_message_event(event: VisibilityEvent) -> bool:
+    if event.kind != "tool_event" or _tool_name(event) != "send_message":
+        return False
+    # R18 wrapper instrumentation emits started + terminal events. Count calls,
+    # not lifecycle edges, by ignoring the non-terminal started record.
+    return event.payload.get("phase") != "started"
+
+
+def is_tool_call_event(event: VisibilityEvent, tool_name: str) -> bool:
+    return (
+        event.kind == "tool_event"
+        and _tool_name(event) == tool_name
+        and event.payload.get("phase") != "started"
+    )
+
+
+def recipient_from_payload(payload: dict[str, Any]) -> str | None:
+    value = payload.get("recipient")
+    if value not in (None, ""):
+        return str(value)
+
+    target = payload.get("target")
+    if target not in (None, ""):
+        text = str(target).strip()
+        if text.startswith("to="):
+            raw = text[3:].strip()
+            try:
+                parsed = ast.literal_eval(raw)
+                if parsed not in (None, ""):
+                    return str(parsed)
+            except (ValueError, SyntaxError):
+                return raw.strip("'\"") or None
+        return text or None
+
+    for key in ("to", "delivered_to"):
+        value = payload.get(key)
+        if value not in (None, ""):
+            return str(value)
+    return None
+
+
+def steer_delivery(payload: dict[str, Any]) -> str:
+    raw = payload.get("delivery") or payload.get("status") or payload.get("state")
+    if raw in (None, ""):
+        return "_unknown:missing"
+    value = str(raw)
+    if value not in KNOWN_STEER_VALUES:
+        return f"_unknown:{value}"
+    return value
+
+
+def is_collision(event: VisibilityEvent) -> bool:
+    if event.kind not in {"turn_completed", "turn_failed"}:
+        return False
+    payload = event.payload or {}
+    try:
+        tool_calls = int(payload.get("tool_call_events") or 0)
+    except (TypeError, ValueError):
+        tool_calls = 0
+    preview = str(payload.get("last_message_preview") or "").strip()
+    return tool_calls > 0 and len(preview) > 32
+
+
+def list_agent_names(events_dir: Path) -> list[str]:
+    return sorted(path.stem for path in events_dir.glob("*.jsonl") if path.is_file())
+
+
+def read_events_via_protocol(team: str, agent: str) -> list[VisibilityEvent]:
+    try:
+        return pio.read_events(team, agent)
+    except Exception as exc:
+        raise ScoreInputError(f"failed to read events for {team}/{agent}: {exc}") from exc
+
+
+def load_dataset(*, team: str | None, events_dir: Path | None) -> CollabDataset:
+    if (team is None) == (events_dir is None):
+        raise ScoreInputError("provide exactly one of --team or --events-dir")
+
+    if team is not None:
+        resolved_events_dir = cs_messaging.TEAMS_DIR / team / "events"
+        if not resolved_events_dir.exists():
+            raise ScoreInputError(f"events dir not found: {resolved_events_dir}")
+        agents = list_agent_names(resolved_events_dir)
+        if not agents:
+            raise ScoreInputError(f"no event logs found in {resolved_events_dir}")
+        return CollabDataset(
+            events_by_agent={agent: read_events_via_protocol(team, agent) for agent in agents},
+            events_dir=resolved_events_dir,
+        )
+
+    assert events_dir is not None
+    resolved_events_dir = events_dir.expanduser().resolve()
+    if not resolved_events_dir.exists() or not resolved_events_dir.is_dir():
+        raise ScoreInputError(f"events dir not found: {resolved_events_dir}")
+    agents = list_agent_names(resolved_events_dir)
+    if not agents:
+        raise ScoreInputError(f"no event logs found in {resolved_events_dir}")
+
+    if resolved_events_dir.name == "events" and resolved_events_dir.parent.name:
+        inferred_team = resolved_events_dir.parent.name
+        inferred_teams_dir = resolved_events_dir.parent.parent
+        old_teams_dir = cs_messaging.TEAMS_DIR
+        try:
+            cs_messaging.TEAMS_DIR = inferred_teams_dir
+            events_by_agent = {
+                agent: read_events_via_protocol(inferred_team, agent)
+                for agent in agents
+            }
+        finally:
+            cs_messaging.TEAMS_DIR = old_teams_dir
+        return CollabDataset(events_by_agent=events_by_agent, events_dir=resolved_events_dir)
+
+    raise ScoreInputError(
+        "--events-dir must point at a '<team>/events' directory so "
+        "protocol_io.read_events(team, agent) remains the sole JSONL reader"
+    )
+
+
+def extract_send_messages(events_by_agent: dict[str, list[VisibilityEvent]]) -> list[SendMessageEvent]:
+    sends: list[SendMessageEvent] = []
+    for agent, events in events_by_agent.items():
+        for event in events:
+            if not is_send_message_event(event):
+                continue
+            payload = event.payload or {}
+            recipient = recipient_from_payload(payload)
+            if recipient is None:
+                warn(f"send_message missing recipient excluded from M3 numerator: {event.event_id}")
+            sender = event.agent or agent
+            if recipient == sender:
+                warn(f"self-DM excluded from peer metrics: {event.event_id} {sender}->{recipient}")
+            sends.append(
+                SendMessageEvent(
+                    event=event,
+                    sender=sender,
+                    recipient=recipient,
+                    timestamp=parse_timestamp(event.timestamp),
+                    semantic=classify_semantic(event.summary, payload),
+                )
+            )
+    return sends
+
+
+def extract_terminal_events(events_by_agent: dict[str, list[VisibilityEvent]]) -> list[TerminalEvent]:
+    terminals: list[TerminalEvent] = []
+    for events in events_by_agent.values():
+        for event in events:
+            if event.kind in {"turn_completed", "turn_failed"}:
+                terminals.append(
+                    TerminalEvent(
+                        event=event,
+                        timestamp=parse_timestamp(event.timestamp),
+                        collision=is_collision(event),
+                    )
+                )
+    return terminals
+
+
+def compute_rtt(send_messages: list[SendMessageEvent]) -> RttResult:
+    peer_sends = [s for s in send_messages if s.is_peer]
+    sends_by_pair: dict[tuple[str, str], list[SendMessageEvent]] = defaultdict(list)
+    replies_by_pair: dict[tuple[str, str], list[SendMessageEvent]] = defaultdict(list)
+    self_dm_warnings = sum(1 for s in send_messages if s.recipient == s.sender and s.recipient is not None)
+
+    for send in peer_sends:
+        assert send.recipient is not None
+        sends_by_pair[(send.sender, send.recipient)].append(send)
+        replies_by_pair[(send.recipient, send.sender)].append(send)
+
+    by_pair: dict[tuple[str, str], list[float]] = defaultdict(list)
+    unmatched_by_pair: Counter[tuple[str, str]] = Counter()
+
+    for pair, sends in sends_by_pair.items():
+        replies = replies_by_pair.get(pair, [])
+        replies = sorted(
+            [r for r in replies if r.timestamp is not None],
+            key=lambda r: r.timestamp,  # type: ignore[arg-type,return-value]
+        )
+        consumed: set[int] = set()
+        for send in sorted(
+            sends,
+            key=lambda s: s.timestamp or datetime.max.replace(tzinfo=timezone.utc),
+        ):
+            if send.timestamp is None:
+                unmatched_by_pair[pair] += 1
+                continue
+            matched_delta: float | None = None
+            matched_index: int | None = None
+            for idx, reply in enumerate(replies):
+                if idx in consumed:
+                    continue
+                if reply.timestamp is None:
+                    continue
+                if reply.timestamp <= send.timestamp:
+                    continue
+                delta = (reply.timestamp - send.timestamp).total_seconds()
+                matched_delta = delta
+                matched_index = idx
+                break
+            if matched_delta is not None and matched_delta <= RTT_CAP_SECONDS:
+                by_pair[pair].append(float(matched_delta))
+                assert matched_index is not None
+                consumed.add(matched_index)
+            else:
+                unmatched_by_pair[pair] += 1
+
+    return RttResult(by_pair=dict(by_pair), unmatched_by_pair=unmatched_by_pair, self_dm_warnings=self_dm_warnings)
+
+
+def delivery_breakdown(events: Iterable[VisibilityEvent]) -> Counter[str]:
+    counter: Counter[str] = Counter()
+    for event in events:
+        if event.kind == "steer_ack":
+            counter[steer_delivery(event.payload or {})] += 1
+    return counter
+
+
+def delivery_rate_parts(counter: Counter[str]) -> tuple[int, int, int, float | None]:
+    observed = sum(counter.get(value, 0) for value in DELIVERED_STEER_VALUES)
+    inflight = counter.get("queued", 0)
+    denominator = sum(counter.values()) - inflight
+    return observed, denominator, inflight, ratio(observed, denominator)
+
+
+def delivery_breakdown_dict(counter: Counter[str]) -> dict[str, int]:
+    out = {value: counter.get(value, 0) for value in sorted(KNOWN_STEER_VALUES)}
+    for key in sorted(k for k in counter if k not in KNOWN_STEER_VALUES):
+        out[key] = counter[key]
+    return out
+
+
+def count_peer_steer_rejected(events: Iterable[VisibilityEvent]) -> int:
+    return sum(
+        1
+        for event in events
+        if event.kind == "visibility_degraded"
+        and (event.payload or {}).get("surface") == "peer_steer_rejected"
+    )
+
+
+def backend_for(events: list[VisibilityEvent]) -> str | None:
+    for event in events:
+        if event.backend:
+            return event.backend
+    return None
+
+
+def sort_events(events: Iterable[VisibilityEvent]) -> list[VisibilityEvent]:
+    def key(event: VisibilityEvent) -> tuple[datetime, int, str]:
+        ts = parse_timestamp(event.timestamp)
+        if ts is None:
+            ts = datetime.max.replace(tzinfo=timezone.utc)
+        return ts, event.seq, event.event_id
+
+    return sorted(events, key=key)
+
+
+def collision_pairs(send_messages: list[SendMessageEvent], terminals: list[TerminalEvent]) -> Counter[tuple[str, str]]:
+    by_agent_turn: dict[tuple[str, str], list[SendMessageEvent]] = defaultdict(list)
+    for send in send_messages:
+        if not send.is_peer or not send.event.turn_id:
+            continue
+        by_agent_turn[(send.sender, send.event.turn_id)].append(send)
+
+    out: Counter[tuple[str, str]] = Counter()
+    for terminal in terminals:
+        if not terminal.collision or not terminal.event.turn_id:
+            continue
+        sends = by_agent_turn.get((terminal.event.agent, terminal.event.turn_id), [])
+        seen_pairs: set[tuple[str, str]] = set()
+        for send in sends:
+            if send.recipient is None:
+                continue
+            pair = (send.sender, send.recipient)
+            if pair in seen_pairs:
+                continue
+            out[pair] += 1
+            seen_pairs.add(pair)
+    return out
+
+
+def turn_window_key(event: VisibilityEvent) -> str:
+    return event.turn_id or f"_event:{event.event_id}"
+
+
+def inbox_polled_without_peer_send(
+    events: Iterable[VisibilityEvent],
+    sends: Iterable[SendMessageEvent],
+) -> int:
+    read_inbox_by_turn: Counter[str] = Counter()
+    peer_send_by_turn: Counter[str] = Counter()
+    for event in events:
+        if is_tool_call_event(event, "read_inbox"):
+            read_inbox_by_turn[turn_window_key(event)] += 1
+    for send in sends:
+        if send.is_peer:
+            peer_send_by_turn[turn_window_key(send.event)] += 1
+    return sum(
+        max(read_count - peer_send_by_turn.get(turn_id, 0), 0)
+        for turn_id, read_count in read_inbox_by_turn.items()
+    )
+
+
+def build_scorecards(
+    dataset: CollabDataset,
+    *,
+    scenario: str,
+    run_id: str,
+) -> tuple[dict[str, Any], dict[str, Any], dict[str, dict[str, Any]]]:
+    merged_events_by_agent: dict[str, list[VisibilityEvent]] = defaultdict(list)
+    for file_agent, events in dataset.events_by_agent.items():
+        if not events:
+            merged_events_by_agent.setdefault(file_agent, [])
+            continue
+        for event in events:
+            merged_events_by_agent[event.agent or file_agent].append(event)
+    events_by_agent = {
+        agent: sort_events(events) for agent, events in merged_events_by_agent.items()
+    }
+    agents = sorted(events_by_agent)
+    send_messages = extract_send_messages(events_by_agent)
+    terminals = extract_terminal_events(events_by_agent)
+    rtt = compute_rtt(send_messages)
+    pair_collisions = collision_pairs(send_messages, terminals)
+
+    sends_by_sender: dict[str, list[SendMessageEvent]] = defaultdict(list)
+    received_by_recipient: Counter[str] = Counter()
+    semantic_by_sender: dict[str, Counter[str]] = defaultdict(Counter)
+    semantic_by_pair: dict[tuple[str, str], Counter[str]] = defaultdict(Counter)
+    for send in send_messages:
+        sends_by_sender[send.sender].append(send)
+        if send.is_peer and send.recipient is not None:
+            received_by_recipient[send.recipient] += 1
+            semantic_by_sender[send.sender][send.semantic] += 1
+            semantic_by_pair[(send.sender, send.recipient)][send.semantic] += 1
+
+    pairs: list[dict[str, Any]] = []
+    pair_keys = sorted({(s.sender, s.recipient) for s in send_messages if s.is_peer and s.recipient is not None})
+    for sender, recipient in pair_keys:
+        assert recipient is not None
+        pair = (sender, recipient)
+        messages_sent = sum(
+            1 for s in send_messages if s.sender == sender and s.recipient == recipient and s.is_peer
+        )
+        pairs.append(
+            {
+                "from": sender,
+                "to": recipient,
+                "messages_sent": messages_sent,
+                "rtt_seconds": stats(
+                    rtt.by_pair.get(pair, []),
+                    include_unmatched=rtt.unmatched_by_pair.get(pair, 0),
+                ),
+                "prose_fallback_collisions": pair_collisions.get(pair, 0),
+                "semantic_counts": {label: semantic_by_pair[pair].get(label, 0) for label in SEMANTIC_LABELS},
+            }
+        )
+
+    per_agent: dict[str, dict[str, Any]] = {}
+    all_rtt_samples: list[float] = []
+    total_peer_sends = 0
+    total_send_calls = 0
+    total_to_lead = 0
+    total_steer_counter: Counter[str] = Counter()
+    total_collisions = 0
+    total_terminals = 0
+    total_peer_steer_rejected = 0
+    total_semantic: Counter[str] = Counter()
+
+    for agent in agents:
+        events = events_by_agent[agent]
+        sends = sends_by_sender.get(agent, [])
+        send_total = len(sends)
+        to_lead = sum(1 for s in sends if s.recipient == TEAM_LEAD)
+        peer_sent = sum(1 for s in sends if s.is_peer)
+        missing_recipient = sum(1 for s in sends if s.recipient is None)
+        steer_counter = delivery_breakdown(events)
+        steer_observed, steer_total, steer_inflight, steer_rate = delivery_rate_parts(steer_counter)
+        agent_terminals = [t for t in terminals if t.event.agent == agent]
+        collisions = sum(1 for t in agent_terminals if t.collision)
+        peer_rejected = count_peer_steer_rejected(events)
+        manifest_consulted = sum(
+            1 for event in events if is_tool_call_event(event, "mcp_anyteam_capability_manifest")
+        )
+        m4_attribution = {
+            "manifest_consulted_count": manifest_consulted,
+            "inbox_polled_without_peer_send": inbox_polled_without_peer_send(events, sends),
+            "peer_steer_rejection_observed": peer_rejected,
+        }
+        agent_pairs = [pair for pair in rtt.by_pair if pair[0] == agent]
+        agent_samples: list[float] = []
+        agent_unmatched = 0
+        for pair in sorted(set(agent_pairs) | {p for p in rtt.unmatched_by_pair if p[0] == agent}):
+            agent_samples.extend(rtt.by_pair.get(pair, []))
+            agent_unmatched += rtt.unmatched_by_pair.get(pair, 0)
+        all_rtt_samples.extend(agent_samples)
+
+        notes: list[str] = []
+        if send_total == 0:
+            notes.append("no_send_message_calls")
+        if missing_recipient:
+            notes.append(f"send_message_missing_recipient:{missing_recipient}")
+        if peer_sent > 0 and len(agent_samples) < 5:
+            notes.append("p95_undersampled")
+        if steer_total == 0 and steer_inflight == 0:
+            notes.append("no_steer_ack")
+        if steer_inflight:
+            notes.append(f"steer_ack_inflight:{steer_inflight}")
+        if peer_rejected:
+            notes.append(f"peer_steer_rejected:{peer_rejected}")
+
+        per_agent[agent] = {
+            "schema_version": SCHEMA_VERSION,
+            "agent": agent,
+            "backend": backend_for(events),
+            "scenario": scenario,
+            "run_id": run_id,
+            "metrics": {
+                "M3_peer_dm_sent": peer_sent,
+                "M3_peer_dm_received": received_by_recipient.get(agent, 0),
+                "M3_peer_dm_semantic_breakdown": {
+                    label: semantic_by_sender[agent].get(label, 0) for label in SEMANTIC_LABELS
+                },
+                "M4_cross_peer_ratio": ratio(peer_sent, send_total),
+                "M4_total_send_message_calls": send_total,
+                "M4_to_lead_count": to_lead,
+                "M4_attribution": m4_attribution,
+                "M4_semantic_breakdown": {
+                    label: semantic_by_sender[agent].get(label, 0) for label in SEMANTIC_LABELS
+                },
+                "M9_steer_ack_rate": steer_rate,
+                "M9_steer_ack_observed": steer_observed,
+                "M9_steer_ack_total": steer_total,
+                "M9_inflight_count": steer_inflight,
+                "M9_delivery_breakdown": delivery_breakdown_dict(steer_counter),
+                "M11_peer_dm_rtt_seconds": stats(agent_samples, include_unmatched=agent_unmatched),
+                "M13_prose_fallback_collisions": collisions,
+                "M13_total_send_message_replies": len(agent_terminals),
+                "M13_prose_fallback_collision_rate": ratio(collisions, len(agent_terminals)),
+            },
+            "notes": notes,
+        }
+
+        total_peer_sends += peer_sent
+        total_send_calls += send_total
+        total_to_lead += to_lead
+        total_steer_counter.update(steer_counter)
+        total_collisions += collisions
+        total_terminals += len(agent_terminals)
+        total_peer_steer_rejected += peer_rejected
+        total_semantic.update(semantic_by_sender[agent])
+
+    team_steer_observed, team_steer_total, team_steer_inflight, team_steer_rate = delivery_rate_parts(total_steer_counter)
+    scenario_doc = {
+        "schema_version": SCHEMA_VERSION,
+        "scenario": scenario,
+        "run_id": run_id,
+        "agents": agents,
+        "aggregate": {
+            "M3_total_peer_dms": total_peer_sends,
+            "M3_peer_dm_semantic_breakdown": {
+                label: total_semantic.get(label, 0) for label in SEMANTIC_LABELS
+            },
+            "M4_semantic_breakdown": {
+                label: total_semantic.get(label, 0) for label in SEMANTIC_LABELS
+            },
+            "M4_team_cross_peer_ratio": ratio(total_peer_sends, total_send_calls),
+            "M4_total_send_message_calls": total_send_calls,
+            "M4_to_lead_count": total_to_lead,
+            "M9_team_steer_ack_rate": team_steer_rate,
+            "M9_team_steer_ack_observed": team_steer_observed,
+            "M9_team_steer_ack_total": team_steer_total,
+            "M9_team_inflight_count": team_steer_inflight,
+            "M9_delivery_breakdown": delivery_breakdown_dict(total_steer_counter),
+            "M11_team_p95_rtt_seconds": stats(all_rtt_samples)["p95"],
+            "M11_team_rtt_seconds": stats(
+                all_rtt_samples,
+                include_unmatched=sum(rtt.unmatched_by_pair.values()),
+            ),
+            "M13_total_collisions": total_collisions,
+            "M13_total_send_message_replies": total_terminals,
+            "M13_prose_fallback_collision_rate": ratio(total_collisions, total_terminals),
+            "peer_steer_rejected_count": total_peer_steer_rejected,
+        },
+        "per_agent_files": [f"agents/{agent}.json" for agent in agents],
+        "pair_file": "pairs.json",
+    }
+    pairs_doc = {
+        "schema_version": SCHEMA_VERSION,
+        "scenario": scenario,
+        "run_id": run_id,
+        "pairs": pairs,
+    }
+    return scenario_doc, pairs_doc, per_agent
+
+
+def write_outputs(out_dir: Path, scenario_doc: dict[str, Any], pairs_doc: dict[str, Any], per_agent: dict[str, dict[str, Any]]) -> None:
+    try:
+        agents_dir = out_dir / "agents"
+        agents_dir.mkdir(parents=True, exist_ok=True)
+        for agent, doc in per_agent.items():
+            (agents_dir / f"{agent}.json").write_text(
+                json.dumps(doc, indent=2, sort_keys=True) + "\n",
+                encoding="utf-8",
+            )
+        (out_dir / "pairs.json").write_text(
+            json.dumps(pairs_doc, indent=2, sort_keys=True) + "\n",
+            encoding="utf-8",
+        )
+        (out_dir / "scenario.json").write_text(
+            json.dumps(scenario_doc, indent=2, sort_keys=True) + "\n",
+            encoding="utf-8",
+        )
+    except OSError as exc:
+        raise ScoreOutputError(str(exc)) from exc
+
+
+def build_arg_parser() -> argparse.ArgumentParser:
+    parser = argparse.ArgumentParser(description=__doc__)
+    source = parser.add_mutually_exclusive_group(required=True)
+    source.add_argument("--team", help="team name under ~/.claude/teams")
+    source.add_argument("--events-dir", type=Path, help="explicit events directory for archived runs")
+    parser.add_argument("--scenario", required=True, help="scenario id, e.g. S5")
+    parser.add_argument("--run-id", required=True, help="run id/timestamp")
+    parser.add_argument("--out", type=Path, required=True, help="output directory")
+    return parser
+
+
+def main(argv: list[str] | None = None) -> int:
+    parser = build_arg_parser()
+    args = parser.parse_args(argv)
+    try:
+        dataset = load_dataset(team=args.team, events_dir=args.events_dir)
+        scenario_doc, pairs_doc, per_agent = build_scorecards(
+            dataset,
+            scenario=args.scenario,
+            run_id=args.run_id,
+        )
+        write_outputs(args.out, scenario_doc, pairs_doc, per_agent)
+    except ScoreInputError as exc:
+        print(f"score_collab: {exc}", file=sys.stderr)
+        return 1
+    except ScoreOutputError as exc:
+        print(f"score_collab: failed to write outputs: {exc}", file=sys.stderr)
+        return 2
+    print(
+        "score_collab: wrote "
+        f"{len(per_agent)} agent profiles, {len(pairs_doc['pairs'])} pairs to {args.out}",
+        file=sys.stderr,
+    )
+    return 0
+
+
+if __name__ == "__main__":  # pragma: no cover
+    raise SystemExit(main())
