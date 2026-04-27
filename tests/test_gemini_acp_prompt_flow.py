@@ -1,8 +1,20 @@
 from __future__ import annotations
 
 import json
+from pathlib import Path
 
+import pytest
+from claude_teams import messaging as cs_messaging  # type: ignore[import-untyped]
+
+from claude_anyteam import protocol_io as pio
 from claude_anyteam.backends.gemini import acp
+
+
+@pytest.fixture(autouse=True)
+def events_root(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> Path:
+    base = tmp_path / "teams"
+    monkeypatch.setattr(cs_messaging, "TEAMS_DIR", base)
+    return base
 
 
 class FakeClient:
@@ -55,6 +67,40 @@ def test_acp_run_structured_result_and_state(tmp_path, monkeypatch):
     assert state["acp_storage_session_id"] == "store-1"
 
 
+def test_acp_success_emits_turn_lifecycle_events(events_root, tmp_path, monkeypatch):
+    FakeClient.instances = []
+    monkeypatch.setattr(acp, "GeminiAcpClient", FakeClient)
+    monkeypatch.setattr(acp.invoke.shutil, "which", lambda name: "/bin/" + name)
+
+    result = acp.run(
+        "prompt",
+        cwd=tmp_path,
+        schema=acp.TASK_COMPLETE_SCHEMA,
+        gemini_home=tmp_path / "home",
+        wrapper_identity=("team-x", "gemini-acp"),
+        task_id="46",
+        model="gemini-2.5-pro",
+        effort="high",
+    )
+
+    assert result.exit_code == 0
+    events = pio.read_events("team-x", "gemini-acp")
+    assert [event.kind for event in events] == ["turn_started", "turn_completed"]
+    assert [event.backend for event in events] == ["gemini_acp", "gemini_acp"]
+    assert events[0].task_id == "46"
+    assert events[0].payload["prompt_kind"] == "task_complete"
+    assert events[0].payload["effective_model"]
+    completed = events[1]
+    assert completed.task_id == "46"
+    assert completed.payload["exit_code"] == 0
+    assert completed.payload["structured"] is True
+    assert completed.payload["tool_call_events"] == 1
+    assert completed.payload["tool_call_event_source"] == "gemini ACP session/update"
+    assert completed.payload["session_id"] == "live-1"
+    assert completed.payload["stop_reason"] == "end_turn"
+    assert completed.payload["events"][1]["type"] == "tool_use"
+
+
 class AuthClient(FakeClient):
     authenticated = []
     def initialize(self): return {"protocolVersion": 1, "authMethods": [{"id": "api-key"}]}
@@ -100,6 +146,29 @@ def test_acp_non_end_turn_stop_reason_fails(tmp_path, monkeypatch):
     result = acp.run("prompt", cwd=tmp_path, gemini_home=tmp_path / "home")
     assert result.exit_code == 1
     assert result.error == "gemini ACP stopReason 'max_turns'"
+
+
+def test_acp_failure_emits_turn_failed_lifecycle_event(events_root, tmp_path, monkeypatch):
+    monkeypatch.setattr(acp, "GeminiAcpClient", StopReasonClient)
+
+    result = acp.run(
+        "prompt",
+        cwd=tmp_path,
+        gemini_home=tmp_path / "home",
+        wrapper_identity=("team-x", "gemini-acp-fail"),
+        task_id="46",
+    )
+
+    assert result.exit_code == 1
+    events = pio.read_events("team-x", "gemini-acp-fail")
+    assert [event.kind for event in events] == ["turn_started", "turn_failed"]
+    failed = events[1]
+    assert failed.backend == "gemini_acp"
+    assert failed.task_id == "46"
+    assert failed.payload["exit_code"] == 1
+    assert failed.payload["error"] == "gemini ACP stopReason 'max_turns'"
+    assert failed.payload["error_class"] == "stop_reason"
+    assert failed.payload["stop_reason"] == "max_turns"
 
 
 class CancelledClient(FakeClient):

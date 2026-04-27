@@ -15,6 +15,7 @@ from typing import Any
 from claude_anyteam import logger
 from claude_anyteam.codex import CodexResult, PLAN_SCHEMA, TASK_COMPLETE_SCHEMA
 from claude_anyteam.env import identity_env
+from claude_anyteam.headless_visibility import HeadlessTurnVisibility
 from claude_anyteam.schema_validation import load_schema, parse_and_validate
 
 from . import crash_hygiene, invoke
@@ -385,6 +386,60 @@ def run(
     session_id: str | None = None
     loaded = False
     logger.info("gemini_acp.invoke", cwd=str(cwd), gemini_home=str(home), schema=str(schema) if schema else None, resumed=bool(resume_session_id), model=model, effort=effort, effective_model=effective_model, trust_mode=trust_mode)
+    visibility = HeadlessTurnVisibility.start(
+        team=team,
+        agent=agent,
+        backend="gemini_acp",
+        enabled=wrapper_identity is not None,
+        cwd=cwd,
+        schema=schema,
+        timeout_s=timeout_s,
+        model=model,
+        effort=effort,
+        resume_session_id=resume_session_id,
+        task_id=task_id,
+        extra_payload={
+            "effective_model": effective_model,
+            "trust_mode": trust_mode,
+            "ephemeral": ephemeral,
+            "gemini_home": str(home),
+        },
+    )
+
+    def _terminal_visibility(
+        *,
+        success: bool,
+        exit_code: int,
+        error: str | None,
+        events: list[dict[str, Any]],
+        tool_call_events: int,
+        last_message: str,
+        structured: bool,
+        session_id: str | None,
+        error_class: str | None = None,
+        extra_payload: dict[str, Any] | None = None,
+    ) -> None:
+        payload = {
+            "tool_call_event_source": "gemini ACP session/update",
+            "loaded": loaded,
+            "trust_mode": trust_mode,
+            "ephemeral": ephemeral,
+        }
+        if extra_payload:
+            payload.update(extra_payload)
+        visibility.terminal(
+            success=success,
+            exit_code=exit_code,
+            error=error,
+            events=events,
+            tool_call_events=tool_call_events,
+            last_message=last_message,
+            structured=structured,
+            partial_events_available=bool(events),
+            session_id=session_id,
+            error_class=error_class,
+            extra_payload=payload,
+        )
 
     client = GeminiAcpClient(
         gemini_binary=gemini_binary,
@@ -435,18 +490,68 @@ def run(
         if getattr(client, "permission_blocked", None) is not None:
             if not ephemeral:
                 invoke.reset_acp_adapter_state(home)
-            return _permission_block_result(getattr(client, "permission_blocked"), events=events, session_id=session_id)
+            result = _permission_block_result(getattr(client, "permission_blocked"), events=events, session_id=session_id)
+            _terminal_visibility(
+                success=False,
+                exit_code=result.exit_code,
+                error=result.error,
+                events=result.events,
+                tool_call_events=result.tool_call_events,
+                last_message=result.last_message,
+                structured=False,
+                session_id=session_id,
+                error_class="permission_blocked",
+                extra_payload={"permission_blocked": getattr(client, "permission_blocked")},
+            )
+            return result
     except (subprocess.TimeoutExpired, GeminiAcpTimeoutError):
         _cancel_session_quietly(client, session_id)
         if not ephemeral:
             invoke.reset_acp_adapter_state(home)
-        return CodexResult(exit_code=124, structured=None, last_message="", events=events, error=f"gemini ACP timed out after {timeout_s}s; ACP session was dropped for the next task", session_id=session_id)
+        error = f"gemini ACP timed out after {timeout_s}s; ACP session was dropped for the next task"
+        _terminal_visibility(
+            success=False,
+            exit_code=124,
+            error=error,
+            events=events,
+            tool_call_events=0,
+            last_message="",
+            structured=False,
+            session_id=session_id,
+            error_class="turn_timeout",
+        )
+        return CodexResult(exit_code=124, structured=None, last_message="", events=events, error=error, session_id=session_id)
     except Exception as e:
         if getattr(client, "permission_blocked", None) is not None:
             if not ephemeral:
                 invoke.reset_acp_adapter_state(home)
-            return _permission_block_result(getattr(client, "permission_blocked"), events=events, session_id=session_id)
-        return CodexResult(exit_code=1, structured=None, last_message="", events=events, error=str(e), session_id=session_id)
+            result = _permission_block_result(getattr(client, "permission_blocked"), events=events, session_id=session_id)
+            _terminal_visibility(
+                success=False,
+                exit_code=result.exit_code,
+                error=result.error,
+                events=result.events,
+                tool_call_events=result.tool_call_events,
+                last_message=result.last_message,
+                structured=False,
+                session_id=session_id,
+                error_class="permission_blocked",
+                extra_payload={"permission_blocked": getattr(client, "permission_blocked")},
+            )
+            return result
+        error = str(e)
+        _terminal_visibility(
+            success=False,
+            exit_code=1,
+            error=error,
+            events=events,
+            tool_call_events=0,
+            last_message="",
+            structured=False,
+            session_id=session_id,
+            error_class="acp_error",
+        )
+        return CodexResult(exit_code=1, structured=None, last_message="", events=events, error=error, session_id=session_id)
     finally:
         try:
             client.close()
@@ -464,11 +569,15 @@ def run(
 
     stop_reason = response.get("stopReason") if isinstance(response, dict) else None
     exit_code = 0
+    error_class: str | None = None
     if stop_reason not in (None, "end_turn") and not error:
         exit_code = 1
         error = f"gemini ACP stopReason {stop_reason!r}"
+        error_class = "stop_reason"
     if error:
         exit_code = 1
+        if error_class is None and "schema validation" in error:
+            error_class = "schema_validation_failed"
 
     if session_id and not ephemeral:
         if stop_reason == "cancelled":
@@ -482,6 +591,23 @@ def run(
             )
 
     logger.info("gemini_acp.result", session_id=session_id, loaded=loaded, stop_reason=stop_reason, tool_calls=tool_call_events)
+    success = exit_code == 0 and error is None
+    _terminal_visibility(
+        success=success,
+        exit_code=exit_code,
+        error=error,
+        events=events,
+        tool_call_events=tool_call_events,
+        last_message=last_message,
+        structured=structured is not None,
+        session_id=session_id,
+        error_class=error_class,
+        extra_payload={
+            "stop_reason": stop_reason,
+            "response": response if isinstance(response, dict) else None,
+            "effective_model": effective_model,
+        },
+    )
     return CodexResult(
         exit_code=exit_code,
         structured=structured,
