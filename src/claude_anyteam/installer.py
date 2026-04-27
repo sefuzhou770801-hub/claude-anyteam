@@ -21,6 +21,7 @@ import sys
 import tempfile
 from dataclasses import dataclass, field
 from datetime import datetime, timezone
+from importlib import resources as importlib_resources
 from pathlib import Path
 from typing import Any, Callable, Literal
 
@@ -50,6 +51,12 @@ RECOMMENDED_ALLOWLIST_ENTRIES = (
     "Bash(claude-anyteam team-agent *)",
     "Bash(claude-anyteam team-patch *)",
     "Bash(claude-anyteam team-roster *)",
+)
+REQUIRED_SCHEMA_RESOURCES = (
+    "task-complete.schema.json",
+    "plan.schema.json",
+    "permission_request.schema.json",
+    "permission_response.schema.json",
 )
 
 MANAGED_BINARY_KEYS = (
@@ -575,6 +582,43 @@ def _plugin_registration_error(details: str) -> InstallError:
         severity="soft",
         details=details,
     )
+
+
+def _packaged_schema_assets_error() -> InstallError | None:
+    """Return an installer hard-stop if required schema resources are absent."""
+    # R1 (09-implementation-roadmap) / 07 §9: schema JSON files are part of
+    # the wire contract. Refuse to declare install success if the wheel does
+    # not contain them; otherwise first teammate task fails mysteriously later.
+    try:
+        schemas_dir = importlib_resources.files("claude_anyteam.schemas")
+        missing = [
+            name
+            for name in REQUIRED_SCHEMA_RESOURCES
+            if not schemas_dir.joinpath(name).is_file()
+        ]
+    except Exception as exc:
+        return InstallError(
+            title="claude-anyteam's schema assets are missing",
+            explanation=(
+                "The installed package could not resolve its bundled JSON schemas, "
+                "which are required for structured teammate outputs."
+            ),
+            action="Run `uv tool install --reinstall claude-anyteam`, then run `claude-anyteam install` again.",
+            severity="blocker",
+            details=f"{type(exc).__name__}: {exc}",
+        )
+    if missing:
+        return InstallError(
+            title="claude-anyteam's schema assets are missing",
+            explanation=(
+                "The installed package is missing JSON schemas required for "
+                "structured teammate outputs."
+            ),
+            action="Run `uv tool install --reinstall claude-anyteam`, then run `claude-anyteam install` again.",
+            severity="blocker",
+            details=f"Missing schema resources: {', '.join(missing)}",
+        )
+    return None
 
 
 
@@ -2225,6 +2269,10 @@ def install(
             details=message,
             cli_exit_code=INSTALL_ERROR_EXIT_NO_PROVIDER,
         )
+
+    schema_assets_error = _packaged_schema_assets_error()
+    if schema_assets_error is not None:
+        raise schema_assets_error
 
     paths = discover_managed_paths(
         settings_path=settings_path,
