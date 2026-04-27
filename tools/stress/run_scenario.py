@@ -928,6 +928,7 @@ def write_unified_scorecard(
     scenario_id: str,
     scenario: Mapping[str, Any],
     run_id: str,
+    run_time_git_sha: str,
     team_name: str,
     wall_clock_seconds: float,
     task_ids: Iterable[str],
@@ -953,12 +954,15 @@ def write_unified_scorecard(
     for key in HEADLINE_KEYS:
         headline_metrics.setdefault(key, None)
     s1_violations = _sum_s1_violations(quality, path.parent / "quality")
+    scoring_time_git_sha = _git_sha()
     scorecard = {
         "schema_version": 1,
         "scenario": scenario_id,
         "scenario_name": scenario.get("name"),
         "run_id": run_id,
-        "git_sha": _git_sha(),
+        "git_sha": run_time_git_sha,
+        "run_time_git_sha": run_time_git_sha,
+        "scoring_time_git_sha": scoring_time_git_sha,
         "wall_clock_seconds": wall_clock_seconds,
         "team": team_name,
         "n_tasks": len(task_ids),
@@ -990,6 +994,7 @@ def write_partial_scorecard(
     scenario_id: str,
     scenario: Mapping[str, Any],
     run_id: str,
+    run_time_git_sha: str,
     team_name: str,
     started_at: float,
     task_ids: Iterable[str],
@@ -1003,6 +1008,7 @@ def write_partial_scorecard(
         scenario_id=scenario_id,
         scenario=scenario,
         run_id=run_id,
+        run_time_git_sha=run_time_git_sha,
         team_name=team_name,
         wall_clock_seconds=time.monotonic() - started_at,
         task_ids=task_ids,
@@ -1064,6 +1070,7 @@ def run_scenario(args: argparse.Namespace, *, stderr: TextIO | None = None) -> i
     task_ids: list[str] = []
     scorer_cards: dict[str, dict[str, Any]] = {}
     spawn_env, env_overrides = scenario_environment(scenario)
+    run_time_git_sha = _git_sha()
 
     try:
         init_sandbox_repo(sandbox / "repo")
@@ -1115,6 +1122,7 @@ def run_scenario(args: argparse.Namespace, *, stderr: TextIO | None = None) -> i
                 scenario_id=scenario_id,
                 scenario=scenario,
                 run_id=run_id,
+                run_time_git_sha=run_time_git_sha,
                 team_name=team_name,
                 started_at=started_at,
                 task_ids=task_ids,
@@ -1132,6 +1140,7 @@ def run_scenario(args: argparse.Namespace, *, stderr: TextIO | None = None) -> i
             scenario_id=scenario_id,
             scenario=scenario,
             run_id=run_id,
+            run_time_git_sha=run_time_git_sha,
             team_name=team_name,
             wall_clock_seconds=time.monotonic() - started_at,
             task_ids=task_ids,

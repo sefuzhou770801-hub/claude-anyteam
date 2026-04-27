@@ -160,6 +160,24 @@ def test_dry_run_S1(isolated_protocol_roots, fake_scorers, tmp_path: Path) -> No
     assert (out / "events").exists()
 
 
+def test_scorecard_records_run_time_and_scoring_time_git_shas(
+    isolated_protocol_roots,
+    fake_scorers,
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+) -> None:
+    git_sha = Mock(side_effect=["run-start-sha", "score-time-sha"])
+    monkeypatch.setattr(run_scenario, "_git_sha", git_sha)
+
+    rc, out, _ = _invoke(tmp_path, "S1")
+
+    assert rc == 0
+    card = _scorecard(out)
+    assert card["run_time_git_sha"] == "run-start-sha"
+    assert card["scoring_time_git_sha"] == "score-time-sha"
+    assert card["git_sha"] == "run-start-sha"
+
+
 def test_dry_run_S5_mixed(isolated_protocol_roots, fake_scorers, tmp_path: Path) -> None:
     rc, out, _ = _invoke(tmp_path, "S5", workload="W9.json")
 
