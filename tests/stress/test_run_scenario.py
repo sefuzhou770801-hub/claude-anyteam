@@ -221,6 +221,24 @@ def test_workload_manifest_missing(isolated_protocol_roots, fake_scorers, tmp_pa
     assert "workload manifest missing" in capsys.readouterr().err
 
 
+def test_command_for_member_constructs_claude_invocation(tmp_path: Path) -> None:
+    sandbox = tmp_path / "sandbox"
+    cmd = run_scenario._command_for_member(
+        {"name": "claude-tgt-a", "agent_type": "claude", "model": "sonnet"},
+        "stress-S2-20260427T1530Z",
+        sandbox,
+    )
+
+    assert cmd is not None
+    assert cmd[:3] == ["claude", "--print", "--append-system-prompt"]
+    assert "--model" in cmd
+    assert cmd[cmd.index("--model") + 1] == "sonnet"
+    assert "claude_anyteam" not in cmd
+    assert "claude-tgt-a" in cmd[3]
+    assert "stress-S2-20260427T1530Z" in cmd[3]
+    assert str(sandbox / "repo") in cmd[3]
+
+
 def test_archive_paths(isolated_protocol_roots, fake_scorers, tmp_path: Path) -> None:
     rc, out, _ = _invoke(tmp_path, "S1")
 

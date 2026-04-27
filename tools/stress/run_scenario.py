@@ -365,6 +365,15 @@ def _command_for_member(member: Mapping[str, Any], team_name: str, sandbox: Path
     name = str(member["name"])
     cwd = str(sandbox / "repo")
     base = [sys.executable, "-m"]
+    if agent_type == "claude":
+        prompt = (
+            f"Phase-3 stress target {name}. You are a native Claude Code "
+            f"harness member for team {team_name}. Work from assigned tasks "
+            f"and inbox messages under ~/.claude/teams/{team_name}, using "
+            f"the repository at {cwd}."
+        )
+        model = str(member.get("model") or "sonnet")
+        return ["claude", "--print", "--append-system-prompt", prompt, "--model", model]
     if agent_type == "codex":
         cmd = [*base, "claude_anyteam.cli", "--team", team_name, "--name", name, "--cwd", cwd]
         if member.get("model"):
