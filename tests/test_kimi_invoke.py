@@ -384,8 +384,12 @@ def test_headless_prose_send_message_suppresses_terminal_preview(events_root, tm
     assert result.exit_code == 0
     assert result.last_message.startswith("This final prose")
     events = pio.read_visibility_events("team-x", "kimi-a")
-    payload = events[1].payload
-    assert payload["tool_call_events"] == 1
+    # Post #cross-impl: tool_event envelopes are emitted between turn_started
+    # and turn_completed; turn_completed is at events[-1]. tool_call_events
+    # count is replaced by per-tool envelopes (counted directly).
+    tool_call_envelopes = [e for e in events if e.kind == "tool_event"]
+    assert len(tool_call_envelopes) == 1
+    payload = events[-1].payload
     assert payload["last_message_preview"] == ""
     assert payload["last_message_suppressed_reason"] == "delivered_via_send_message_tool"
 
