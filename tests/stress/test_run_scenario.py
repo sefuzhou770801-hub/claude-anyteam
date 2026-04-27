@@ -40,6 +40,7 @@ def _fake_scorer_modules(*, fail: str | None = None):
             "aggregate": {
                 "M1_throughput_per_min": {"sum": 1.5, "mean": 0.5, "min": 0.4, "max": 0.6},
                 "M5_turn_failed_rate": {"weighted_mean": 0.1},
+                "M11b_team_p95_turn_duration_seconds": 84.0,
             },
             "per_agent_files": ["agents/codex-tgt-app.json"],
         }
@@ -58,7 +59,7 @@ def _fake_scorer_modules(*, fail: str | None = None):
             "aggregate": {
                 "M4_team_cross_peer_ratio": 0.75,
                 "M9_team_steer_ack_rate": 0.9,
-                "M11_team_p95_rtt_seconds": 42.0,
+                "M11a_team_p95_rtt_seconds": 42.0,
                 "M13_total_collisions": 0,
             },
             "per_agent_files": ["agents/codex-tgt-app.json"],
@@ -67,9 +68,9 @@ def _fake_scorer_modules(*, fail: str | None = None):
         agent_doc = {
             "agent": "codex-tgt-app",
             "metrics": {
-                "M11_peer_dm_rtt_seconds_by_recipient_backend": {
-                    "gemini_acp": {"mean": 12.0, "median": 12.0, "p95": None, "samples": 1},
-                    "kimi_headless": None,
+                "M11a_peer_dm_rtt_seconds_by_recipient_backend": {
+                    "gemini_acp": {"p50": None, "p95": None, "max": 12.0, "samples": 1},
+                    "kimi_headless": {"p50": None, "p95": None, "max": None, "samples": 0},
                 }
             },
         }
@@ -164,9 +165,11 @@ def test_dry_run_S5_mixed(isolated_protocol_roots, fake_scorers, tmp_path: Path)
 
     assert rc == 0
     agent_doc = json.loads((out / "collab" / "agents" / "codex-tgt-app.json").read_text())
-    by_backend = agent_doc["metrics"]["M11_peer_dm_rtt_seconds_by_recipient_backend"]
+    by_backend = agent_doc["metrics"]["M11a_peer_dm_rtt_seconds_by_recipient_backend"]
     assert "gemini_acp" in by_backend
-    assert _scorecard(out)["headline_metrics"]["M11_team_p95_rtt_seconds"] == 42.0
+    headline = _scorecard(out)["headline_metrics"]
+    assert headline["M11a_team_p95_rtt_seconds"] == 42.0
+    assert headline["M11b_team_p95_turn_duration_seconds"] == 84.0
 
 
 def test_dry_run_S10a_ablation(isolated_protocol_roots, fake_scorers, tmp_path: Path) -> None:

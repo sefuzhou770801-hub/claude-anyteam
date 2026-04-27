@@ -49,6 +49,7 @@ class AgentComputation:
     m5_completed: int
     idle_samples: list[float]
     m10_warnings: int
+    m11b_samples_by_backend: dict[str, list[float]]
 
 
 def _eprint(stderr: TextIO, message: str) -> None:
@@ -250,6 +251,62 @@ def _compute_idle_samples(events_with_ts: list[tuple[VisibilityEvent, datetime]]
     return samples
 
 
+def _turn_key(event: VisibilityEvent) -> str:
+    return event.turn_id or "_implicit_current_turn"
+
+
+def _compute_turn_duration_samples(
+    events_with_ts: list[tuple[VisibilityEvent, datetime]],
+    stderr: TextIO,
+) -> dict[str, list[float]]:
+    """Pair turn_started with turn_completed/turn_failed and group durations by backend."""
+
+    starts_by_turn: dict[str, tuple[datetime, str]] = {}
+    current_start: tuple[str, datetime, str] | None = None
+    samples: dict[str, list[float]] = {}
+    for event, ts in events_with_ts:
+        if event.kind == "turn_started":
+            backend = event.backend or "_unknown_backend"
+            key = _turn_key(event)
+            starts_by_turn[key] = (ts, backend)
+            current_start = (key, ts, backend)
+            continue
+        if event.kind not in {"turn_completed", "turn_failed"}:
+            continue
+        key = _turn_key(event)
+        start = starts_by_turn.pop(key, None)
+        if start is None and current_start is not None:
+            current_key, current_ts, current_backend = current_start
+            start = (current_ts, current_backend)
+            starts_by_turn.pop(current_key, None)
+        if start is None:
+            continue
+        start_ts, start_backend = start
+        if ts < start_ts:
+            _eprint(
+                stderr,
+                f"warning: terminal turn event {event.event_id} precedes turn_started; duration skipped",
+            )
+            continue
+        backend = event.backend or start_backend or "_unknown_backend"
+        samples.setdefault(backend, []).append((ts - start_ts).total_seconds())
+        if current_start is not None and current_start[0] == key:
+            current_start = None
+    return samples
+
+
+def percentile_triplet(samples: Iterable[float]) -> dict[str, Any]:
+    values = sorted(float(v) for v in samples)
+    enough = len(values) >= 5
+    quantiles = statistics.quantiles(values, n=20) if enough else []
+    return {
+        "p50": quantiles[9] if enough else None,
+        "p95": quantiles[18] if enough else None,
+        "max": max(values) if values else None,
+        "samples": len(values),
+    }
+
+
 def compute_agent_score(
     *,
     agent: str,
@@ -278,6 +335,7 @@ def compute_agent_score(
             m5_completed=0,
             idle_samples=[],
             m10_warnings=0,
+            m11b_samples_by_backend={},
         )
 
     notes: list[str] = []
@@ -386,6 +444,15 @@ def compute_agent_score(
     if m8_notes:
         m8_score["notes"] = m8_notes
 
+    m11b_samples_by_backend = _compute_turn_duration_samples(events_with_ts, stderr)
+    m11b_score = {
+        backend_name: percentile_triplet(samples)
+        for backend_name, samples in sorted(m11b_samples_by_backend.items())
+    }
+    for backend_name, samples in sorted(m11b_samples_by_backend.items()):
+        if len(samples) < 5:
+            notes.append(f"m11b_undersampled:{backend_name}")
+
     scorecard: dict[str, Any] = {
         "schema_version": 1,
         "agent": agent,
@@ -401,6 +468,7 @@ def compute_agent_score(
             "M5_turn_completed_count": completed_count,
             "M8_idle_time_seconds": m8_score,
             "M10_turn_warning_count": warning_count,
+            "M11b_turn_duration_seconds_by_backend": m11b_score,
         },
     }
     if notes:
@@ -414,6 +482,7 @@ def compute_agent_score(
         m5_completed=completed_count,
         idle_samples=idle_samples,
         m10_warnings=warning_count,
+        m11b_samples_by_backend=m11b_samples_by_backend,
     )
 
 
@@ -439,6 +508,19 @@ def compute_scenario_score(
     failures = sum(item.m5_failed for item in computations)
     turns = sum(item.m5_failed + item.m5_completed for item in computations)
     all_idle_samples = [sample for item in computations for sample in item.idle_samples]
+    m11b_samples_by_backend: dict[str, list[float]] = {}
+    for item in computations:
+        for backend_name, samples in item.m11b_samples_by_backend.items():
+            m11b_samples_by_backend.setdefault(backend_name, []).extend(samples)
+    m11b_by_backend = {
+        backend_name: percentile_triplet(samples)
+        for backend_name, samples in sorted(m11b_samples_by_backend.items())
+    }
+    m11b_p95_values = [
+        summary["p95"]
+        for summary in m11b_by_backend.values()
+        if summary.get("p95") is not None
+    ]
 
     return {
         "schema_version": 1,
@@ -453,6 +535,8 @@ def compute_scenario_score(
             },
             "M8_idle_time_seconds": {"team_p95": _p95(all_idle_samples)},
             "M10_total_turn_warnings": sum(item.m10_warnings for item in computations),
+            "M11b_turn_duration_seconds_by_backend": m11b_by_backend,
+            "M11b_team_p95_turn_duration_seconds": max(m11b_p95_values) if m11b_p95_values else None,
         },
         "per_agent_files": [f"agents/{agent}.json" for agent in agents],
     }

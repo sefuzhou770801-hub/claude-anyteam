@@ -70,6 +70,7 @@ def send(
     at: float = 0,
     turn_id: str | None = None,
     summary: str = "ask: status?",
+    backend: str = "codex_app_server",
     payload_extra: dict | None = None,
 ):
     payload = {"tool_name": "send_message", "phase": "completed", "summary": summary}
@@ -83,6 +84,7 @@ def send(
         "tool_event",
         seq,
         at=at,
+        backend=backend,
         turn_id=turn_id,
         summary=summary,
         payload=payload,
@@ -227,10 +229,13 @@ def test_m11_rtt_basic(teams_dir: Path, tmp_path: Path):
     send(team, "agent-b", 1, "agent-a", at=15)
 
     _scenario, pairs, agents = run_score(team, tmp_path / "out")
-    rtt = agents["agent-a"]["metrics"]["M11_peer_dm_rtt_seconds"]
+    metrics = agents["agent-a"]["metrics"]
+    rtt = metrics["M11a_peer_dm_rtt_seconds"]
 
-    assert rtt["mean"] == 15.0
-    assert rtt["median"] == 15.0
+    assert "M11_peer_dm_rtt_seconds" not in metrics
+    assert rtt["p50"] is None
+    assert rtt["p95"] is None
+    assert rtt["max"] == 15.0
     assert rtt["samples"] == 1
     assert rtt["unmatched_send_count"] == 0
     pair = next(row for row in pairs["pairs"] if row["from"] == "agent-a" and row["to"] == "agent-b")
@@ -243,7 +248,7 @@ def test_m11_rtt_unmatched_at_cap(teams_dir: Path, tmp_path: Path):
     send(team, "agent-b", 1, "agent-a", at=700)
 
     _scenario, pairs, agents = run_score(team, tmp_path / "out")
-    rtt = agents["agent-a"]["metrics"]["M11_peer_dm_rtt_seconds"]
+    rtt = agents["agent-a"]["metrics"]["M11a_peer_dm_rtt_seconds"]
 
     assert rtt["samples"] == 0
     assert rtt["p95"] is None
@@ -251,6 +256,43 @@ def test_m11_rtt_unmatched_at_cap(teams_dir: Path, tmp_path: Path):
     assert "p95_undersampled" in agents["agent-a"]["notes"]
     pair = next(row for row in pairs["pairs"] if row["from"] == "agent-a" and row["to"] == "agent-b")
     assert pair["rtt_seconds"]["unmatched_send_count"] == 1
+
+
+def test_m11a_per_backend_distinct_distributions(teams_dir: Path, tmp_path: Path):
+    team = "team-m11a-backend"
+    for idx, delta in enumerate([1, 2, 3, 4, 5], start=1):
+        base = idx * 100
+        send(team, "agent-a", idx, "codex-b", at=base)
+        send(team, "codex-b", idx, "agent-a", at=base + delta, backend="codex_app_server")
+    for idx, delta in enumerate([20, 21, 22, 23, 24], start=10):
+        base = idx * 100
+        send(team, "agent-a", idx, "gemini-c", at=base)
+        send(team, "gemini-c", idx, "agent-a", at=base + delta, backend="gemini_acp")
+
+    _scenario, _pairs, agents = run_score(team, tmp_path / "out")
+    buckets = agents["agent-a"]["metrics"]["M11a_peer_dm_rtt_seconds_by_recipient_backend"]
+
+    assert set(buckets) == {"codex_app_server", "gemini_acp"}
+    assert buckets["codex_app_server"]["samples"] == 5
+    assert buckets["gemini_acp"]["samples"] == 5
+    assert buckets["codex_app_server"]["max"] == 5.0
+    assert buckets["gemini_acp"]["max"] == 24.0
+    assert buckets["codex_app_server"]["p50"] != buckets["gemini_acp"]["p50"]
+
+
+def test_m11a_undersampled_backend_emits_null_percentiles(teams_dir: Path, tmp_path: Path):
+    team = "team-m11a-under"
+    send(team, "agent-a", 1, "kimi-b", at=0)
+    send(team, "kimi-b", 1, "agent-a", at=42, backend="kimi_headless")
+
+    _scenario, _pairs, agents = run_score(team, tmp_path / "out")
+    bucket = agents["agent-a"]["metrics"]["M11a_peer_dm_rtt_seconds_by_recipient_backend"]["kimi_headless"]
+
+    assert bucket["samples"] == 1
+    assert bucket["p50"] is None
+    assert bucket["p95"] is None
+    assert bucket["max"] == 42.0
+    assert "m11a_undersampled:kimi_headless" in agents["agent-a"]["notes"]
 
 
 def test_m11_self_dm_excluded(
@@ -303,6 +345,27 @@ def test_m13_no_collision_when_preview_short(teams_dir: Path, tmp_path: Path):
 
     assert agents["agent-a"]["metrics"]["M13_prose_fallback_collisions"] == 0
     assert agents["agent-a"]["metrics"]["M13_total_send_message_replies"] == 1
+
+
+def test_m13_structured_reply_not_collision(teams_dir: Path, tmp_path: Path):
+    team = "team-m13-structured"
+    append_event(
+        team,
+        "agent-a",
+        "turn_completed",
+        1,
+        payload={
+            "tool_call_events": 2,
+            "last_message_preview": "structured task_complete payload with enough text to look prose-like",
+            "structured": True,
+        },
+    )
+
+    scenario, _pairs, agents = run_score(team, tmp_path / "out")
+
+    assert agents["agent-a"]["metrics"]["M13_prose_fallback_collisions"] == 0
+    assert agents["agent-a"]["metrics"]["M13_total_send_message_replies"] == 1
+    assert scenario["aggregate"]["M13_total_collisions"] == 0
 
 
 def test_pair_table_built(teams_dir: Path, tmp_path: Path):

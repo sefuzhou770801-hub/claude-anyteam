@@ -183,7 +183,8 @@ HEADLINE_KEYS = (
     "M4_team_cross_peer_ratio",
     "M5_team_failure_rate",
     "M9_team_steer_ack_rate",
-    "M11_team_p95_rtt_seconds",
+    "M11a_team_p95_rtt_seconds",
+    "M11b_team_p95_turn_duration_seconds",
     "M12_team_average_coverage_ratio",
     "M13_total_collisions",
 )
@@ -911,7 +912,8 @@ def write_unified_scorecard(
         "M4_team_cross_peer_ratio": _metric_from(collab, ("aggregate", "M4_team_cross_peer_ratio")),
         "M5_team_failure_rate": _metric_from(throughput, ("aggregate", "M5_turn_failed_rate", "weighted_mean")),
         "M9_team_steer_ack_rate": _metric_from(collab, ("aggregate", "M9_team_steer_ack_rate")),
-        "M11_team_p95_rtt_seconds": _metric_from(collab, ("aggregate", "M11_team_p95_rtt_seconds")),
+        "M11a_team_p95_rtt_seconds": _metric_from(collab, ("aggregate", "M11a_team_p95_rtt_seconds")),
+        "M11b_team_p95_turn_duration_seconds": _metric_from(throughput, ("aggregate", "M11b_team_p95_turn_duration_seconds")),
         "M12_team_average_coverage_ratio": quality.get("M12_team_average_coverage_ratio"),
         "M13_total_collisions": _metric_from(collab, ("aggregate", "M13_total_collisions")),
     }
@@ -941,7 +943,7 @@ def write_unified_scorecard(
         "north_star_signals": {
             "harness_preservation_violations": s1_violations,
             "visibility_degraded_count": quality.get("M6_team_total_visibility_degraded"),
-            "peer_efficiency_p95_rtt_s": headline_metrics["M11_team_p95_rtt_seconds"],
+            "peer_efficiency_p95_rtt_s": headline_metrics["M11a_team_p95_rtt_seconds"],
         },
         "notes": notes,
     }

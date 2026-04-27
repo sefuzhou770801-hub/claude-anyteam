@@ -117,6 +117,23 @@ def stats(samples: Iterable[float], *, include_unmatched: int | None = None) -> 
     return out
 
 
+def percentile_triplet(samples: Iterable[float], *, include_unmatched: int | None = None) -> dict[str, Any]:
+    """p50/p95/max shape for M11a backend-sliced RTT distributions."""
+
+    values = sorted(float(v) for v in samples)
+    enough = len(values) >= 5
+    quantiles = statistics.quantiles(values, n=20) if enough else []
+    out: dict[str, Any] = {
+        "p50": round(quantiles[9], 3) if enough else None,
+        "p95": round(quantiles[18], 3) if enough else None,
+        "max": round(max(values), 3) if values else None,
+        "samples": len(values),
+    }
+    if include_unmatched is not None:
+        out["unmatched_send_count"] = int(include_unmatched)
+    return out
+
+
 def ratio(numerator: int, denominator: int) -> float | None:
     if denominator == 0:
         return None
@@ -212,6 +229,8 @@ def is_collision(event: VisibilityEvent) -> bool:
     if event.kind not in {"turn_completed", "turn_failed"}:
         return False
     payload = event.payload or {}
+    if payload.get("structured") is True:
+        return False
     try:
         tool_calls = int(payload.get("tool_call_events") or 0)
     except (TypeError, ValueError):
@@ -404,6 +423,26 @@ def backend_for(events: list[VisibilityEvent]) -> str | None:
     return None
 
 
+def recipient_backend_buckets(
+    *,
+    sender: str,
+    rtt: RttResult,
+    backend_by_agent: dict[str, str | None],
+) -> tuple[dict[str, list[float]], Counter[str]]:
+    """Return M11a RTT samples/unmatched counts partitioned by recipient backend."""
+
+    buckets: dict[str, list[float]] = defaultdict(list)
+    unmatched: Counter[str] = Counter()
+    pairs = {pair for pair in rtt.by_pair if pair[0] == sender}
+    pairs.update(pair for pair in rtt.unmatched_by_pair if pair[0] == sender)
+    for _from_agent, recipient in pairs:
+        backend = backend_by_agent.get(recipient) or "_unknown_backend"
+        pair = (sender, recipient)
+        buckets[backend].extend(rtt.by_pair.get(pair, []))
+        unmatched[backend] += rtt.unmatched_by_pair.get(pair, 0)
+    return dict(buckets), unmatched
+
+
 def sort_events(events: Iterable[VisibilityEvent]) -> list[VisibilityEvent]:
     def key(event: VisibilityEvent) -> tuple[datetime, int, str]:
         ts = parse_timestamp(event.timestamp)
@@ -476,6 +515,7 @@ def build_scorecards(
     events_by_agent = {
         agent: sort_events(events) for agent, events in merged_events_by_agent.items()
     }
+    backend_by_agent = {agent: backend_for(events) for agent, events in events_by_agent.items()}
     agents = sorted(events_by_agent)
     send_messages = extract_send_messages(events_by_agent)
     terminals = extract_terminal_events(events_by_agent)
@@ -553,8 +593,23 @@ def build_scorecards(
             agent_samples.extend(rtt.by_pair.get(pair, []))
             agent_unmatched += rtt.unmatched_by_pair.get(pair, 0)
         all_rtt_samples.extend(agent_samples)
+        backend_samples, backend_unmatched = recipient_backend_buckets(
+            sender=agent,
+            rtt=rtt,
+            backend_by_agent=backend_by_agent,
+        )
+        m11a_by_backend = {
+            backend: percentile_triplet(
+                samples,
+                include_unmatched=backend_unmatched.get(backend, 0),
+            )
+            for backend, samples in sorted(backend_samples.items())
+        }
 
         notes: list[str] = []
+        for backend, samples in sorted(backend_samples.items()):
+            if len(samples) < 5:
+                notes.append(f"m11a_undersampled:{backend}")
         if send_total == 0:
             notes.append("no_send_message_calls")
         if missing_recipient:
@@ -592,7 +647,8 @@ def build_scorecards(
                 "M9_steer_ack_total": steer_total,
                 "M9_inflight_count": steer_inflight,
                 "M9_delivery_breakdown": delivery_breakdown_dict(steer_counter),
-                "M11_peer_dm_rtt_seconds": stats(agent_samples, include_unmatched=agent_unmatched),
+                "M11a_peer_dm_rtt_seconds": percentile_triplet(agent_samples, include_unmatched=agent_unmatched),
+                "M11a_peer_dm_rtt_seconds_by_recipient_backend": m11a_by_backend,
                 "M13_prose_fallback_collisions": collisions,
                 "M13_total_send_message_replies": len(agent_terminals),
                 "M13_prose_fallback_collision_rate": ratio(collisions, len(agent_terminals)),
@@ -631,8 +687,8 @@ def build_scorecards(
             "M9_team_steer_ack_total": team_steer_total,
             "M9_team_inflight_count": team_steer_inflight,
             "M9_delivery_breakdown": delivery_breakdown_dict(total_steer_counter),
-            "M11_team_p95_rtt_seconds": stats(all_rtt_samples)["p95"],
-            "M11_team_rtt_seconds": stats(
+            "M11a_team_p95_rtt_seconds": percentile_triplet(all_rtt_samples)["p95"],
+            "M11a_team_rtt_seconds": percentile_triplet(
                 all_rtt_samples,
                 include_unmatched=sum(rtt.unmatched_by_pair.values()),
             ),
