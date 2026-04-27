@@ -258,8 +258,13 @@ MAX_STEER_PREFIX_CHARS = 8192
 
 def _handle_steer(state: GeminiLoopState, payload: SteerIn, msg: Any) -> None:
     sender = getattr(msg, "from_", None) or payload.from_
-    if sender != "team-lead":
-        logger.warn("gemini.steer.rejected", sender=sender, reason="not_team_lead")
+    capabilities = _backend_metadata(state.settings).capabilities
+    if sender != "team-lead" and "accepts_peer_steer" not in capabilities:
+        logger.warn(
+            "gemini.steer.rejected",
+            sender=sender,
+            reason="not_team_lead_and_capability_not_declared",
+        )
         return
     message = payload.message.strip() if isinstance(payload.message, str) else ""
     if not message:

@@ -11,7 +11,7 @@ from claude_anyteam.backends.gemini.loop import GeminiLoopState, QueuedSteer
 from claude_anyteam.codex import CodexResult
 
 
-def _settings() -> GeminiSettings:
+def _settings(*, backend: str = "acp") -> GeminiSettings:
     return GeminiSettings(
         team_name="t",
         agent_name="a",
@@ -19,7 +19,7 @@ def _settings() -> GeminiSettings:
         poll_interval_s=0.01,
         color="cyan",
         plan_mode_required=False,
-        backend="acp",
+        backend=backend,
     )
 
 
@@ -112,8 +112,10 @@ def test_matching_task_id_steer_injects_and_nonmatching_is_retained():
     assert [s.steer_id for s in state.queued_steers] == ["s-later"]
 
 
-def test_non_lead_steer_is_ignored():
-    state = GeminiLoopState(settings=_settings())
+def test_non_lead_steer_without_declared_capability_is_ignored(monkeypatch):
+    state = GeminiLoopState(settings=_settings(backend="headless"))
+    warns: list[tuple[str, dict]] = []
+    monkeypatch.setattr(loop.logger, "warn", lambda msg, **fields: warns.append((msg, fields)))
     msg = SimpleNamespace(
         from_="codex-implementer",
         text=json.dumps({"type": "steer", "message": "Malicious steer."}),
@@ -122,3 +124,12 @@ def test_non_lead_steer_is_ignored():
     loop._handle_message(state, msg)
 
     assert state.queued_steers == []
+    assert warns == [
+        (
+            "gemini.steer.rejected",
+            {
+                "sender": "codex-implementer",
+                "reason": "not_team_lead_and_capability_not_declared",
+            },
+        )
+    ]

@@ -30,13 +30,8 @@ CODEX_APP_SERVER_CAPABILITIES = [
     "thread_fork",
     "live_tool_events",
     "structured_output",
-    # Q4 (per opus-arch-impl): Codex App Server's SteerQueue.push currently
-    # accepts any sender unintentionally (CD-6 footnote). We declare false
-    # here for conservative shipping — reflects the explicit *intent*, not
-    # the accidental implementation. R15-finalize (codex-impl-peer) will
-    # wire SteerQueue to honor this declaration. Flip to "accepts_peer_steer"
-    # post-verification once R15 enforcement test passes for non-lead
-    # senders against a Codex App Server recipient.
+    # Q4 (per opus-arch-impl): Codex App Server is deliberately lead-only
+    # for peer steer until the handler and runtime behavior are re-reviewed.
 ]
 
 CODEX_EXEC_CAPABILITIES = ["structured_output"]

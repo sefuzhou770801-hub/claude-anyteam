@@ -1262,12 +1262,21 @@ class _SteerQueue:
     delivered (same failure mode as a race-lost SendMessage).
     """
 
-    def __init__(self) -> None:
+    def __init__(self, *, capabilities: list[str] | None = None) -> None:
         import queue as _queue
+        self.capabilities = list(capabilities or [])
         self._q: _queue.Queue[str] = _queue.Queue()
 
-    def push(self, text: str) -> None:
+    def push(self, text: str, *, sender: str | None = "team-lead") -> bool:
+        if sender != "team-lead" and "accepts_peer_steer" not in self.capabilities:
+            logger.warn(
+                "app_server.steer.rejected",
+                sender=sender,
+                reason="not_team_lead_and_capability_not_declared",
+            )
+            return False
         self._q.put(text)
+        return True
 
     def pop_nowait(self) -> str | None:
         import queue as _queue

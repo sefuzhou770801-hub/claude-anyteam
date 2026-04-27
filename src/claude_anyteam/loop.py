@@ -43,6 +43,7 @@ from .messages import (
     CapabilityManifestUpdatedIn,
     PlanApprovalRequestIn,
     ShutdownRequestIn,
+    SteerIn,
     parse_protocol_text,
 )
 from .registration import BackendMetadata, deregister, register
@@ -88,7 +89,7 @@ def _backend_metadata(settings: Settings) -> BackendMetadata:
                 capabilities,
                 delivery_mode="live",
                 expiry_semantics="live_only",
-                steer_authorization="any_peer",
+                steer_authorization="lead_only",
                 host_tool_surface="codex-native",
             ),
             transport="codex-app-server",
@@ -859,7 +860,9 @@ def _execute_task_app_server(state: LoopState, task, prompt: str):
     # inline in `turn/start` params, not as a file path).
     schema = _sv.load_schema(codex_mod.TASK_COMPLETE_SCHEMA)
 
-    steer_queue = codex_mod.SteerQueue()
+    steer_queue = codex_mod.SteerQueue(
+        capabilities=_backend_metadata(s).capabilities,
+    )
 
     def _mid_turn_hook() -> None:
         # Drain own inbox. Prose messages become steer fragments; shutdown
@@ -874,14 +877,38 @@ def _execute_task_app_server(state: LoopState, task, prompt: str):
                 "claude_anyteam.messages", fromlist=["parse_protocol_text"]
             ).parse_protocol_text(m.text)
             if payload is None:
-                steer_queue.push(
-                    f"mid-task message from {m.from_}: {m.text}"
+                sender = getattr(m, "from_", None)
+                accepted = steer_queue.push(
+                    f"mid-task message from {sender}: {m.text}",
+                    sender=sender,
                 )
-                logger.info(
-                    "task.steer_queued",
-                    from_=m.from_,
-                    text_head=m.text[:120],
+                if accepted:
+                    logger.info(
+                        "task.steer_queued",
+                        from_=sender,
+                        text_head=m.text[:120],
+                    )
+            elif isinstance(payload, SteerIn):
+                sender = getattr(m, "from_", None) or payload.from_
+                message = (
+                    payload.message.strip()
+                    if isinstance(payload.message, str)
+                    else ""
                 )
+                if not message:
+                    logger.warn(
+                        "app_server.steer.rejected",
+                        sender=sender,
+                        reason="empty_message",
+                    )
+                    continue
+                accepted = steer_queue.push(message, sender=sender)
+                if accepted:
+                    logger.info(
+                        "task.steer_queued",
+                        from_=sender,
+                        text_head=message[:120],
+                    )
             elif isinstance(payload, ShutdownRequestIn):
                 # Reuse the normal shutdown handler so mid-task requests get
                 # the same immediate reject+feedback response, idempotency,

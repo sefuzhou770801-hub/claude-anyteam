@@ -37,6 +37,9 @@ def test_codex_app_server_backend_metadata_declares_expected_capabilities(tmp_pa
     metadata = codex_loop._backend_metadata(_codex_settings(tmp_path, app_server=True))
 
     assert metadata.capabilities == CODEX_APP_SERVER_CAPABILITIES
+    assert "accepts_peer_steer" not in metadata.capabilities
+    assert metadata.capability_manifest["turn_steer"]["authorization"] == "lead_only"
+    assert metadata.capability_manifest["turn_steer"]["callable_from_peers"] is False
 
 
 def test_codex_exec_backend_metadata_declares_structured_output_only(tmp_path: Path):
