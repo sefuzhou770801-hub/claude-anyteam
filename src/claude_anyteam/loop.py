@@ -253,6 +253,19 @@ def _handle_message(state: LoopState, msg: Any) -> None:
     logger.debug("inbox.protocol_noop", type=payload.__class__.__name__)
 
 
+def _peer_prompt_fragments(state: LoopState) -> str:
+    """Return cached R14 peer capability prompt fragments for this turn."""
+    if state.peer_manifest_cache is None:
+        return ""
+    try:
+        return state.peer_manifest_cache.peer_prompt_fragments_for(
+            state.settings.agent_name
+        )
+    except Exception as e:
+        logger.warn("capability_manifest.peer_prompt_fragments_fail", error=str(e))
+        return ""
+
+
 def _handle_prose(state: LoopState, msg: Any) -> None:
     """Handle an inbound prose (non-protocol) message while idle.
 
@@ -278,6 +291,7 @@ def _handle_prose(state: LoopState, msg: Any) -> None:
         body=msg.text,
         agent_name=s.agent_name,
         team_name=s.team_name,
+        peer_prompt_fragments=_peer_prompt_fragments(state),
     )
 
     reply: str | None = None
@@ -732,7 +746,10 @@ def _invoke_codex_for_task(state: LoopState, task):
 
     if s.app_server:
         prompt = prompts_mod.v7_task_prompt(
-            task, agent_name=s.agent_name, team_name=s.team_name
+            task,
+            agent_name=s.agent_name,
+            team_name=s.team_name,
+            peer_prompt_fragments=_peer_prompt_fragments(state),
         )
         try:
             return _execute_task_app_server(state, task, prompt)
@@ -750,6 +767,7 @@ def _invoke_codex_for_task(state: LoopState, task):
                 task,
                 agent_name=s.agent_name,
                 team_name=s.team_name,
+                peer_prompt_fragments=_peer_prompt_fragments(state),
             ) + "\n\n# Output contract (v7.2 resume)\n" + inline
             if attempt == 2:
                 prompt += (
@@ -827,7 +845,10 @@ def _invoke_codex_for_task(state: LoopState, task):
     # v7 fresh-exec path (also: first task of an adapter's lifetime,
     # before we've captured a session id).
     prompt = prompts_mod.v7_task_prompt(
-        task, agent_name=s.agent_name, team_name=s.team_name
+        task,
+        agent_name=s.agent_name,
+        team_name=s.team_name,
+        peer_prompt_fragments=_peer_prompt_fragments(state),
     )
     try:
         return codex_mod.run(

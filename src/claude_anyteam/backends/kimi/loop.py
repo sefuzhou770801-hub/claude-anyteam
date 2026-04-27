@@ -209,6 +209,19 @@ def _handle_message(state: KimiLoopState, msg: Any) -> None:
         logger.debug("kimi.inbox.protocol_noop", type=payload.__class__.__name__)
 
 
+def _peer_prompt_fragments(state: KimiLoopState) -> str:
+    """Return cached R14 peer capability prompt fragments for this turn."""
+    if state.peer_manifest_cache is None:
+        return ""
+    try:
+        return state.peer_manifest_cache.peer_prompt_fragments_for(
+            state.settings.agent_name
+        )
+    except Exception as e:
+        logger.warn("kimi.capability_manifest.peer_prompt_fragments_fail", error=str(e))
+        return ""
+
+
 MAX_STEER_PREFIX_CHARS = 8192
 
 
@@ -293,7 +306,13 @@ def _handle_prose(state: KimiLoopState, msg: Any) -> None:
     s = state.settings
     sender = getattr(msg, "from_", "unknown")
     logger.info("kimi.inbox.prose", sender=sender, summary=getattr(msg, "summary", None))
-    prompt = prompts.prose_reply_prompt(sender=sender, body=msg.text, agent_name=s.agent_name, team_name=s.team_name)
+    prompt = prompts.prose_reply_prompt(
+        sender=sender,
+        body=msg.text,
+        agent_name=s.agent_name,
+        team_name=s.team_name,
+        peer_prompt_fragments=_peer_prompt_fragments(state),
+    )
     reply: str | None = None
     result = None
     try:
@@ -500,7 +519,12 @@ def _execute_task(state: KimiLoopState, task) -> None:
     schema = load_schema(headless_invoke.TASK_COMPLETE_SCHEMA)
     result = None
     for attempt in (1, 2):
-        prompt = prompts.task_prompt(task, agent_name=s.agent_name, team_name=s.team_name)
+        prompt = prompts.task_prompt(
+            task,
+            agent_name=s.agent_name,
+            team_name=s.team_name,
+            peer_prompt_fragments=_peer_prompt_fragments(state),
+        )
         steer_prefix = _steer_prefix_for_task(state, task) if attempt == 1 else ""
         if steer_prefix:
             prompt = steer_prefix + prompt

@@ -12,7 +12,19 @@ validation time.
 from __future__ import annotations
 
 
-def v7_task_prompt(task, agent_name: str, team_name: str) -> str:
+def _peer_fragment_section(peer_prompt_fragments: str) -> str:
+    text = peer_prompt_fragments.strip()
+    if not text:
+        return ""
+    return f"\n\n{text}"
+
+
+def v7_task_prompt(
+    task,
+    agent_name: str,
+    team_name: str,
+    peer_prompt_fragments: str = "",
+) -> str:
     """Prompt for a task-completion Codex invocation (v7).
 
     Teaches Codex about the MCP tools available via the wrapper, asks
@@ -42,7 +54,8 @@ def v7_task_prompt(task, agent_name: str, team_name: str) -> str:
         f"- task_list(), read_config() — read-only inspection of team state.\n"
         f"\n"
         f"Your current task id is {task.id}. Destructive lifecycle operations "
-        f"are deliberately unavailable.\n\n"
+        f"are deliberately unavailable."
+        f"{_peer_fragment_section(peer_prompt_fragments)}\n\n"
         f"# Required response\n"
         f"Produce a JSON object with fields `files_changed` (list of paths "
         f"created or modified) and `summary` (one-paragraph description of "
@@ -50,13 +63,22 @@ def v7_task_prompt(task, agent_name: str, team_name: str) -> str:
     )
 
 
-def v7_prose_reply_prompt(sender: str, body: str, agent_name: str, team_name: str) -> str:
+def v7_prose_reply_prompt(
+    sender: str,
+    body: str,
+    agent_name: str,
+    team_name: str,
+    peer_prompt_fragments: str = "",
+) -> str:
     """Prompt for a schema-free prose reply to a peer message.
 
     Used when an idle Codex adapter receives a direct message from a teammate.
     Codex should reply conversationally; no task is being executed, no schema
     is required.
     """
+    peer_section = _peer_fragment_section(peer_prompt_fragments)
+    peer_tail = f"{peer_section}\n\n" if peer_section else ""
+    final_instruction = "Do not produce a structured JSON object; plain prose is correct here."
     return (
         f"You are {agent_name}, a Codex teammate on the {team_name} team. "
         f"A teammate named {sender!r} sent you a direct message:\n\n"
@@ -64,7 +86,7 @@ def v7_prose_reply_prompt(sender: str, body: str, agent_name: str, team_name: st
         f"Reply briefly and helpfully. Do not execute any code unless explicitly "
         f"asked. Use the `send_message` MCP tool to deliver your reply to "
         f"{sender!r} — call `send_message(to={sender!r}, body=<your reply>)`. "
-        f"Do not produce a structured JSON object; plain prose is correct here."
+        f"{peer_tail}{final_instruction}"
     )
 
 

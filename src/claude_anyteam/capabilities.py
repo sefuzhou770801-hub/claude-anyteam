@@ -303,3 +303,114 @@ def build_agent_card(
         "host_tool_surface": host_tool_surface,
         "capabilities": entries,
     }
+
+
+def _entry_text(entry: dict[str, Any], key: str) -> str:
+    value = entry.get(key)
+    return str(value).strip() if value is not None else ""
+
+
+def _failure_modes_text(entry: dict[str, Any]) -> str:
+    value = entry.get("failure_modes")
+    if isinstance(value, list):
+        modes = [str(v).strip() for v in value if str(v).strip()]
+        return ", ".join(modes[:6])
+    if value is not None:
+        return str(value).strip()
+    return ""
+
+
+def _peer_capability_block(peer: str, capability: str, entry: dict[str, Any]) -> str:
+    lines = [f"## {peer}: {capability}"]
+    description = _entry_text(entry, "description")
+    when_to_use = _entry_text(entry, "when_to_use")
+    when_not_to = _entry_text(entry, "when_not_to")
+    failure_modes = _failure_modes_text(entry)
+    if description:
+        lines.append(f"- What: {description}")
+    if when_to_use:
+        lines.append(f"- When to use: {when_to_use}")
+    if when_not_to:
+        lines.append(f"- When not to use: {when_not_to}")
+    if failure_modes:
+        lines.append(f"- Failure modes: {failure_modes}")
+    for key, label in (
+        ("delivery_mode", "Delivery mode"),
+        ("expiry_semantics", "Expiry semantics"),
+        ("authorization", "Authorization"),
+    ):
+        value = _entry_text(entry, key)
+        if value:
+            lines.append(f"- {label}: {value}")
+    return "\n".join(lines)
+
+
+def peer_prompt_fragment(agent_name: str, card: dict[str, Any]) -> str:
+    """Return the R14 prompt fragment for one peer's rich Agent Card.
+
+    The fragment teaches peer agents both what capabilities exist and when
+    invoking/routing through that peer is useful.  It intentionally includes
+    informational and lead-gated capabilities as well as directly callable
+    ones: even non-callable features shape routing decisions and peer
+    expectations (§3 peer efficiency).
+    """
+    caps = card.get("capabilities", {}) if isinstance(card, dict) else {}
+    if not isinstance(caps, dict):
+        return ""
+    blocks: list[str] = []
+    for capability, entry in sorted(caps.items()):
+        if not isinstance(entry, dict):
+            continue
+        block = _peer_capability_block(agent_name, str(capability), entry)
+        if block:
+            blocks.append(block)
+    if not blocks:
+        return ""
+    return "\n\n".join(blocks)
+
+
+def peer_prompt_fragments_for(requester: str, cache: Any) -> str:
+    """Aggregate peer-capability prompt fragments for the requesting agent.
+
+    Skips the requester's own card and capabilities already present on the
+    requester, then concatenates one fragment per peer using the cache's known
+    rich Agent Cards.
+    """
+    cards = getattr(cache, "cards", None)
+    if cards is None:
+        cards = getattr(cache, "manifests", {})
+    if not isinstance(cards, dict):
+        return ""
+
+    requester_card = cards.get(requester)
+    requester_caps: set[str] = set()
+    if isinstance(requester_card, dict):
+        caps = requester_card.get("capabilities", {})
+        if isinstance(caps, dict):
+            requester_caps = set(caps)
+
+    parts: list[str] = []
+    for peer_name in sorted(cards):
+        if peer_name == requester:
+            continue
+        card = cards[peer_name]
+        if not isinstance(card, dict):
+            continue
+        caps = card.get("capabilities", {})
+        if not isinstance(caps, dict):
+            continue
+        peer_unique = {
+            capability: entry
+            for capability, entry in caps.items()
+            if capability not in requester_caps
+        }
+        if not peer_unique:
+            continue
+        peer_card = dict(card)
+        peer_card["capabilities"] = peer_unique
+        fragment = peer_prompt_fragment(peer_name, peer_card)
+        if fragment:
+            parts.append(fragment)
+    if not parts:
+        return ""
+    return "# Capabilities of your peers\n\n" + "\n\n".join(parts)

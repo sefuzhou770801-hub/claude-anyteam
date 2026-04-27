@@ -20,6 +20,7 @@ from typing import Any
 from claude_teams._filelock import config_lock, file_lock
 
 from . import logger
+from .capabilities import peer_prompt_fragments_for
 from .messages import CapabilityManifestUpdatedIn, CapabilityManifestUpdatedOut, now_iso, parse_protocol_text
 
 TEAMS_ROOT = Path.home() / ".claude" / "teams"
@@ -320,3 +321,8 @@ class CapabilityManifestCache:
 
     def get(self, agent_name: str) -> dict[str, Any] | None:
         return self.manifests.get(agent_name)
+
+    def peer_prompt_fragments_for(self, requester: str) -> str:
+        """Return R14 peer-capability prompt fragments for ``requester``."""
+
+        return peer_prompt_fragments_for(requester, self)
