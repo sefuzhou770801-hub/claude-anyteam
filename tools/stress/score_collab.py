@@ -62,6 +62,61 @@ class TerminalEvent:
     collision: bool
 
 
+@dataclass(frozen=True)
+class M13Attribution:
+    terminal: TerminalEvent
+    sender: str
+    sender_backend: str
+    recipient: str
+    recipient_backend: str
+    structured_reply_ts: datetime | None
+    prose_fallback_ts: datetime | None
+    terminal_event_kind: str
+
+    @property
+    def backend_key(self) -> str:
+        return backend_pair_key(self.sender_backend, self.recipient_backend)
+
+    def as_dict(self) -> dict[str, Any]:
+        inter_event_ms: int | None = None
+        if self.structured_reply_ts is not None and self.prose_fallback_ts is not None:
+            inter_event_ms = int(
+                round(
+                    (self.prose_fallback_ts - self.structured_reply_ts).total_seconds()
+                    * 1000
+                )
+            )
+        turn_id = self.terminal.event.turn_id or "N/A"
+        structured_reply_ts = (
+            self.structured_reply_ts.isoformat().replace("+00:00", "Z")
+            if self.structured_reply_ts is not None
+            else "N/A"
+        )
+        prose_fallback_ts = (
+            self.prose_fallback_ts.isoformat().replace("+00:00", "Z")
+            if self.prose_fallback_ts is not None
+            else "N/A"
+        )
+        return {
+            "turn_id": turn_id,
+            "terminal_event_id": self.terminal.event.event_id,
+            # Kept as a sender-backend alias for the original M13 attribution
+            # sketch; the explicit sender/recipient backend fields below are
+            # the authoritative disambiguators for mixed-backend runs.
+            "backend": self.sender_backend,
+            "sender": self.sender,
+            "sender_backend": self.sender_backend,
+            "recipient": self.recipient,
+            "recipient_backend": self.recipient_backend,
+            "structured_reply_seen": self.structured_reply_ts is not None,
+            "prose_fallback_seen": self.terminal.collision,
+            "structured_reply_ts": structured_reply_ts,
+            "prose_fallback_ts": prose_fallback_ts,
+            "inter_event_ms": inter_event_ms,
+            "terminal_event_kind": self.terminal_event_kind,
+        }
+
+
 @dataclass
 class RttResult:
     by_pair: dict[tuple[str, str], list[float]]
@@ -418,6 +473,9 @@ def count_peer_steer_rejected(events: Iterable[VisibilityEvent]) -> int:
 
 def backend_for(events: list[VisibilityEvent]) -> str | None:
     for event in events:
+        if event.backend and event.backend != "wrapper_mcp":
+            return event.backend
+    for event in events:
         if event.backend:
             return event.backend
     return None
@@ -453,27 +511,178 @@ def sort_events(events: Iterable[VisibilityEvent]) -> list[VisibilityEvent]:
     return sorted(events, key=key)
 
 
-def collision_pairs(send_messages: list[SendMessageEvent], terminals: list[TerminalEvent]) -> Counter[tuple[str, str]]:
-    by_agent_turn: dict[tuple[str, str], list[SendMessageEvent]] = defaultdict(list)
-    for send in send_messages:
-        if not send.is_peer or not send.event.turn_id:
-            continue
-        by_agent_turn[(send.sender, send.event.turn_id)].append(send)
+def agent_backend(agent: str, backend_by_agent: dict[str, str | None]) -> str:
+    return backend_by_agent.get(agent) or "N/A"
 
-    out: Counter[tuple[str, str]] = Counter()
-    for terminal in terminals:
-        if not terminal.collision or not terminal.event.turn_id:
+
+def backend_pair_key(sender_backend: str, recipient_backend: str) -> str:
+    return f"{sender_backend}->{recipient_backend}"
+
+
+def terminal_event_kind(
+    structured_reply_ts: datetime | None,
+    prose_fallback_ts: datetime | None,
+) -> str:
+    if structured_reply_ts is None or prose_fallback_ts is None:
+        return "unknown"
+    if structured_reply_ts == prose_fallback_ts:
+        return "concurrent"
+    if structured_reply_ts < prose_fallback_ts:
+        return "structured_first_then_prose"
+    return "prose_first_then_structured"
+
+
+def m13_send_counts_by_backend(
+    send_messages: list[SendMessageEvent],
+    backend_by_agent: dict[str, str | None],
+) -> Counter[str]:
+    counts: Counter[str] = Counter()
+    for send in send_messages:
+        if not send.is_peer or send.recipient is None:
             continue
-        sends = by_agent_turn.get((terminal.event.agent, terminal.event.turn_id), [])
-        seen_pairs: set[tuple[str, str]] = set()
-        for send in sends:
-            if send.recipient is None:
-                continue
-            pair = (send.sender, send.recipient)
-            if pair in seen_pairs:
-                continue
-            out[pair] += 1
-            seen_pairs.add(pair)
+        sender_backend = agent_backend(send.sender, backend_by_agent)
+        recipient_backend = agent_backend(send.recipient, backend_by_agent)
+        counts[backend_pair_key(sender_backend, recipient_backend)] += 1
+    return counts
+
+
+def _earliest_send_by_recipient(sends: Iterable[SendMessageEvent]) -> dict[str, SendMessageEvent]:
+    earliest: dict[str, SendMessageEvent] = {}
+    for send in sends:
+        recipient = send.recipient or "N/A"
+        current = earliest.get(recipient)
+        if current is None:
+            earliest[recipient] = send
+            continue
+        if send.timestamp is None:
+            continue
+        if current.timestamp is None or send.timestamp < current.timestamp:
+            earliest[recipient] = send
+    return earliest
+
+
+def m13_attribution_records(
+    send_messages: list[SendMessageEvent],
+    terminals: list[TerminalEvent],
+    backend_by_agent: dict[str, str | None],
+) -> list[M13Attribution]:
+    """Attribute M13 prose-fallback collisions to sender/recipient backend pairs.
+
+    send_message events are emitted by the wrapper MCP stream, so their
+    ``turn_id`` is not the model turn's ``turn_id``.  The stable association
+    available in archived runs is same-agent temporal containment: a peer
+    send belongs to the terminal model turn whose terminal event is the first
+    same-agent terminal after the send.  That preserves recipient attribution
+    in both homogeneous and mixed-backend runs while keeping the legacy M13
+    terminal-count numerator unchanged.
+    """
+
+    sends_by_agent: dict[str, list[SendMessageEvent]] = defaultdict(list)
+    terminals_by_agent: dict[str, list[TerminalEvent]] = defaultdict(list)
+    for send in send_messages:
+        if send.is_peer:
+            sends_by_agent[send.sender].append(send)
+    for terminal in terminals:
+        terminals_by_agent[terminal.event.agent].append(terminal)
+
+    records: list[M13Attribution] = []
+    for sender, agent_terminals in terminals_by_agent.items():
+        agent_sends = sorted(
+            sends_by_agent.get(sender, []),
+            key=lambda send: send.timestamp or datetime.max.replace(tzinfo=timezone.utc),
+        )
+        previous_terminal_ts: datetime | None = None
+        for terminal in sorted(
+            agent_terminals,
+            key=lambda item: item.timestamp or datetime.max.replace(tzinfo=timezone.utc),
+        ):
+            terminal_ts = terminal.timestamp
+            window_sends: list[SendMessageEvent] = []
+            for send in agent_sends:
+                if send.timestamp is None:
+                    continue
+                after_previous = previous_terminal_ts is None or send.timestamp > previous_terminal_ts
+                before_terminal = terminal_ts is None or send.timestamp <= terminal_ts
+                if after_previous and before_terminal:
+                    window_sends.append(send)
+            if terminal.collision:
+                sender_backend = agent_backend(sender, backend_by_agent)
+                sends_by_recipient = _earliest_send_by_recipient(window_sends)
+                if not sends_by_recipient:
+                    records.append(
+                        M13Attribution(
+                            terminal=terminal,
+                            sender=sender,
+                            sender_backend=sender_backend,
+                            recipient="N/A",
+                            recipient_backend="N/A",
+                            structured_reply_ts=None,
+                            prose_fallback_ts=terminal_ts,
+                            terminal_event_kind="unknown",
+                        )
+                    )
+                else:
+                    for recipient, send in sorted(sends_by_recipient.items()):
+                        recipient_backend = (
+                            agent_backend(recipient, backend_by_agent)
+                            if recipient != "N/A"
+                            else "N/A"
+                        )
+                        records.append(
+                            M13Attribution(
+                                terminal=terminal,
+                                sender=sender,
+                                sender_backend=sender_backend,
+                                recipient=recipient,
+                                recipient_backend=recipient_backend,
+                                structured_reply_ts=send.timestamp,
+                                prose_fallback_ts=terminal_ts,
+                                terminal_event_kind=terminal_event_kind(send.timestamp, terminal_ts),
+                            )
+                        )
+            if terminal_ts is not None:
+                previous_terminal_ts = terminal_ts
+    return sorted(
+        records,
+        key=lambda record: (
+            record.prose_fallback_ts or datetime.max.replace(tzinfo=timezone.utc),
+            record.sender,
+            record.recipient,
+            record.terminal.event.event_id,
+        ),
+    )
+
+
+def collision_pairs(attributions: list[M13Attribution]) -> Counter[tuple[str, str]]:
+    out: Counter[tuple[str, str]] = Counter()
+    for attribution in attributions:
+        if attribution.recipient == "N/A":
+            continue
+        out[(attribution.sender, attribution.recipient)] += 1
+    return out
+
+
+def m13_collisions_by_backend(
+    *,
+    attributions: Iterable[M13Attribution],
+    send_counts: Counter[str],
+) -> dict[str, dict[str, Any]]:
+    collision_counts = Counter(record.backend_key for record in attributions)
+    out: dict[str, dict[str, Any]] = {}
+    for key in sorted(set(send_counts) | set(collision_counts)):
+        if "->" in key:
+            sender_backend, recipient_backend = key.split("->", 1)
+        else:
+            sender_backend, recipient_backend = key, "N/A"
+        collisions = collision_counts.get(key, 0)
+        sends = send_counts.get(key, 0)
+        out[key] = {
+            "sender_backend": sender_backend,
+            "recipient_backend": recipient_backend,
+            "collisions": collisions,
+            "send_message_count": sends,
+            "collision_rate": ratio(collisions, sends),
+        }
     return out
 
 
@@ -520,7 +729,9 @@ def build_scorecards(
     send_messages = extract_send_messages(events_by_agent)
     terminals = extract_terminal_events(events_by_agent)
     rtt = compute_rtt(send_messages)
-    pair_collisions = collision_pairs(send_messages, terminals)
+    m13_attributions = m13_attribution_records(send_messages, terminals, backend_by_agent)
+    pair_collisions = collision_pairs(m13_attributions)
+    m13_send_counts = m13_send_counts_by_backend(send_messages, backend_by_agent)
 
     sends_by_sender: dict[str, list[SendMessageEvent]] = defaultdict(list)
     received_by_recipient: Counter[str] = Counter()
@@ -605,6 +816,13 @@ def build_scorecards(
             )
             for backend, samples in sorted(backend_samples.items())
         }
+        agent_m13_attributions = [
+            attribution for attribution in m13_attributions if attribution.sender == agent
+        ]
+        agent_m13_send_counts = m13_send_counts_by_backend(
+            [send for send in send_messages if send.sender == agent],
+            backend_by_agent,
+        )
 
         notes: list[str] = []
         for backend, samples in sorted(backend_samples.items()):
@@ -652,6 +870,13 @@ def build_scorecards(
                 "M13_prose_fallback_collisions": collisions,
                 "M13_total_send_message_replies": len(agent_terminals),
                 "M13_prose_fallback_collision_rate": ratio(collisions, len(agent_terminals)),
+                "M13_collisions_by_backend": m13_collisions_by_backend(
+                    attributions=agent_m13_attributions,
+                    send_counts=agent_m13_send_counts,
+                ),
+                "M13_per_collision_attribution": [
+                    attribution.as_dict() for attribution in agent_m13_attributions
+                ],
             },
             "notes": notes,
         }
@@ -695,6 +920,13 @@ def build_scorecards(
             "M13_total_collisions": total_collisions,
             "M13_total_send_message_replies": total_terminals,
             "M13_prose_fallback_collision_rate": ratio(total_collisions, total_terminals),
+            "M13_collisions_by_backend": m13_collisions_by_backend(
+                attributions=m13_attributions,
+                send_counts=m13_send_counts,
+            ),
+            "M13_per_collision_attribution": [
+                attribution.as_dict() for attribution in m13_attributions
+            ],
             "peer_steer_rejected_count": total_peer_steer_rejected,
         },
         "per_agent_files": [f"agents/{agent}.json" for agent in agents],
