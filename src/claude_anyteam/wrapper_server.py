@@ -44,7 +44,7 @@ from typing import Any, Callable, Literal, TypeVar, cast
 
 from .capability_manifest import CapabilityManifestCache
 from .env import LEGACY_NAME_ENV, LEGACY_TEAM_ENV, NAME_ENV, TEAM_ENV, env_first
-from .messages import SteerIn, VisibilityEvent, parse_protocol_text
+from .messages import VisibilityEvent
 from . import protocol_io
 from claude_teams import messaging as _cs_messaging  # type: ignore[import-untyped]
 from claude_teams import tasks as _cs_tasks  # type: ignore[import-untyped]
@@ -521,15 +521,38 @@ def build_server(argv: list[str] | None = None) -> FastMCP:
             return False
         return (tool_call_seq - last_seq) <= _peer_steer_manifest_max_age_turns()
 
+    def _manifest_accepts_peer_steer(manifest: Any) -> bool:
+        if not isinstance(manifest, dict):
+            return False
+        accepts = manifest.get("accepts_peer_steer")
+        if isinstance(accepts, bool):
+            return accepts
+        capabilities = manifest.get("capabilities")
+        if isinstance(capabilities, dict):
+            value = capabilities.get("accepts_peer_steer")
+            if isinstance(value, bool):
+                return value
+            return value is not None
+        if isinstance(capabilities, list):
+            return "accepts_peer_steer" in capabilities
+        return False
+
     def _steer_recipients_requiring_manifest_query(
         to: str,
         body: str,
         cfg: Any,
     ) -> list[str]:
+        """Return recipients needing a fresh manifest query before send.
+
+        §3 L3 v2 gates on the recipient's interpretation criteria, not the
+        sender's body shape. Codex App Server's mid-turn hook treats any prose
+        from a non-lead peer as a steer fragment, so a plain ``send_message`` to
+        a recipient that does not declare ``accepts_peer_steer`` must be refused
+        at the wrapper until the sender has recently consulted that recipient's
+        manifest.
+        """
+        _ = body  # Body shape is intentionally irrelevant for L3 v2.
         if self_name == "team-lead" or to == "team-lead":
-            return []
-        payload = parse_protocol_text(body)
-        if not isinstance(payload, SteerIn):
             return []
         if to == "*":
             recipients: list[str] = []
@@ -537,8 +560,20 @@ def build_server(argv: list[str] | None = None) -> FastMCP:
                 target = getattr(member, "name", None)
                 if target and target not in {self_name, "team-lead"}:
                     recipients.append(target)
-            return recipients
-        return [to]
+        else:
+            recipients = [to]
+
+        rejecting: list[str] = []
+        for recipient in recipients:
+            manifest = manifest_cache.get(recipient)
+            if manifest is None:
+                # No declaration means we conservatively assume the recipient
+                # rejects peer steer and require an explicit manifest lookup.
+                rejecting.append(recipient)
+                continue
+            if not _manifest_accepts_peer_steer(manifest):
+                rejecting.append(recipient)
+        return rejecting
 
     def _emit_peer_steer_refused_at_wrapper(
         *,

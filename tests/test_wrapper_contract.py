@@ -83,7 +83,13 @@ def _lead() -> LeadMember:
     )
 
 
-def _seed_manifest_team(team_root, *, version: str = "1"):
+def _seed_manifest_team(
+    team_root,
+    *,
+    version: str = "1",
+    peer_accepts_steer: bool = False,
+    peer_manifest: bool = True,
+):
     team_dir = team_root / "claude-anyteam"
     team_dir.mkdir(parents=True, exist_ok=True)
     (team_dir / "inboxes").mkdir(exist_ok=True)
@@ -101,13 +107,9 @@ def _seed_manifest_team(team_root, *, version: str = "1"):
     (team_dir / "config.json").write_text(json.dumps(config), encoding="utf-8")
     manifest_dir = team_dir / "manifests"
     manifest_dir.mkdir()
-    manifest = {
-        "schema_version": 1,
-        "capability_version": version,
-        "team_name": "claude-anyteam",
-        "agent_name": "peer-a",
-        "agent_id": "peer-a@claude-anyteam",
-        "capabilities": {
+    manifest = None
+    if peer_manifest:
+        capabilities = {
             "permission_bridge": {
                 "version": version,
                 "schema": {"type": "object"},
@@ -123,16 +125,42 @@ def _seed_manifest_team(team_root, *, version: str = "1"):
                 "when_to_use": "mid-turn course correction",
                 "when_not_to": "recipient does not allow peers",
                 "failure_modes": ["PEER_STEER_REJECTED"],
+            },
+        }
+        if peer_accepts_steer:
+            capabilities["accepts_peer_steer"] = {
+                "version": version,
+                "schema": {"type": "boolean"},
+                "description": "Allows non-lead peers to send steer messages",
+                "when_to_use": "peer steer is allowed",
+                "when_not_to": "route through team-lead for lead-owned decisions",
+                "failure_modes": ["STEER_PAYLOAD_OVERFLOW"],
             }
-        },
-    }
-    (manifest_dir / "peer-a.json").write_text(json.dumps(manifest), encoding="utf-8")
+        manifest = {
+            "schema_version": 1,
+            "capability_version": version,
+            "team_name": "claude-anyteam",
+            "agent_name": "peer-a",
+            "agent_id": "peer-a@claude-anyteam",
+            "capabilities": capabilities,
+        }
+        (manifest_dir / "peer-a.json").write_text(json.dumps(manifest), encoding="utf-8")
     (team_dir / "inboxes" / "contract-test.json").write_text("[]", encoding="utf-8")
     return team_dir, manifest
 
 
-def _seeded_wrapper(identity, monkeypatch):
-    _seed_manifest_team(identity)
+def _seeded_wrapper(
+    identity,
+    monkeypatch,
+    *,
+    peer_accepts_steer: bool = False,
+    peer_manifest: bool = True,
+):
+    _seed_manifest_team(
+        identity,
+        peer_accepts_steer=peer_accepts_steer,
+        peer_manifest=peer_manifest,
+    )
     monkeypatch.setattr("claude_anyteam.wrapper_server._cs_teams.TEAMS_DIR", identity)
     return build_server()
 
@@ -559,6 +587,7 @@ def test_task_update_rejects_when_owned_by_other_teammate(identity):
 
 
 def test_send_message_accepts_broadcast_star(identity, monkeypatch, tmp_path):
+    monkeypatch.setenv("CLAUDE_ANYTEAM_DISABLE_PEER_STEER_MANIFEST_CHECK", "1")
     members = [
         SimpleNamespace(name="contract-test"),
         SimpleNamespace(name="team-lead"),
@@ -594,6 +623,7 @@ def test_send_message_accepts_broadcast_star(identity, monkeypatch, tmp_path):
 
 
 def test_send_message_direct_message_uses_sender_color(identity, monkeypatch, tmp_path):
+    monkeypatch.setenv("CLAUDE_ANYTEAM_DISABLE_PEER_STEER_MANIFEST_CHECK", "1")
     config = SimpleNamespace(
         members=[
             _member("contract-test", "magenta"),
@@ -621,6 +651,63 @@ def test_send_message_direct_message_uses_sender_color(identity, monkeypatch, tm
     assert payload[0]["color"] == "magenta"
 
 
+def test_peer_steer_refused_for_prose_body_when_recipient_rejects(
+    identity,
+    monkeypatch,
+):
+    mcp = _seeded_wrapper(identity, monkeypatch)
+
+    with pytest.raises(Exception, match="manifest_not_queried"):
+        _call_existing_tool(
+            mcp,
+            "send_message",
+            {"to": "peer-a", "body": "Please use the revised constraint.", "summary": "peer steer"},
+        )
+
+    assert _peer_a_inbox(identity) == []
+    refusals = _wrapper_refusals()
+    assert len(refusals) == 1
+    assert refusals[0].payload["recipient"] == "peer-a"
+
+
+def test_peer_steer_allowed_for_prose_body_when_recipient_accepts(
+    identity,
+    monkeypatch,
+):
+    mcp = _seeded_wrapper(identity, monkeypatch, peer_accepts_steer=True)
+
+    result = _call_existing_tool(
+        mcp,
+        "send_message",
+        {"to": "peer-a", "body": "Please use the revised constraint.", "summary": "peer steer"},
+    )
+
+    assert result == {"delivered_to": "peer-a", "sender": "contract-test"}
+    inbox = _peer_a_inbox(identity)
+    assert len(inbox) == 1
+    assert inbox[0]["text"] == "Please use the revised constraint."
+    assert _wrapper_refusals() == []
+
+
+def test_peer_steer_refused_for_unknown_recipient_capability(
+    identity,
+    monkeypatch,
+):
+    mcp = _seeded_wrapper(identity, monkeypatch, peer_manifest=False)
+
+    with pytest.raises(Exception, match="manifest_not_queried"):
+        _call_existing_tool(
+            mcp,
+            "send_message",
+            {"to": "peer-a", "body": "Plain peer steer without a cached manifest.", "summary": "peer steer"},
+        )
+
+    assert _peer_a_inbox(identity) == []
+    refusals = _wrapper_refusals()
+    assert len(refusals) == 1
+    assert refusals[0].payload["recipient"] == "peer-a"
+
+
 def test_wrapper_peer_steer_refused_without_recent_manifest_query(
     identity,
     monkeypatch,
@@ -631,7 +718,7 @@ def test_wrapper_peer_steer_refused_without_recent_manifest_query(
         _call_existing_tool(
             mcp,
             "send_message",
-            {"to": "peer-a", "body": _steer_body(), "summary": "peer steer"},
+            {"to": "peer-a", "body": "Please use the revised constraint.", "summary": "peer steer"},
         )
 
     assert _peer_a_inbox(identity) == []
@@ -656,13 +743,13 @@ def test_wrapper_peer_steer_allowed_with_recent_manifest_query(
     result = _call_existing_tool(
         mcp,
         "send_message",
-        {"to": "peer-a", "body": _steer_body("use the fresh plan"), "summary": "peer steer"},
+        {"to": "peer-a", "body": "use the fresh plan", "summary": "peer steer"},
     )
 
     assert result == {"delivered_to": "peer-a", "sender": "contract-test"}
     inbox = _peer_a_inbox(identity)
     assert len(inbox) == 1
-    assert json.loads(inbox[0]["text"])["message"] == "use the fresh plan"
+    assert inbox[0]["text"] == "use the fresh plan"
     assert _wrapper_refusals() == []
 
 

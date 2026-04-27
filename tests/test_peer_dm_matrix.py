@@ -98,6 +98,7 @@ def test_five_backend_wrapper_peer_dm_matrix_delivers_exactly_once(monkeypatch, 
     """
 
     team_dir = _write_team(tmp_path)
+    monkeypatch.setenv("CLAUDE_ANYTEAM_DISABLE_PEER_STEER_MANIFEST_CHECK", "1")
     monkeypatch.setattr("claude_anyteam.wrapper_server._cs_teams.TEAMS_DIR", tmp_path / "teams")
     monkeypatch.setattr("claude_anyteam.wrapper_server._cs_messaging.TEAMS_DIR", tmp_path / "teams")
 
