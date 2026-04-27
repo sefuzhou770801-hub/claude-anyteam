@@ -1,0 +1,18 @@
+{
+  "schema_version": 1,
+  "workload_id": "W1",
+  "name": "rename-function",
+  "description": "Rename a function across three files in the sandbox repo, update all call sites, and keep the test suite green.",
+  "lead_prompt_template": "In {repo}, rename `old_name` to `new_name` across the implementation, tests, and README references. Keep the change minimal and run the sandbox tests before finishing. Assigned target: {assigned_to}.",
+  "tasks_per_run": 1,
+  "min_team_size": 1,
+  "success_check": {
+    "type": "pytest_passes",
+    "args": ["tests"],
+    "cwd": "{sandbox}/repo"
+  },
+  "secondary_check": {
+    "type": "git_grep_count",
+    "args": {"pattern": "new_name", "min": 2, "max": 20}
+  }
+}

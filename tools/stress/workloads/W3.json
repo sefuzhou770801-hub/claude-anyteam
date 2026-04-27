@@ -1,0 +1,18 @@
+{
+  "schema_version": 1,
+  "workload_id": "W3",
+  "name": "find-regression",
+  "description": "Find an intentional regression causing a failing test and isolate the root-cause fix to a small source diff.",
+  "lead_prompt_template": "In {repo}, investigate the failing sandbox test and fix the regression. Keep the final diff focused to the root cause; do not rewrite unrelated files. Assigned target: {assigned_to}.",
+  "tasks_per_run": 1,
+  "min_team_size": 1,
+  "success_check": {
+    "type": "files_modified",
+    "args": {"max_files": 2, "must_include": ["src/"]}
+  },
+  "secondary_check": {
+    "type": "pytest_passes",
+    "args": ["tests"],
+    "cwd": "{sandbox}/repo"
+  }
+}

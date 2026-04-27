@@ -1,0 +1,18 @@
+{
+  "schema_version": 1,
+  "workload_id": "W7",
+  "name": "pair-program-tool",
+  "description": "Two teammates pair-program a new wrapper tool. Teammate A designs the API and test, teammate B implements, and A reviews. Both must commit and coordinate via peer-DM.",
+  "lead_prompt_template": "Implement a new wrapper MCP tool `mcp_anyteam_grep` that takes a regex and a directory and returns line-matched results. {assigned_to_a} designs the API surface and writes the test; {assigned_to_b} implements. Both must commit on the same branch. Use peer-DM, not lead pivot, to coordinate.",
+  "tasks_per_run": 1,
+  "min_team_size": 2,
+  "success_check": {
+    "type": "pytest_passes",
+    "args": ["tests/stress/sandbox/test_grep_tool.py"],
+    "cwd": "{sandbox}/repo"
+  },
+  "secondary_check": {
+    "type": "files_modified",
+    "args": {"max_files": 4, "must_include": ["tools/grep.py"], "min_distinct_authors": 2}
+  }
+}

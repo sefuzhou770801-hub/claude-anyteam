@@ -1,0 +1,13 @@
+{
+  "schema_version": 1,
+  "workload_id": "W5",
+  "name": "rewrite-readme-section",
+  "description": "Rewrite a README section for clarity while preserving the section heading and keeping the rendered Markdown simple.",
+  "lead_prompt_template": "In {repo}, rewrite README section `Team protocol overview` for clarity. Preserve the heading exactly and keep the section within 80%-120% of its original length. Assigned target: {assigned_to}.",
+  "tasks_per_run": 1,
+  "min_team_size": 1,
+  "success_check": {
+    "type": "git_grep_count",
+    "args": {"pattern": "Team protocol overview", "min": 1, "max": 1}
+  }
+}

@@ -1,0 +1,20 @@
+{
+  "schema_version": 1,
+  "workload_id": "W9",
+  "name": "capability-aware-request",
+  "description": "A requester must inspect peer capabilities and choose the right backend for a harness-specific primitive without pivoting through the lead.",
+  "lead_prompt_template": "In {repo}, {assigned_to_a} needs a peer capability decision. They must consult capability information, choose the peer whose manifest matches the requested primitive, and ask that peer directly. No lead pivot. Record why the chosen peer matched the capability.",
+  "tasks_per_run": 1,
+  "min_team_size": 2,
+  "success_check": {
+    "type": "manual",
+    "description": "Human analyst verifies the chosen peer has the matching declared capability and that M7 capability-manifest invocation count is > 0 for the requesting agent."
+  },
+  "metric_check": {
+    "metric": "M7",
+    "agent_role": "requesting_agent",
+    "operator": ">",
+    "value": 0
+  },
+  "primary_metrics": ["M4", "M7", "M12"]
+}
