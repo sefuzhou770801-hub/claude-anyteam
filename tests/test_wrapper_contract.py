@@ -617,6 +617,7 @@ def test_send_message_accepts_broadcast_star(identity, monkeypatch, tmp_path):
         assert payload[0]["from"] == "contract-test"
         assert payload[0]["text"] == "heads up"
         assert payload[0]["summary"] == "broadcast"
+        assert payload[0]["messageKind"] == "informational"
 
     own_inbox = team_root / "claude-anyteam" / "inboxes" / "contract-test.json"
     assert not own_inbox.exists(), "broadcast must not send to the sender's own inbox"
@@ -649,25 +650,51 @@ def test_send_message_direct_message_uses_sender_color(identity, monkeypatch, tm
     assert len(payload) == 1
     assert payload[0]["from"] == "contract-test"
     assert payload[0]["color"] == "magenta"
+    assert payload[0]["messageKind"] == "informational"
 
 
-def test_peer_steer_refused_for_prose_body_when_recipient_rejects(
+def test_informational_peer_dm_allowed_without_manifest_query(
     identity,
     monkeypatch,
 ):
     mcp = _seeded_wrapper(identity, monkeypatch)
 
-    with pytest.raises(Exception, match="manifest_not_queried"):
-        _call_existing_tool(
-            mcp,
-            "send_message",
-            {"to": "peer-a", "body": "Please use the revised constraint.", "summary": "peer steer"},
-        )
+    result = _call_existing_tool(
+        mcp,
+        "send_message",
+        {"to": "peer-a", "body": "Please use the revised constraint.", "summary": "coordination"},
+    )
 
-    assert _peer_a_inbox(identity) == []
-    refusals = _wrapper_refusals()
-    assert len(refusals) == 1
-    assert refusals[0].payload["recipient"] == "peer-a"
+    assert result == {"delivered_to": "peer-a", "sender": "contract-test"}
+    inbox = _peer_a_inbox(identity)
+    assert len(inbox) == 1
+    assert inbox[0]["text"] == "Please use the revised constraint."
+    assert inbox[0]["messageKind"] == "informational"
+    assert _wrapper_refusals() == []
+
+
+def test_handoff_peer_dm_allowed_without_manifest_query(
+    identity,
+    monkeypatch,
+):
+    mcp = _seeded_wrapper(identity, monkeypatch)
+
+    result = _call_existing_tool(
+        mcp,
+        "send_message",
+        {
+            "to": "peer-a",
+            "body": "Handoff: I updated the helper; please continue from there.",
+            "summary": "handoff",
+            "kind": "handoff",
+        },
+    )
+
+    assert result == {"delivered_to": "peer-a", "sender": "contract-test"}
+    inbox = _peer_a_inbox(identity)
+    assert len(inbox) == 1
+    assert inbox[0]["messageKind"] == "handoff"
+    assert _wrapper_refusals() == []
 
 
 def test_peer_steer_allowed_for_prose_body_when_recipient_accepts(
@@ -679,13 +706,19 @@ def test_peer_steer_allowed_for_prose_body_when_recipient_accepts(
     result = _call_existing_tool(
         mcp,
         "send_message",
-        {"to": "peer-a", "body": "Please use the revised constraint.", "summary": "peer steer"},
+        {
+            "to": "peer-a",
+            "body": "Please use the revised constraint.",
+            "summary": "peer steer",
+            "kind": "steer",
+        },
     )
 
     assert result == {"delivered_to": "peer-a", "sender": "contract-test"}
     inbox = _peer_a_inbox(identity)
     assert len(inbox) == 1
     assert inbox[0]["text"] == "Please use the revised constraint."
+    assert inbox[0]["messageKind"] == "steer"
     assert _wrapper_refusals() == []
 
 
@@ -699,13 +732,35 @@ def test_peer_steer_refused_for_unknown_recipient_capability(
         _call_existing_tool(
             mcp,
             "send_message",
-            {"to": "peer-a", "body": "Plain peer steer without a cached manifest.", "summary": "peer steer"},
+            {
+                "to": "peer-a",
+                "body": "Plain peer steer without a cached manifest.",
+                "summary": "peer steer",
+                "kind": "steer",
+            },
         )
 
     assert _peer_a_inbox(identity) == []
     refusals = _wrapper_refusals()
     assert len(refusals) == 1
     assert refusals[0].payload["recipient"] == "peer-a"
+
+
+def test_send_message_rejects_unknown_kind(
+    identity,
+    monkeypatch,
+):
+    mcp = _seeded_wrapper(identity, monkeypatch)
+
+    with pytest.raises(Exception, match="kind"):
+        _call_existing_tool(
+            mcp,
+            "send_message",
+            {"to": "peer-a", "body": "hello", "summary": "bad kind", "kind": "urgent"},
+        )
+
+    assert _peer_a_inbox(identity) == []
+    assert _wrapper_refusals() == []
 
 
 def test_wrapper_peer_steer_refused_without_recent_manifest_query(
@@ -718,7 +773,12 @@ def test_wrapper_peer_steer_refused_without_recent_manifest_query(
         _call_existing_tool(
             mcp,
             "send_message",
-            {"to": "peer-a", "body": "Please use the revised constraint.", "summary": "peer steer"},
+            {
+                "to": "peer-a",
+                "body": "Please use the revised constraint.",
+                "summary": "peer steer",
+                "kind": "steer",
+            },
         )
 
     assert _peer_a_inbox(identity) == []
@@ -743,13 +803,14 @@ def test_wrapper_peer_steer_allowed_with_recent_manifest_query(
     result = _call_existing_tool(
         mcp,
         "send_message",
-        {"to": "peer-a", "body": "use the fresh plan", "summary": "peer steer"},
+        {"to": "peer-a", "body": "use the fresh plan", "summary": "peer steer", "kind": "steer"},
     )
 
     assert result == {"delivered_to": "peer-a", "sender": "contract-test"}
     inbox = _peer_a_inbox(identity)
     assert len(inbox) == 1
     assert inbox[0]["text"] == "use the fresh plan"
+    assert inbox[0]["messageKind"] == "steer"
     assert _wrapper_refusals() == []
 
 
@@ -769,7 +830,7 @@ def test_wrapper_peer_steer_manifest_query_stays_fresh_after_intervening_tools(
     result = _call_existing_tool(
         mcp,
         "send_message",
-        {"to": "peer-a", "body": _steer_body(), "summary": "peer steer"},
+        {"to": "peer-a", "body": _steer_body(), "summary": "peer steer", "kind": "steer"},
     )
 
     assert result == {"delivered_to": "peer-a", "sender": "contract-test"}
@@ -787,7 +848,7 @@ def test_wrapper_enforce_disabled_ablation(
     result = _call_existing_tool(
         mcp,
         "send_message",
-        {"to": "peer-a", "body": _steer_body(), "summary": "peer steer"},
+        {"to": "peer-a", "body": _steer_body(), "summary": "peer steer", "kind": "steer"},
     )
 
     assert result == {"delivered_to": "peer-a", "sender": "contract-test"}
@@ -805,7 +866,7 @@ def test_visibility_envelope_emitted_on_wrapper_refusal(
         _call_existing_tool(
             mcp,
             "send_message",
-            {"to": "peer-a", "body": _steer_body(), "summary": "peer steer"},
+            {"to": "peer-a", "body": _steer_body(), "summary": "peer steer", "kind": "steer"},
         )
 
     event = _wrapper_refusals()[0]

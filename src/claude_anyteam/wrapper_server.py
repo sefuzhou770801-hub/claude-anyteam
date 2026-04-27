@@ -50,6 +50,7 @@ from . import protocol_io
 from claude_teams import messaging as _cs_messaging  # type: ignore[import-untyped]
 from claude_teams import tasks as _cs_tasks  # type: ignore[import-untyped]
 from claude_teams import teams as _cs_teams  # type: ignore[import-untyped]
+from claude_teams.models import InboxMessage as _InboxMessage  # type: ignore[import-untyped]
 from claude_teams.models import TeammateMember as _TeammateMember  # type: ignore[import-untyped]
 from fastmcp import FastMCP
 from fastmcp.exceptions import ToolError
@@ -58,6 +59,7 @@ logger = logging.getLogger("claude_anyteam.wrapper")
 
 TASK_ID_ENV = "CLAUDE_ANYTEAM_TASK_ID"
 LEGACY_TASK_ID_ENV = "CODEX_TEAMMATE_TASK_ID"
+SEND_MESSAGE_KINDS = ("informational", "steer", "handoff")
 
 
 class PeerSteerManifestCheckError(ToolError):
@@ -563,19 +565,15 @@ def build_server(argv: list[str] | None = None) -> FastMCP:
 
     def _steer_recipients_requiring_manifest_query(
         to: str,
-        body: str,
         cfg: Any,
     ) -> list[str]:
-        """Return recipients needing a fresh manifest query before send.
+        """Return recipients needing a fresh manifest query before steer send.
 
         §3 L3 v2 gates on the recipient's interpretation criteria, not the
-        sender's body shape. Codex App Server's mid-turn hook treats any prose
-        from a non-lead peer as a steer fragment, so a plain ``send_message`` to
-        a recipient that does not declare ``accepts_peer_steer`` must be refused
-        at the wrapper until the sender has recently consulted that recipient's
-        manifest.
+        sender's body shape. Post-57, however, this precondition applies only
+        when the sender explicitly declares ``kind="steer"``; ordinary
+        informational/handoff peer-DMs flow through without relocation gating.
         """
-        _ = body  # Body shape is intentionally irrelevant for L3 v2.
         if self_name == "team-lead" or to == "team-lead":
             return []
         if to == "*":
@@ -634,6 +632,28 @@ def build_server(argv: list[str] | None = None) -> FastMCP:
         )
         _fanout_visibility_event(event, mailbox=True)
         return event
+
+    def _send_peer_message(
+        *,
+        to: str,
+        body: str,
+        summary: str,
+        color: str | None,
+        message_kind: str,
+    ) -> None:
+        _cs_messaging.append_message(
+            team,
+            to,
+            _InboxMessage(
+                from_=self_name,
+                text=body,
+                timestamp=_cs_messaging.now_iso(),
+                read=False,
+                summary=summary,
+                color=color,
+                message_kind=message_kind,
+            ),
+        )
 
     def instrumented_tool(category: ToolCategory) -> Callable[[_F], _F]:
         def decorate(func: _F) -> _F:
@@ -784,10 +804,13 @@ def build_server(argv: list[str] | None = None) -> FastMCP:
         to: str,
         body: str,
         summary: str = "status update",
+        kind: Literal["informational", "steer", "handoff"] = "informational",
     ) -> dict:
         """Send a message to another teammate (team-lead or any peer). Use
         for progress updates, clarifying questions, or handoffs. The sender
-        is always you; do not try to impersonate another teammate.
+        is always you; do not try to impersonate another teammate. Set
+        kind='steer' only when intentionally sending a mid-turn steer attempt;
+        informational and handoff messages are ordinary peer-DMs.
 
         Args:
             to: recipient teammate name (e.g., 'team-lead' or a peer). Must
@@ -795,11 +818,15 @@ def build_server(argv: list[str] | None = None) -> FastMCP:
             body: message content. Plain prose or JSON-serialized protocol
                 payload both work.
             summary: optional short label shown in notifications (5-10 words).
+            kind: informational (default), steer, or handoff. Wrapper-side
+                manifest gating applies only to explicit steer attempts.
         """
         if not to:
             raise ToolError("`to` must not be empty")
         if not body:
             raise ToolError("`body` must not be empty")
+        if kind not in SEND_MESSAGE_KINDS:
+            raise ToolError(f"`kind` must be one of {SEND_MESSAGE_KINDS}; got {kind!r}")
         if to == self_name:
             raise ToolError(f"refusing to send message to self ({self_name!r})")
         try:
@@ -812,7 +839,11 @@ def build_server(argv: list[str] | None = None) -> FastMCP:
                 f"recipient {to!r} is not a member of team {team!r}; "
                 f"members: {sorted(member_names)}"
             )
-        steer_recipients = _steer_recipients_requiring_manifest_query(to, body, cfg)
+        steer_recipients = (
+            _steer_recipients_requiring_manifest_query(to, cfg)
+            if kind == "steer"
+            else []
+        )
         if _enforce_peer_steer_manifest_check() and steer_recipients:
             missing = [
                 recipient
@@ -836,13 +867,12 @@ def build_server(argv: list[str] | None = None) -> FastMCP:
                 target = getattr(m, "name", None)
                 if not target or target == self_name:
                     continue
-                _cs_messaging.send_plain_message(
-                    team,
-                    from_name=self_name,
-                    to_name=target,
-                    text=body,
+                _send_peer_message(
+                    to=target,
+                    body=body,
                     summary=summary,
                     color=None,
+                    message_kind=kind,
                 )
                 delivered += 1
             return {"delivered_to": "*", "sender": self_name, "count": delivered}
@@ -854,13 +884,12 @@ def build_server(argv: list[str] | None = None) -> FastMCP:
             if m.name == self_name and isinstance(m, _TeammateMember):
                 sender_color = m.color
                 break
-        _cs_messaging.send_plain_message(
-            team,
-            from_name=self_name,
-            to_name=to,
-            text=body,
+        _send_peer_message(
+            to=to,
+            body=body,
             summary=summary,
             color=sender_color,
+            message_kind=kind,
         )
         return {"delivered_to": to, "sender": self_name}
 
