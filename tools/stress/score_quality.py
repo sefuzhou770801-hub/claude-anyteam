@@ -62,6 +62,10 @@ RAW_TOOL_NAME_WHITELIST: dict[str, set[str]] = {
 
 DEFAULT_SURFACES = ("peer_steer_rejected", "host_tool_stream", "permission_bridge", "peer_dm")
 CAPABILITY_MANIFEST_TOOL = "mcp_anyteam_capability_manifest"
+PRE_R14_M7_ZERO_WORKLOADS = {"W7"}
+CAPABILITY_HEAVY_WORKLOADS_POST_R14 = {"W7", "W8", "W9", "W10"}
+M7_ZERO_NOTE_PRE_R14 = "m7_zero_in_collab_workload"
+M7_ZERO_NOTE_POST_R14 = "m7_zero_in_collab_workload_post_r14"
 
 
 class ManifestError(ValueError):
@@ -121,6 +125,32 @@ def _safe_int(value: Any) -> int | None:
         return int(value)
     except (TypeError, ValueError):
         return None
+
+
+def _has_post_r14_signal(value: Any) -> bool:
+    """Return True when archived metadata says R14 prompt fragments were wired."""
+
+    if isinstance(value, dict):
+        if "peer_prompt_fragments" in value:
+            return True
+        notes = value.get("notes")
+        if isinstance(notes, str) and "R14_WIRED=true" in notes:
+            return True
+        if isinstance(notes, list) and any("R14_WIRED=true" in str(note) for note in notes):
+            return True
+        return any(_has_post_r14_signal(item) for item in value.values())
+    if isinstance(value, list):
+        return any(_has_post_r14_signal(item) for item in value)
+    return False
+
+
+def _m7_zero_note(workload_id: Any, task_m7: int, *, post_r14: bool) -> str | None:
+    if task_m7 != 0:
+        return None
+    workload = str(workload_id).upper()
+    if post_r14:
+        return M7_ZERO_NOTE_POST_R14 if workload in CAPABILITY_HEAVY_WORKLOADS_POST_R14 else None
+    return M7_ZERO_NOTE_PRE_R14 if workload in PRE_R14_M7_ZERO_WORKLOADS else None
 
 
 # ---------------------------------------------------------------------------
@@ -479,7 +509,14 @@ def _combine_verdicts(verdicts: Sequence[str]) -> str:
     return verdicts[0]
 
 
-def score_manifest_task(task: dict[str, Any], *, sandbox: Path, all_events: dict[str, list[VisibilityEvent]], timeout_s: float) -> dict[str, Any]:
+def score_manifest_task(
+    task: dict[str, Any],
+    *,
+    sandbox: Path,
+    all_events: dict[str, list[VisibilityEvent]],
+    timeout_s: float,
+    post_r14: bool = False,
+) -> dict[str, Any]:
     task_id = str(task.get("task_id") or task.get("taskId") or "")
     workload_id = task.get("workload_id") or task.get("workloadId")
     success_check = task.get("success_check")
@@ -505,8 +542,8 @@ def score_manifest_task(task: dict[str, Any], *, sandbox: Path, all_events: dict
         evidence = {"checks": check_results}
 
     task_m7 = _task_m7_count(task_id, all_events) if task_id else 0
-    if str(workload_id).upper() == "W7" and task_m7 == 0:
-        notes.append("m7_zero_in_collab_workload")
+    if note := _m7_zero_note(workload_id, task_m7, post_r14=post_r14):
+        notes.append(note)
     metrics = {"M7_capability_manifest_calls": task_m7}
     if task_m7:
         evidence = dict(evidence)
@@ -649,6 +686,7 @@ def score_task(
     owner_actual: str | None = None,
     task_m7: int = 0,
     pytest_timeout_s: float = 600.0,
+    post_r14: bool | None = None,
 ) -> dict[str, Any]:
     """Score one manifest task without requiring an event-log fixture.
 
@@ -661,7 +699,20 @@ def score_task(
         # ``score_manifest_task`` derives owner/M7 from events in production.
         # For unit tests, apply explicit overrides after the check result.
         events = {}
-    result = score_manifest_task(task, sandbox=sandbox, all_events=events, timeout_s=pytest_timeout_s)
+    r14_wired = _has_post_r14_signal(task) if post_r14 is None else post_r14
+    result = score_manifest_task(
+        task,
+        sandbox=sandbox,
+        all_events=events,
+        timeout_s=pytest_timeout_s,
+        post_r14=r14_wired,
+    )
+    result.setdefault("notes", [])
+    result["notes"] = [
+        note
+        for note in result["notes"]
+        if note not in {M7_ZERO_NOTE_PRE_R14, M7_ZERO_NOTE_POST_R14}
+    ]
     if owner_actual is not None:
         result["owner_actual"] = owner_actual
     elif result.get("owner_actual") is None:
@@ -670,10 +721,13 @@ def score_task(
     if task_m7:
         result["evidence"] = dict(result.get("evidence") or {})
         result["evidence"]["M7_capability_manifest_calls"] = task_m7
-    if str(task.get("workload_id") or task.get("workloadId")).upper() == "W7" and task_m7 == 0:
-        result.setdefault("notes", [])
-        if "m7_zero_in_collab_workload" not in result["notes"]:
-            result["notes"].append("m7_zero_in_collab_workload")
+    if note := _m7_zero_note(
+        task.get("workload_id") or task.get("workloadId"),
+        task_m7,
+        post_r14=r14_wired,
+    ):
+        if note not in result["notes"]:
+            result["notes"].append(note)
     return result
 
 
@@ -740,9 +794,31 @@ def run_score(
         raise FileNotFoundError(f"sandbox path does not exist: {sandbox}")
     manifest = load_workload_manifest(workload_manifest)
     all_events, warnings = load_events(team=team, events_dir=events_dir)
+    scorecard_path = out.parent / "scorecard.json"
+    scorecard_payload: Any = {}
+    if scorecard_path.exists():
+        try:
+            scorecard_payload = _read_json(scorecard_path)
+        except (OSError, json.JSONDecodeError) as exc:
+            warnings.append(f"scorecard_r14_signal_unreadable:{exc}")
+    post_r14 = _has_post_r14_signal(manifest) or _has_post_r14_signal(
+        scorecard_payload
+    ) or _has_post_r14_signal(
+        [
+            event.model_dump(mode="json")
+            for events in all_events.values()
+            for event in events
+        ]
+    )
 
     task_scores = [
-        score_manifest_task(task, sandbox=sandbox, all_events=all_events, timeout_s=check_timeout_s)
+        score_manifest_task(
+            task,
+            sandbox=sandbox,
+            all_events=all_events,
+            timeout_s=check_timeout_s,
+            post_r14=post_r14,
+        )
         for task in manifest["tasks"]
         if isinstance(task, dict)
     ]

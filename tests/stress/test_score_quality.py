@@ -312,3 +312,29 @@ def test_m7_zero_in_w7_flagged(tmp_path: Path):
 
     assert result["verdict"] == "manual_pending"
     assert "m7_zero_in_collab_workload" in result["notes"]
+
+
+def test_m7_zero_w8_flagged_post_r14(tmp_path: Path):
+    task = _task(
+        {"type": "manual", "args": {"description": "handoff review"}},
+        workload_id="W8",
+    )
+    task["metadata"] = {"agent": {"peer_prompt_fragments": "# Capabilities of your peers"}}
+
+    result = sq.score_task(task, sandbox=tmp_path, task_m7=0)
+
+    assert result["verdict"] == "manual_pending"
+    assert "m7_zero_in_collab_workload_post_r14" in result["notes"]
+    assert "m7_zero_in_collab_workload" not in result["notes"]
+
+
+def test_m7_zero_w8_not_flagged_pre_r14(tmp_path: Path):
+    result = sq.score_task(
+        _task({"type": "manual", "args": {"description": "handoff review"}}, workload_id="W8"),
+        sandbox=tmp_path,
+        task_m7=0,
+    )
+
+    assert result["verdict"] == "manual_pending"
+    assert "m7_zero_in_collab_workload_post_r14" not in result["notes"]
+    assert "m7_zero_in_collab_workload" not in result["notes"]
