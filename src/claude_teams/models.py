@@ -112,6 +112,13 @@ class InboxMessage(BaseModel):
     read: bool = False
     summary: str | None = Field(default=None)
     color: str | None = Field(default=None)
+    # 09 R3 (Q1 option b): typed messageKind discriminator declared as an
+    # explicit field with default="peer_dm". Survives substrate
+    # `read_inbox(mark_as_read=True)` round-trip — model_dump preserves
+    # the field by construction, no extra="allow" needed. Per CLAUDE.md
+    # §3 anti-pattern A11 (no parse-prose-to-route): consumers filter by
+    # this kind, never by parsing JSON inside `text`.
+    message_kind: str = Field(default="peer_dm", alias="messageKind")
 
 
 class IdleNotification(BaseModel):
