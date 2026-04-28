@@ -817,8 +817,8 @@ def build_server(argv: list[str] | None = None) -> FastMCP:
         summary: str,
         color: str | None,
         message_kind: str,
-    ) -> None:
-        _cs_messaging.append_message(
+    ) -> _InboxMessage:
+        return _cs_messaging.append_message(
             team,
             to,
             _InboxMessage(
@@ -998,13 +998,14 @@ def build_server(argv: list[str] | None = None) -> FastMCP:
     ) -> dict:
         """Your plain text output is NOT visible to other agents — to communicate, you MUST call this tool. Refer to teammates by name, never UUID.
 
-        Send a message to another teammate (team-lead or any peer). Use for
         progress updates, clarifying questions, handoffs, or typed lifecycle
         payloads. The sender is always you; do not try to impersonate another
         teammate. Set kind='steer' only when intentionally sending a mid-turn
         steer attempt; informational and handoff messages are ordinary peer-DMs.
         Lifecycle kinds require body to be a JSON protocol payload whose
-        kind/type matches the selected messageKind.
+        kind/type matches the selected messageKind. Oversized bodies are
+        stored as inbox artifacts automatically; the recipient sees a bounded
+        preview plus an attachment reference.
 
         Args:
             to: recipient teammate name (e.g., 'team-lead' or a peer). Must
@@ -1060,19 +1061,32 @@ def build_server(argv: list[str] | None = None) -> FastMCP:
                 )
         if to == "*":
             delivered = 0
+            attachments: dict[str, dict[str, Any]] = {}
             for m in cfg.members:
                 target = getattr(m, "name", None)
                 if not target or target == self_name:
                     continue
-                _send_peer_message(
+                stored = _send_peer_message(
                     to=target,
                     body=body,
                     summary=summary,
                     color=None,
                     message_kind=kind,
                 )
+                if stored.attachment is not None:
+                    attachments[target] = stored.attachment.model_dump(
+                        by_alias=True,
+                        exclude_none=True,
+                    )
                 delivered += 1
-            return {"delivered_to": "*", "sender": self_name, "count": delivered}
+            result: dict[str, Any] = {
+                "delivered_to": "*",
+                "sender": self_name,
+                "count": delivered,
+            }
+            if attachments:
+                result["attachments"] = attachments
+            return result
         # Stamp the sender's colour onto the wire payload. `send_plain_message`
         # stores this value directly on the inbox message, so using the
         # recipient's colour (the old behavior) misattributes who spoke.
@@ -1081,14 +1095,20 @@ def build_server(argv: list[str] | None = None) -> FastMCP:
             if m.name == self_name and isinstance(m, _TeammateMember):
                 sender_color = m.color
                 break
-        _send_peer_message(
+        stored = _send_peer_message(
             to=to,
             body=body,
             summary=summary,
             color=sender_color,
             message_kind=kind,
         )
-        return {"delivered_to": to, "sender": self_name}
+        result = {"delivered_to": to, "sender": self_name}
+        if stored.attachment is not None:
+            result["attachment"] = stored.attachment.model_dump(
+                by_alias=True,
+                exclude_none=True,
+            )
+        return result
 
     @mcp.tool
     @instrumented_tool(category="team_tool")
@@ -1177,6 +1197,9 @@ def build_server(argv: list[str] | None = None) -> FastMCP:
         order (does not re-mark anything).
 
         Other teammates' inboxes are not accessible from this tool.
+        Oversized messages include an `attachment` artifact reference; use
+        mcp_anyteam_read_file on attachment.path only when the preview is
+        insufficient.
         """
         msgs = _cs_messaging.read_inbox(
             team,
