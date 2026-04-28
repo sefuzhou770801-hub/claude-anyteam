@@ -492,15 +492,70 @@ export async function findInstalledTool({ uvPath }) {
   return null;
 }
 
+// Strip ANSI escapes — uv colors its stdout when FORCE_COLOR is set in env,
+// which the npm wrapper does for our own theming. Parsing the wrapped lines
+// fails (os.path.isdir / version-string equality / etc.) without this strip.
+const ANSI_RE = /\x1b\[[0-?]*[ -/]*[@-~]/g;
+function stripAnsi(value) { return String(value || '').replace(ANSI_RE, ''); }
+
+const INSTALL_DEBUG = ['1', 'true', 'yes', 'on'].includes(String(process.env.CLAUDE_ANYTEAM_DEBUG || '').toLowerCase());
+function dlog(...parts) {
+  if (!INSTALL_DEBUG) return;
+  const ts = new Date().toISOString().slice(11, 19);
+  const prefix = process.stderr.isTTY ? '\x1b[35m[debug]\x1b[39m ' : '[debug] ';
+  console.error(prefix + ts + ' [installTool] ' + parts.map((p) => (typeof p === 'string' ? p : JSON.stringify(p))).join(' '));
+}
+
+// Run uv subprocess WITHOUT FORCE_COLOR so its output we parse is clean ASCII.
+function uvParseEnv(env) {
+  const clean = { ...env };
+  delete clean.FORCE_COLOR;
+  delete clean.CLAUDE_ANYTEAM_FORCE_COLOR;
+  clean.NO_COLOR = '1';
+  return clean;
+}
+
+async function getInstalledToolVersion({ uvPath, env }) {
+  // `uv tool list` lines look like: `claude-anyteam v0.7.7 (python3.12)` (or similar).
+  try {
+    const result = await runCommand(uvPath, ['--no-config', 'tool', 'list'], { env: uvParseEnv(env) });
+    dlog(`uv tool list exit=${result.code}`);
+    if (result.code !== 0) return null;
+    const out = stripAnsi(result.stdout || '');
+    dlog(`uv tool list stdout (first 400):`, out.slice(0, 400));
+    const m = out.match(/(?:^|\n)\s*claude-anyteam\s+v?(\d+\.\d+\.\d+(?:[abr]\d+)?)/i);
+    return m ? m[1] : null;
+  } catch (e) {
+    dlog(`uv tool list exception:`, e.message);
+    return null;
+  }
+}
+
+async function uninstallTool({ uvPath, env }) {
+  // Best-effort: ignore failures (tool may not be installed yet).
+  try {
+    const result = await runCommand(uvPath, ['--no-config', 'tool', 'uninstall', TOOL_NAME], { env: uvParseEnv(env) });
+    dlog(`uv tool uninstall exit=${result.code}`);
+    if (result.stderr) dlog(`  uninstall stderr (first 400):`, stripAnsi(result.stderr).slice(0, 400));
+    return result.code === 0;
+  } catch (e) {
+    dlog(`uninstall exception:`, e.message);
+    return false;
+  }
+}
+
 export async function installTool({ uvPath, pythonPath, refresh = false, version = null }) {
+  dlog(`installTool start: refresh=${refresh} version=${version}`);
   if (!refresh) {
     const existing = await findInstalledTool({ uvPath }).catch(() => null);
     if (existing) {
+      dlog(`existing tool found and refresh=false; returning existing`);
       return existing;
     }
   }
 
   const { env, binDir } = await resolveToolBinDir({ uvPath });
+  dlog(`resolveToolBinDir -> binDir=${binDir}`);
   const symlinkCheck = await checkWindowsSymlinkPrivilege();
   if (!symlinkCheck.ok) {
     const error = new Error('Windows blocked symlink creation, which uv tool install needs.');
@@ -508,35 +563,63 @@ export async function installTool({ uvPath, pythonPath, refresh = false, version
     error.details = symlinkCheck.details || symlinkCheck.message || 'Enable Developer Mode or rerun from an elevated PowerShell session.';
     throw error;
   }
+
+  // Belt-and-suspenders: explicitly UNINSTALL first when refreshing. uv's
+  // `--force` reinstall has been observed on Windows to silently keep the
+  // older version (cache hit), even when an exact version pin is given.
+  // Uninstall + install guarantees a fresh build.
+  if (refresh) {
+    dlog(`refresh=true: running explicit uninstall first`);
+    await uninstallTool({ uvPath, env });
+  }
+
   // --prerelease=allow: claude-anyteam currently pins fastmcp==3.0.0b1 (a
   // beta), and uv refuses pre-release deps by default. Without this flag the
   // install fails on a clean machine with the cryptic uv "no solution found"
   // dependency-resolver error. Until fastmcp ships a stable 3.x we always
   // allow pre-releases for our own tool install.
-  const args = ['--no-config', 'tool', 'install', '--force', '--prerelease=allow'];
+  const args = ['--no-config', 'tool', 'install', '--force', '--prerelease=allow', '--no-cache'];
   if (pythonPath) {
     args.push('--python', pythonPath);
   }
   let installTarget = await resolveInstallTarget();
   // Pin the Python tool to the npm wrapper's version. PyPI's index can lag
   // npm publish by minutes; without a pin, uv may resolve to a stale older
-  // version even though our wrapper is new. Result: wrapper bug-fixes don't
-  // run because the Python tool is older. Skip pinning when installing
+  // version even though our wrapper is new. Skip pinning when installing
   // from a local checkout (resolveInstallTarget returns a path).
   if (version && installTarget === TOOL_NAME) {
     installTarget = `${TOOL_NAME}==${version}`;
   }
   args.push(installTarget);
-  const result = await runCommand(uvPath, args, { env, cwd: toolWorkingDir() });
+  dlog(`uv install argv:`, args);
+  const result = await runCommand(uvPath, args, { env: uvParseEnv(env), cwd: toolWorkingDir() });
+  dlog(`uv install exit=${result.code}`);
+  if (result.stdout) dlog(`  uv install stdout (first 800):`, stripAnsi(result.stdout).slice(0, 800));
+  if (result.stderr) dlog(`  uv install stderr (first 800):`, stripAnsi(result.stderr).slice(0, 800));
   if (result.code !== 0) {
-    const fallback = await findInstalledTool({ uvPath }).catch(() => null);
-    if (fallback) {
-      return fallback;
-    }
+    // No silent fallback: surface the real failure so the user (and the
+    // version-mismatch detector in the Python child) can react. If we just
+    // returned the existing copy, the wrapper would print "installed v0.7.X"
+    // while running the older v0.7.Y silently — which masked exactly this
+    // class of bug for several iterations.
     const error = new Error(`uv could not install ${installTarget}.`);
-    error.details = (result.stderr || result.stdout).trim();
+    error.details = (stripAnsi(result.stderr) || stripAnsi(result.stdout)).trim();
     error.command = formatCommand(uvPath, args);
+    error.code = 'UV_TOOL_INSTALL_FAILED';
     throw error;
+  }
+  // Verify the installed version matches what we asked for. uv has been
+  // observed to exit 0 while keeping the older version, so trust-but-verify.
+  if (version) {
+    const actual = await getInstalledToolVersion({ uvPath, env });
+    dlog(`post-install version verify: expected=${version} actual=${actual}`);
+    if (actual && actual !== version) {
+      const error = new Error(`uv reported success but installed claude-anyteam==${actual}, not the requested ==${version}.`);
+      error.details = `Try running 'uv tool uninstall claude-anyteam' manually, then re-run 'npx --yes claude-anyteam'. Known causes: stale uv cache, conflicting venv from prior uv version.`;
+      error.command = formatCommand(uvPath, args);
+      error.code = 'UV_TOOL_INSTALL_VERSION_MISMATCH';
+      throw error;
+    }
   }
   const resolvedPaths = await resolveToolPaths(binDir);
   if (!resolvedPaths) {
@@ -544,6 +627,7 @@ export async function installTool({ uvPath, pythonPath, refresh = false, version
     error.details = `uv reported bin directory ${binDir}, but neither the claude-anyteam nor legacy codex-teammate binaries were available.`;
     throw error;
   }
+  dlog(`installTool returning installMode=${refresh ? 'refreshed' : 'installed'}`);
   return { env, binDir, ...resolvedPaths, installMode: refresh ? 'refreshed' : 'installed' };
 }
 
