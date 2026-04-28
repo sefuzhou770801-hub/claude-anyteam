@@ -79,6 +79,9 @@ def test_setup_delegates_to_python_installer() -> None:
     assert "'--assume-yes'" in setup_source, (
         'setup.js must always pass --assume-yes since npx is non-interactive'
     )
+    assert "'--prerelease=allow'" in setup_source, (
+        'setup.js must allow pre-release Python deps when uv resolves claude-anyteam'
+    )
     # stdio must be inherited so the Python installer's messages reach the user.
     assert "stdio:" in setup_source and "'inherit'" in setup_source
 
@@ -87,6 +90,13 @@ def test_setup_delegates_to_python_installer() -> None:
     assert "from '../lib/settings.js'" not in setup_source
     assert 'TEAMMATE_COMMAND_KEY' not in setup_source
     assert 'TEAMMATE_BINARY_KEY' not in setup_source
+
+
+def test_npm_version_banner_reads_package_json() -> None:
+    setup_source = (NPM_DIR / 'bin' / 'setup.js').read_text(encoding='utf-8')
+
+    assert "readFileSync(new URL('../package.json', import.meta.url)" in setup_source
+    assert 'claude-anyteam installer v${INSTALLER_VERSION}' in setup_source
 
 
 def test_setup_refreshes_plugin_on_every_run() -> None:

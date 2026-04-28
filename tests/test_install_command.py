@@ -2,8 +2,14 @@ from __future__ import annotations
 
 import errno
 import json
+import os
+import shutil
+import subprocess
+import textwrap
+from io import StringIO
 from pathlib import Path
 from typing import Any
+from urllib.parse import parse_qs, urlparse
 
 import pytest
 
@@ -487,10 +493,119 @@ def test_install_command_renders_structured_install_error_box(monkeypatch, capsy
     assert "INSTALL FAILED" in err
     assert "Friendly title" in err
     assert "Plain English explanation." in err
-    assert "Next step: Run `fix-it`." in err
-    assert "Then retry." in err
+    assert "Try this next:" in err
+    assert "1. Run `fix-it`." in err
+    assert "2. Then retry." in err
     assert "Severity: blocker" in err
     assert "Raw details (for debugging):" in err
+    assert "Still stuck? Report it:" in err
+    assert "https://github.com/JonathanRosado/claude-anyteam/issues/new?" in err
+
+
+def test_python_version_banner_reads_npm_parent_version(monkeypatch):
+    monkeypatch.setenv("CLAUDE_ANYTEAM_NPM_VERSION", "9.9.9")
+    assert cli_mod._version_banner() == "claude-anyteam installer v9.9.9"
+
+
+def test_python_issue_url_includes_runtime_diagnostics(monkeypatch):
+    monkeypatch.setenv("CLAUDE_ANYTEAM_NPM_VERSION", "9.9.9")
+    url = installer_mod.build_issue_url(title="Broken install", raw_error="raw boom")
+    parsed = urlparse(url)
+    assert parsed.scheme == "https"
+    assert parsed.netloc == "github.com"
+    assert parsed.path == "/JonathanRosado/claude-anyteam/issues/new"
+    query = parse_qs(parsed.query)
+    assert "Broken install" in query["title"][0]
+    body = query["body"][0]
+    assert "Installer version: 9.9.9" in body
+    assert "OS:" in body
+    assert "Python version:" in body
+    assert "uv version:" in body
+    assert "Node version:" in body
+    assert "raw boom" in body
+
+
+def test_dependency_installer_skips_cleanly_without_tty(monkeypatch):
+    monkeypatch.setattr(installer_mod, "_check_codex_cli", lambda: _codex_cli_missing())
+    monkeypatch.setattr(installer_mod, "_check_gemini_cli", lambda: _gemini_cli_missing())
+    monkeypatch.setattr(installer_mod, "_check_kimi_cli", lambda: _kimi_cli_missing())
+
+    stream = StringIO()
+    cli_mod._offer_provider_dependency_installs(no_input=True, stream=stream)
+
+    assert "Skipping interactive dependency install" in stream.getvalue()
+
+
+def test_npm_uv_tool_invocations_allow_prerelease_dependencies(tmp_path: Path):
+    """Regression for fastmcp==3.0.0b1: every claude-anyteam uv tool resolve
+    must opt into pre-releases so clean machines do not hit uv's resolver hint.
+    """
+    node = shutil.which("node")
+    if node is None:
+        pytest.skip("node is required for npm installer regression test")
+
+    root = Path(__file__).resolve().parents[1]
+    log_path = tmp_path / "uv-args.jsonl"
+    bin_dir = tmp_path / "uv-bin"
+    fake_uv = tmp_path / "uv"
+    fake_uv.write_text(
+        textwrap.dedent(
+            f"""\
+            #!/usr/bin/env python3
+            import json, os, pathlib, sys
+            args = sys.argv[1:]
+            with open({str(log_path)!r}, "a", encoding="utf-8") as handle:
+                handle.write(json.dumps(args) + "\\n")
+            if args == ["--no-config", "tool", "dir", "--bin"]:
+                print(os.environ["TEST_UV_BIN_DIR"])
+                raise SystemExit(0)
+            if args[:3] == ["--no-config", "tool", "install"]:
+                bindir = pathlib.Path(os.environ["TEST_UV_BIN_DIR"])
+                bindir.mkdir(parents=True, exist_ok=True)
+                for name in ("claude-anyteam", "claude-anyteam-spawn-shim"):
+                    target = bindir / name
+                    target.write_text("#!/bin/sh\\nexit 0\\n", encoding="utf-8")
+                    target.chmod(0o755)
+                raise SystemExit(0)
+            raise SystemExit(0)
+            """
+        ),
+        encoding="utf-8",
+    )
+    fake_uv.chmod(0o755)
+
+    script = textwrap.dedent(
+        f"""\
+        import {{ installTool }} from {str(root / 'npm' / 'lib' / 'detect.js')!r};
+        await installTool({{ uvPath: {str(fake_uv)!r}, pythonPath: {str(Path('/usr/bin/python3'))!r} }});
+        """
+    )
+    env = {
+        **os.environ,
+        "TEST_UV_BIN_DIR": str(bin_dir),
+        "CLAUDE_ANYTEAM_UV_TOOL_BIN_DIR": str(bin_dir),
+    }
+    completed = subprocess.run(
+        [node, "--input-type=module", "-e", script],
+        cwd=root,
+        env=env,
+        text=True,
+        capture_output=True,
+        check=False,
+        timeout=30,
+    )
+    assert completed.returncode == 0, completed.stderr
+
+    argv_lines = [
+        json.loads(line)
+        for line in log_path.read_text(encoding="utf-8").splitlines()
+        if line.strip()
+    ]
+    install_argv = next(args for args in argv_lines if args[:3] == ["--no-config", "tool", "install"])
+    assert "--prerelease=allow" in install_argv
+
+    setup_source = (root / "npm" / "bin" / "setup.js").read_text(encoding="utf-8")
+    assert "'tool',\n    'run',\n    '--prerelease=allow'," in setup_source
 
 
 # ---------------------------------------------------------------------------
@@ -914,7 +1029,7 @@ def test_install_force_empty_with_no_providers_updates_settings(
 
     stdout = capsys.readouterr().out
     assert (
-        "Proceeding with --force-empty: claude-anyteam is installed but inert until a CLI is ready."
+        "Proceeding with --force-empty: claude-anyteam is installed, but teammates will wait until a provider app is installed and signed in."
         in stdout
     )
     assert "Refusing to install" not in stdout

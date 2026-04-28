@@ -12,8 +12,10 @@ from __future__ import annotations
 import contextlib
 import copy
 import errno
+import importlib.metadata
 import json
 import os
+import platform as platform_mod
 import re
 import shutil
 import subprocess
@@ -23,6 +25,7 @@ from dataclasses import dataclass, field
 from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any, Callable, Literal
+from urllib.parse import urlencode
 
 TEAMMATE_COMMAND_KEY = "CLAUDE_CODE_TEAMMATE_COMMAND"
 TEAMMATE_BINARY_KEY = "CLAUDE_ANYTEAM_BINARY"
@@ -84,6 +87,7 @@ INSTALL_ERROR_EXIT_GENERIC = 2
 INSTALL_ERROR_EXIT_PROMPT_DECLINED = 3
 INSTALL_ERROR_EXIT_CORRUPTED_STATE = 4
 INSTALL_ERROR_EXIT_NO_PROVIDER = 5
+ISSUE_NEW_URL = "https://github.com/JonathanRosado/claude-anyteam/issues/new"
 
 ProviderState = Literal["READY", "NEEDS_SIGNIN", "NEEDS_UPGRADE", "MISSING"]
 InstallSeverity = Literal["blocker", "hard-stop", "soft"]
@@ -337,19 +341,142 @@ class InstallError(ValueError):
             self.cli_exit_code = cli_exit_code  # type: ignore[attr-defined]
         super().__init__(self.as_plain_text())
 
-    def as_plain_text(self, *, include_details: bool = True) -> str:
+    def as_plain_text(self, *, include_details: bool = True, include_report: bool = True) -> str:
         lines = [
             self.title,
             self.explanation,
-            f"Next step: {self.action}",
+            "Try this next:",
+            *(f"  {index}. {line}" for index, line in enumerate(self.action.splitlines() or [self.action], start=1)),
             f"Severity: {self.severity}",
         ]
         if include_details and self.details:
             lines.extend(["Raw details:", self.details])
+        if include_report:
+            raw_error = self.as_plain_text(include_details=include_details, include_report=False)
+            lines.extend(
+                [
+                    "Still stuck? Report it:",
+                    f"  {build_issue_url(title=self.title, raw_error=raw_error)}",
+                ]
+            )
         return "\n".join(lines)
 
     def __str__(self) -> str:
         return self.as_plain_text()
+
+
+def installer_version() -> str:
+    env_version = os.environ.get("CLAUDE_ANYTEAM_NPM_VERSION")
+    if env_version:
+        return env_version
+    try:
+        return importlib.metadata.version("claude-anyteam")
+    except importlib.metadata.PackageNotFoundError:
+        pyproject = Path(__file__).resolve().parents[2] / "pyproject.toml"
+        try:
+            for line in pyproject.read_text(encoding="utf-8").splitlines():
+                if line.startswith("version = "):
+                    return line.split("=", 1)[1].strip().strip('"')
+        except OSError:
+            pass
+    return "unknown"
+
+
+def _tool_version(command: str) -> str:
+    try:
+        found = shutil.which(command)
+    except Exception as exc:
+        return f"version check skipped: {exc}"
+    if not found:
+        return "not found"
+    try:
+        completed = subprocess.run(
+            [found, "--version"],
+            capture_output=True,
+            text=True,
+            timeout=3,
+            check=False,
+        )
+    except (OSError, subprocess.SubprocessError) as exc:
+        return f"found at {found}, but version check failed: {exc}"
+    return (completed.stdout or completed.stderr or "").strip() or f"found at {found}"
+
+
+def _os_label() -> str:
+    return f"{sys.platform} {platform_mod.release()} {platform_mod.machine()}"
+
+
+def _normalize_steps(
+    next_steps_per_os: dict[str, list[str] | tuple[str, ...] | str] | list[str] | tuple[str, ...] | str,
+) -> list[str]:
+    if isinstance(next_steps_per_os, str):
+        return [line for line in next_steps_per_os.splitlines() if line.strip()]
+    if isinstance(next_steps_per_os, (list, tuple)):
+        return [str(line) for line in next_steps_per_os if str(line).strip()]
+    if isinstance(next_steps_per_os, dict):
+        if _is_windows_platform() and "win32" in next_steps_per_os:
+            return _normalize_steps(next_steps_per_os["win32"])
+        if sys.platform == "darwin" and "darwin" in next_steps_per_os:
+            return _normalize_steps(next_steps_per_os["darwin"])
+        if sys.platform not in ("win32", "cygwin", "darwin") and "linux" in next_steps_per_os:
+            return _normalize_steps(next_steps_per_os["linux"])
+        return _normalize_steps(next_steps_per_os.get("default", []))
+    return []
+
+
+def build_issue_url(
+    *,
+    title: str,
+    raw_error: str,
+    what_doing: str = "I was running `claude-anyteam install`.",
+) -> str:
+    body = "\n".join(
+        [
+            "## What I was doing",
+            what_doing,
+            "",
+            "## Installer details",
+            f"- Installer version: {installer_version()}",
+            f"- OS: {_os_label()}",
+            f"- Python version: {sys.version.split()[0]}",
+            f"- uv version: {_tool_version('uv')}",
+            f"- Node version: {_tool_version('node')}",
+            "",
+            "## Raw error text",
+            "```text",
+            raw_error or "No raw error captured.",
+            "```",
+        ]
+    )
+    return f"{ISSUE_NEW_URL}?{urlencode({'title': f'[installer] {title[:120]}', 'body': body})}"
+
+
+def format_installer_diagnostic(
+    *,
+    summary: str,
+    raw_error: str,
+    next_steps_per_os: dict[str, list[str] | tuple[str, ...] | str] | list[str] | tuple[str, ...] | str,
+    title: str = "Installer error",
+    what_doing: str = "I was running `claude-anyteam install`.",
+    include_what_happened: bool = True,
+) -> list[str]:
+    steps = _normalize_steps(next_steps_per_os)
+    if not steps:
+        steps = [
+            "Read the message above.",
+            "Fix the problem it describes.",
+            "Run `claude-anyteam install` again.",
+        ]
+    lines: list[str] = []
+    if include_what_happened:
+        lines.append(f"What happened: {summary}")
+    lines.append("Try this next:")
+    lines.extend(f"  {index}. {step}" for index, step in enumerate(steps, start=1))
+    lines.append("Still stuck? Report it:")
+    lines.append(
+        f"  {build_issue_url(title=title, raw_error=raw_error, what_doing=what_doing)}"
+    )
+    return lines
 
 
 def _quote_command_path(path: Path) -> str:
@@ -555,8 +682,8 @@ def _provider_version_probe_error(
     return InstallError(
         title=f"Found `{binary}` but couldn't read its version",
         explanation=(
-            f"Found `{binary}` on PATH but it didn't return a recognizable version. "
-            "The installer will warn but continue — you may need to upgrade or reinstall the provider CLI."
+            f"Found `{binary}` on PATH (the command search list) but it didn't return a recognizable version. "
+            "The installer will warn but continue — you may need to upgrade or reinstall that provider app."
         ),
         action=f"Upgrade or reinstall {provider_name}, then run `{command}` again.",
         severity="soft",
@@ -661,9 +788,9 @@ def discover_managed_paths(
         raise InstallError(
             title="claude-anyteam is not on PATH",
             explanation=(
-                "The installer could not find the claude-anyteam command it needs to write into Claude Code settings."
+                "The installer could not find the claude-anyteam command on PATH (the list of folders your terminal searches for commands)."
             ),
-            action="Run `uv tool install --reinstall claude-anyteam`, then run `claude-anyteam install` again.",
+            action="Run `uv tool install --reinstall --prerelease=allow claude-anyteam`, then run `claude-anyteam install` again.",
             severity="blocker",
             details="Unable to resolve the claude-anyteam binary.",
         )
@@ -671,9 +798,9 @@ def discover_managed_paths(
         raise InstallError(
             title="claude-anyteam's spawn shim is not on PATH",
             explanation=(
-                "The installer could not find the spawn shim that Claude Code uses to launch routed teammates."
+                "The installer could not find the spawn shim (the small helper command Claude Code uses to launch routed teammates) on PATH."
             ),
-            action="Run `uv tool install --reinstall claude-anyteam`, then run `claude-anyteam install` again.",
+            action="Run `uv tool install --reinstall --prerelease=allow claude-anyteam`, then run `claude-anyteam install` again.",
             severity="blocker",
             details="Unable to resolve the claude-anyteam-spawn-shim binary.",
         )
@@ -2173,7 +2300,7 @@ def install(
 
     if not prereq.found:
         message = (
-            "claude-anyteam requires a terminal multiplexer on PATH; none was found.\n"
+            "claude-anyteam requires a terminal multiplexer called tmux (a tool that lets Claude Code show helper teammates in panes), and none was found on PATH.\n"
             "Install one of:\n"
             f"{_install_instructions(prereq.platform)}\n"
             "After installing, re-run `claude-anyteam install`."
@@ -2190,7 +2317,7 @@ def install(
         raise InstallError(
             title="A required terminal tool is missing",
             explanation=(
-                "claude-anyteam needs tmux on Linux/macOS so teammates can appear in Claude Code panes."
+                "claude-anyteam needs tmux on Linux/macOS. tmux is a terminal tool that lets teammates appear in Claude Code panes."
             ),
             action=f"Install tmux for your OS, then run `claude-anyteam install` again.\n{_install_instructions(prereq.platform)}",
             severity="blocker",
@@ -2674,9 +2801,10 @@ def _format_provider_status_table(
 def _format_no_provider_explainer() -> str:
     return "\n".join(
         [
-            "claude-anyteam routes some Claude Code teammates to external AI CLIs (Codex, Gemini, Kimi).",
-            "You need at least one signed-in CLI for it to do anything useful.",
-            "Pick whichever you have access to.",
+            "claude-anyteam lets Claude Code start helper teammates through provider apps: Codex, Gemini, or Kimi.",
+            "A provider app is a command-line app (a tool you run from Terminal or PowerShell).",
+            "You need at least one provider app installed and signed in before teammates can do useful work.",
+            "Pick whichever provider you have access to; you do not need all three.",
         ]
     )
 
@@ -2774,7 +2902,7 @@ def _format_no_provider_refusal_message() -> str:
     return (
         "Refusing to install — no provider is ready.\n"
         "  Follow the steps above, then re-run `claude-anyteam install`.\n\n"
-        "  Setting up later? Pass --force-empty to install with no provider ready:\n"
+        "  Want to set up the provider later? Pass --force-empty to install the wiring now:\n"
         "    claude-anyteam install --force-empty"
     )
 
@@ -2794,7 +2922,7 @@ def _format_provider_preamble(
         blocks.append(walkthrough)
     if force_empty and no_provider_ready:
         blocks.append(
-            "Proceeding with --force-empty: claude-anyteam is installed but inert until a CLI is ready."
+            "Proceeding with --force-empty: claude-anyteam is installed, but teammates will wait until a provider app is installed and signed in."
         )
     return "\n\n".join(blocks)
 
@@ -2814,14 +2942,25 @@ def _format_no_provider_ready_message(
 
 
 def _format_soft_diagnostic(diagnostic: InstallError) -> str:
-    return "\n".join(
-        [
-            f"Warning: {diagnostic.title}",
-            diagnostic.explanation,
-            f"Next step: {diagnostic.action}",
-            f"Severity: {diagnostic.severity}",
-        ]
+    raw_error = diagnostic.as_plain_text(include_details=True, include_report=False)
+    lines = [
+        f"Warning: {diagnostic.title}",
+        diagnostic.explanation,
+    ]
+    lines.extend(
+        format_installer_diagnostic(
+            summary=diagnostic.explanation,
+            raw_error=raw_error,
+            next_steps_per_os=diagnostic.action,
+            title=diagnostic.title,
+            include_what_happened=False,
+        )
     )
+    lines.append(f"Severity: {diagnostic.severity}")
+    if diagnostic.details:
+        lines.append("Raw details (for debugging):")
+        lines.extend(f"  {line}" for line in diagnostic.details.splitlines())
+    return "\n".join(lines)
 
 
 def format_install_message(result: InstallResult, *, include_provider_status: bool = True) -> str:
