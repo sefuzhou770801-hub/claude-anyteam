@@ -100,6 +100,10 @@ def test_handle_prose_batch_collapses_idle_peer_dms_to_one_gemini_invocation(tmp
     assert invocations[0]["ephemeral"] is True
     assert callable(invocations[0]["event_sink"])
     assert invocations[0]["prompt"].count("[from peer-") == 5
+    assert "# Team messaging" in invocations[0]["prompt"]
+    assert "Plain prose output is NOT visible to teammates" in invocations[0]["prompt"]
+    assert "call mcp_anyteam_send_message" in invocations[0]["prompt"]
+    assert "underlying wrapper tool is send_message" in invocations[0]["prompt"]
 
 
 @pytest.mark.parametrize("backend", ["acp", "headless"])

@@ -6,6 +6,8 @@ needed by the adapter.
 """
 from __future__ import annotations
 
+from claude_anyteam.prompts import TEAM_MESSAGING_BLOCK
+
 
 def _peer_fragment_section(peer_prompt_fragments: str) -> str:
     text = peer_prompt_fragments.strip()
@@ -34,7 +36,8 @@ def task_prompt(
         f"You are {agent_name}, a Kimi CLI teammate on the {team_name} team. Execute the task below.\n\n"
         f"# Subject\n{task.subject}\n\n# Description\n{task.description}\n\n"
         "# MCP tools available\nKimi built-in local tools are available for shell, filesystem, search, and web work. Use the bare anyteam protocol tools below only when useful for teammate coordination; do not call them by default:\n"
-        f"{_tools_text()}\nYour current task id is {task.id}."
+        f"{_tools_text()}\nYour current task id is {task.id}.\n\n"
+        f"{TEAM_MESSAGING_BLOCK}"
         f"{_peer_fragment_section(peer_prompt_fragments)}\n\n"
         "# Required response\nProduce the required final JSON object only."
     )
@@ -51,7 +54,8 @@ def prose_reply_prompt(
         f"You are {agent_name}, a Kimi CLI teammate on the {team_name} team. "
         f"A teammate named {sender!r} sent you:\n\n{body}\n\n"
         f"Reply briefly and helpfully using send_message(to={sender!r}, body=<reply>). "
-        "Plain prose is fine for your local final answer."
+        f"\n\n{TEAM_MESSAGING_BLOCK}\n\n"
+        "Final local prose, if any, is informational only."
         f"{_peer_fragment_section(peer_prompt_fragments)}"
     )
 

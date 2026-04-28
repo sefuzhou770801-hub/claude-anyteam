@@ -77,6 +77,10 @@ def test_main_loop_batches_five_idle_peer_dms_into_one_kimi_invocation(tmp_path:
     assert len(invocations) == 1
     prompt = invocations[0]["prompt"]
     assert prompt.count("[from peer-") == 5
+    assert "# Team messaging" in prompt
+    assert "Plain prose output is NOT visible to teammates" in prompt
+    assert "call send_message" in prompt
+    assert "try SendMessage (capitalized)" in prompt
     assert invocations[0]["ephemeral"] is True
 
 

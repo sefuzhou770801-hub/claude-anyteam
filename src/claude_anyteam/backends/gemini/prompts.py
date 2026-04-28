@@ -7,6 +7,17 @@ normalized tool names explicitly.
 from __future__ import annotations
 
 
+GEMINI_TEAM_MESSAGING_BLOCK = (
+    "# Team messaging\n"
+    "mcp_anyteam_send_message is exposed by the wrapper MCP in this session. "
+    "Plain prose output is NOT visible to teammates — to communicate, you MUST "
+    "call mcp_anyteam_send_message. The underlying wrapper tool is send_message; "
+    "if a probe surfaces it as SendMessage (capitalized), treat that as the "
+    'same team-messaging tool. Do not emit "I cannot deliver" prose; that '
+    "creates inbox noise."
+)
+
+
 def _peer_fragment_section(peer_prompt_fragments: str) -> str:
     text = peer_prompt_fragments.strip()
     if not text:
@@ -41,7 +52,8 @@ def task_prompt(
         f"You are {agent_name}, a Gemini CLI teammate on the {team_name} team. Execute the task below.\n\n"
         f"# Subject\n{task.subject}\n\n# Description\n{task.description}\n\n"
         "# MCP tools available\nGemini built-in local tools are intentionally disabled. For shell, filesystem, edit, search, and web fetch work, use the mcp_anyteam_* shadow tools below so outputs are visible to the adapter. Use protocol tools only when useful; do not call them by default:\n"
-        f"{_tools_text()}\nYour current task id is {task.id}."
+        f"{_tools_text()}\nYour current task id is {task.id}.\n\n"
+        f"{GEMINI_TEAM_MESSAGING_BLOCK}"
         f"{_peer_fragment_section(peer_prompt_fragments)}\n\n"
         "# Required response\nProduce the required final JSON object only."
     )
@@ -58,7 +70,8 @@ def prose_reply_prompt(
         f"You are {agent_name}, a Gemini CLI teammate on the {team_name} team. "
         f"A teammate named {sender!r} sent you:\n\n{body}\n\n"
         f"Reply briefly and helpfully using mcp_anyteam_send_message(to={sender!r}, body=<reply>). "
-        "Plain prose is fine for your local final answer."
+        f"\n\n{GEMINI_TEAM_MESSAGING_BLOCK}\n\n"
+        "Final local prose, if any, is informational only."
         f"{_peer_fragment_section(peer_prompt_fragments)}"
     )
 

@@ -28,6 +28,15 @@ TEAM_MESSAGING_MARKERS = (
     "try SendMessage (capitalized)",
     'Do not emit "I cannot deliver" prose',
 )
+GEMINI_TEAM_MESSAGING_MARKERS = (
+    "# Team messaging",
+    "mcp_anyteam_send_message is exposed by the wrapper MCP in this session",
+    "Plain prose output is NOT visible to teammates",
+    "call mcp_anyteam_send_message",
+    "underlying wrapper tool is send_message",
+    "SendMessage (capitalized)",
+    'Do not emit "I cannot deliver" prose',
+)
 
 
 def _task(task_id: str = "7"):
@@ -152,6 +161,11 @@ def _assert_team_messaging_block(prompt: str) -> None:
         assert marker in prompt
 
 
+def _assert_gemini_team_messaging_block(prompt: str) -> None:
+    for marker in GEMINI_TEAM_MESSAGING_MARKERS:
+        assert marker in prompt
+
+
 def test_empty_team_yields_empty_fragments():
     cache = CapabilityManifestCache(team=TEAM, self_name=SELF)
 
@@ -190,6 +204,22 @@ def test_codex_routed_prompts_include_team_messaging_block():
 
     _assert_team_messaging_block(task_prompt)
     _assert_team_messaging_block(prose_prompt)
+
+
+def test_kimi_and_gemini_routed_prompts_include_team_messaging_blocks():
+    kimi_task = kimi_prompts.task_prompt(_task(), SELF, TEAM)
+    kimi_prose = kimi_prompts.prose_reply_prompt(
+        "codex-peer", "please ack", SELF, TEAM
+    )
+    gemini_task = gemini_prompts.task_prompt(_task(), SELF, TEAM)
+    gemini_prose = gemini_prompts.prose_reply_prompt(
+        "codex-peer", "please ack", SELF, TEAM
+    )
+
+    _assert_team_messaging_block(kimi_task)
+    _assert_team_messaging_block(kimi_prose)
+    _assert_gemini_team_messaging_block(gemini_task)
+    _assert_gemini_team_messaging_block(gemini_prose)
 
 
 def test_r14_fragment_instructs_manifest_query():

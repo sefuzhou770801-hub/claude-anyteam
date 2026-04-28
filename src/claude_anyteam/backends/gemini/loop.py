@@ -666,6 +666,7 @@ def _handle_prose_batch(state: GeminiLoopState, messages: list[Any]) -> None:
         f"mcp_anyteam_send_message(to=<sender>, body=<your reply>) once per "
         f"sender. Do not execute code unless explicitly asked.\n\n"
         f"# Messages\n{body_blocks}\n\n"
+        f"{prompts.GEMINI_TEAM_MESSAGING_BLOCK}\n\n"
         f"{peer_tail}"
         f"Do not produce a structured JSON object; address each sender via "
         f"the mcp_anyteam_send_message tool. Final assistant prose, if any, "
