@@ -70,6 +70,68 @@ def test_should_not_skip_prose_fallback_for_non_send_message_tools_when_events_a
 
 
 @pytest.mark.parametrize(
+    "command",
+    [
+        "python - <<'PY'\nfrom claude_teams import messaging\nmessaging.send_plain_message(team, sender, to, body, summary='status')\nPY",
+        "python - <<'PY'\nfrom claude_teams import messaging\nmessaging.append_message(team, to, msg)\nPY",
+        "python - <<'PY'\nawait client.call_tool('send_message', {'to': 'peer-a', 'body': 'ok'})\nPY",
+    ],
+    ids=["send-plain-message", "append-message", "local-wrapper-client"],
+)
+def test_should_skip_prose_fallback_for_direct_host_delivery_workarounds(command):
+    result = _result(
+        events=[
+            {
+                "method": "notifications/item_update",
+                "params": {
+                    "item": {
+                        "type": "commandExecution",
+                        "command": command,
+                        "status": "completed",
+                        "exitCode": 0,
+                    }
+                },
+            }
+        ],
+        tool_call_events=1,
+        last_message="Message delivered to peer-a.",
+    )
+
+    assert should_skip_prose_fallback(result) is True
+
+
+@pytest.mark.parametrize(
+    "command",
+    [
+        "command -v send_message || true",
+        "python - <<'PY'\nimport inspect\nprint(inspect.signature(messaging.send_plain_message))\nPY",
+        "grep -R 'def send_plain_message' src",
+    ],
+    ids=["command-v", "signature-inspection", "source-grep"],
+)
+def test_should_not_skip_prose_fallback_for_direct_delivery_discovery(command):
+    result = _result(
+        events=[
+            {
+                "method": "notifications/item_update",
+                "params": {
+                    "item": {
+                        "type": "commandExecution",
+                        "command": command,
+                        "status": "completed",
+                        "exitCode": 0,
+                    }
+                },
+            }
+        ],
+        tool_call_events=1,
+        last_message="I could not find the send_message tool.",
+    )
+
+    assert should_skip_prose_fallback(result) is False
+
+
+@pytest.mark.parametrize(
     "result",
     [
         None,

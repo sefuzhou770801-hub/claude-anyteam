@@ -399,11 +399,15 @@ def test_m11_self_dm_excluded(
 
 def test_m13_collision_detected(teams_dir: Path, tmp_path: Path):
     team = "team-m13"
+    append_event(team, "agent-a", "turn_started", 1, at=0, turn_id="turn-a")
+    send(team, "agent-a", 2, "agent-b", at=5, turn_id="turn-a")
     append_event(
         team,
         "agent-a",
         "turn_completed",
-        1,
+        3,
+        at=8,
+        turn_id="turn-a",
         payload={
             "tool_call_events": 2,
             "last_message_preview": "this is a 50-char canned fallback prose reply, oops",
@@ -415,6 +419,43 @@ def test_m13_collision_detected(teams_dir: Path, tmp_path: Path):
     assert agents["agent-a"]["metrics"]["M13_prose_fallback_collisions"] == 1
     assert agents["agent-a"]["metrics"]["M13_total_send_message_replies"] == 1
     assert scenario["aggregate"]["M13_total_collisions"] == 1
+
+
+def test_m13_generic_tool_use_without_send_is_not_collision(
+    teams_dir: Path, tmp_path: Path
+):
+    team = "team-m13-tool-discovery"
+    append_event(team, "agent-a", "turn_started", 1, at=0, turn_id="turn-a")
+    append_event(
+        team,
+        "agent-a",
+        "tool_event",
+        2,
+        at=3,
+        turn_id="turn-a",
+        payload={
+            "tool_name": "list_mcp_resources",
+            "phase": "completed",
+        },
+    )
+    append_event(
+        team,
+        "agent-a",
+        "turn_completed",
+        3,
+        at=8,
+        turn_id="turn-a",
+        payload={
+            "tool_call_events": 1,
+            "last_message_preview": "I do not have a visible send_message MCP tool in this session.",
+        },
+    )
+
+    scenario, _pairs, agents = run_score(team, tmp_path / "out")
+
+    assert agents["agent-a"]["metrics"]["M13_prose_fallback_collisions"] == 0
+    assert agents["agent-a"]["metrics"]["M13_per_collision_attribution"] == []
+    assert scenario["aggregate"]["M13_total_collisions"] == 0
 
 
 def test_m13_attribution_includes_backend_timestamps_and_ordering(
