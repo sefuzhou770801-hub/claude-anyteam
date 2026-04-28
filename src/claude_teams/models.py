@@ -137,10 +137,31 @@ class InboxMessage(BaseModel):
     message_kind: str = Field(default="peer_dm", alias="messageKind")
 
 
+LIFECYCLE_MESSAGE_KINDS = frozenset(
+    {
+        "idle_notification",
+        "task_assignment",
+        "task_complete",
+        "task_blocked",
+        "plan_blocked",
+        "plan_approval_request",
+        "plan_approval_response",
+        "permission_request",
+        "permission_response",
+        "shutdown_request",
+        "shutdown_approved",
+        "shutdown_rejected",
+        "shutdown_response",
+        "capability_manifest_updated",
+    }
+)
+
+
 class IdleNotification(BaseModel):
     model_config = {"populate_by_name": True}
 
     type: Literal["idle_notification"] = "idle_notification"
+    schema_version: Literal[1] = 1
     from_: str = Field(alias="from")
     timestamp: str
     idle_reason: str = Field(alias="idleReason", default="available")
@@ -178,6 +199,96 @@ class ShutdownApproved(BaseModel):
     pane_id: str = Field(alias="paneId")
     backend_type: str = Field(alias="backendType")
     session_id: str | None = Field(alias="sessionId", default=None)
+
+
+class ShutdownRejected(BaseModel):
+    model_config = {"populate_by_name": True}
+
+    type: Literal["shutdown_rejected"] = "shutdown_rejected"
+    schema_version: Literal[1] = 1
+    request_id: str = Field(alias="requestId")
+    from_: str = Field(alias="from")
+    reason: str
+    timestamp: str
+
+
+class PlanApprovalRequest(BaseModel):
+    model_config = {"populate_by_name": True}
+
+    type: Literal["plan_approval_request"] = "plan_approval_request"
+    schema_version: Literal[1] = 1
+    request_id: str = Field(alias="requestId")
+    plan: dict[str, Any]
+    timestamp: str
+
+
+class PlanApprovalResponse(BaseModel):
+    model_config = {"populate_by_name": True}
+
+    type: Literal["plan_approval_response"] = "plan_approval_response"
+    schema_version: Literal[1] = 1
+    request_id: str = Field(alias="requestId")
+    approve: bool
+    feedback: str | None = None
+    timestamp: str
+
+
+class PermissionRequest(BaseModel):
+    model_config = {"populate_by_name": True}
+
+    type: Literal["permission_request"] = "permission_request"
+    schema_version: Literal[1] = 1
+    request_id: str
+    tool_name: str
+    tool_args: Any
+    task_id: str
+    teammate_name: str
+    trust_mode: Literal["default", "plan"]
+    label: str | None = None
+    session_id: str | None = None
+    timestamp: str
+
+
+class PermissionResponse(BaseModel):
+    model_config = {"populate_by_name": True}
+
+    type: Literal["permission_response"] = "permission_response"
+    request_id: str = Field(alias="requestId")
+    decision: Literal["allow_once", "allow_session", "deny"]
+    reason: str | None = None
+    timestamp: str | None = None
+
+
+class TaskCompleted(BaseModel):
+    model_config = {"populate_by_name": True}
+
+    kind: Literal["task_complete"] = "task_complete"
+    schema_version: Literal[1] = 1
+    task_id: str
+    files_changed: list[str] = Field(default_factory=list)
+    summary: str
+    codex_exit_code: int
+
+
+class TaskBlocked(BaseModel):
+    model_config = {"populate_by_name": True}
+
+    kind: Literal["task_blocked"] = "task_blocked"
+    schema_version: Literal[1] = 1
+    task_id: str
+    reason: str
+    timestamp: str
+
+
+class PlanBlocked(BaseModel):
+    model_config = {"populate_by_name": True}
+
+    kind: Literal["plan_blocked"] = "plan_blocked"
+    schema_version: Literal[1] = 1
+    request_id: str
+    reason: str
+    task_id: str | None = None
+    timestamp: str
 
 
 class TeamCreateResult(BaseModel):

@@ -145,6 +145,24 @@ class PlanApprovalResponseIn(_Base):
     feedback: str | None = None
 
 
+class PlanApprovalResponseOut(_Base):
+    """Outbound typed plan-approval decision.
+
+    The lead/full-MCP surface historically sent plan decisions as either prose
+    summaries (``plan_approved`` / ``plan_rejected``) or a legacy
+    ``{"type":"plan_approval"}`` body. The adapter-side parser accepts the
+    canonical lifecycle variant so receivers do not need to infer decisions
+    from summary text.
+    """
+
+    type: Literal["plan_approval_response"] = "plan_approval_response"
+    schema_version: Literal[1] = 1
+    request_id: str = Field(alias="requestId")
+    approve: bool
+    feedback: str | None = None
+    timestamp: str = Field(default_factory=now_iso)
+
+
 class CapabilityManifestUpdatedIn(_Base):
     """Inbound R12 manifest-cache invalidation event.
 
@@ -205,6 +223,7 @@ class SteerIn(_Base):
 
 class IdleNotificationOut(_Base):
     type: Literal["idle_notification"] = "idle_notification"
+    schema_version: Literal[1] = 1
     from_: str = Field(alias="from")
     timestamp: str = Field(default_factory=now_iso)
     idle_reason: str = Field(default="available", alias="idleReason")
@@ -218,10 +237,52 @@ class TaskCompleteOut(_Base):
     """
 
     kind: Literal["task_complete"] = "task_complete"
+    schema_version: Literal[1] = 1
     task_id: str
     files_changed: list[str] = Field(default_factory=list)
     summary: str
     codex_exit_code: int
+
+
+class TaskBlockedOut(_Base):
+    """Typed lifecycle payload for a claimed task that could not proceed."""
+
+    kind: Literal["task_blocked"] = "task_blocked"
+    schema_version: Literal[1] = 1
+    task_id: str
+    reason: str
+    timestamp: str = Field(default_factory=now_iso)
+
+
+class PlanBlockedOut(_Base):
+    """Typed lifecycle payload for an unfulfillable plan-approval request."""
+
+    kind: Literal["plan_blocked"] = "plan_blocked"
+    schema_version: Literal[1] = 1
+    request_id: str
+    reason: str
+    task_id: str | None = None
+    timestamp: str = Field(default_factory=now_iso)
+
+
+LIFECYCLE_MESSAGE_KINDS = frozenset(
+    {
+        "idle_notification",
+        "task_assignment",
+        "task_complete",
+        "task_blocked",
+        "plan_blocked",
+        "plan_approval_request",
+        "plan_approval_response",
+        "permission_request",
+        "permission_response",
+        "shutdown_request",
+        "shutdown_approved",
+        "shutdown_rejected",
+        "shutdown_response",
+        "capability_manifest_updated",
+    }
+)
 
 
 VisibilityEventKind = Literal[
@@ -315,12 +376,22 @@ def parse_protocol_text(text: str) -> _Base | None:
         return _safe_load(PlanApprovalRequestIn, raw)
     if t == "plan_approval_response":
         return _safe_load(PlanApprovalResponseIn, raw)
+    if t == "plan_blocked":
+        return _safe_load(PlanBlockedOut, raw)
+    if t == "permission_request":
+        return _safe_load(PermissionRequestOut, raw)
     if t == "permission_response":
         return _safe_load(PermissionResponseIn, raw)
     if t == "capability_manifest_updated":
         return _safe_load(CapabilityManifestUpdatedIn, raw)
     if t == "steer":
         return _safe_load(SteerIn, raw)
+    if t == "idle_notification":
+        return _safe_load(IdleNotificationOut, raw)
+    if t == "task_complete":
+        return _safe_load(TaskCompleteOut, raw)
+    if t == "task_blocked":
+        return _safe_load(TaskBlockedOut, raw)
     if t in {
         "agent_registered",
         "turn_started",
