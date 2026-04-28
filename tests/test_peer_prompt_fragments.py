@@ -226,6 +226,22 @@ def test_kimi_and_gemini_routed_prompts_include_team_messaging_blocks():
     _assert_gemini_team_messaging_block(gemini_prose)
 
 
+def test_task_prompts_instruct_checkpoint_commits_during_multifile_work():
+    codex_task = codex_prompts.v7_task_prompt(_task(), SELF, TEAM)
+    kimi_task = kimi_prompts.task_prompt(_task(), SELF, TEAM)
+    gemini_task = gemini_prompts.task_prompt(_task(), SELF, TEAM)
+
+    assert "checkpoint_commit(message)" in codex_task
+    assert "checkpoint_commit so progress is not lost on a turn timeout" in codex_task
+    assert "checkpoint_commit(message)" in kimi_task
+    assert "checkpoint_commit so progress is not lost on a turn timeout" in kimi_task
+    assert "mcp_anyteam_checkpoint_commit(message)" in gemini_task
+    assert (
+        "mcp_anyteam_checkpoint_commit so progress is not lost on a turn timeout"
+        in gemini_task
+    )
+
+
 def test_r14_fragment_instructs_manifest_query():
     fragment = _fragment()
 

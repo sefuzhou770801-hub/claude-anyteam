@@ -20,6 +20,7 @@ def _tools_text() -> str:
     return (
         "- send_message(to, body, summary?) — send a status update or clarifying question to team-lead or any peer.\n"
         "- task_update(task_id, active_form?, status?) — update your own active_form mid-run; do not set owner or mark completed.\n"
+        "- checkpoint_commit(message) — git add -A and git commit in your working directory. During multi-file work, after each meaningful file edit or small coherent batch, call checkpoint_commit so progress is not lost on a turn timeout.\n"
         "- task_create(subject, description) — create a follow-up task if work should be split off.\n"
         "- read_inbox(unread_only?) — read your own inbox for replies.\n"
         "- task_list(), read_config() — read-only team inspection.\n"
