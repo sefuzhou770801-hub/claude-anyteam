@@ -13,6 +13,7 @@ import json
 import sys
 import time
 from dataclasses import dataclass
+from datetime import datetime, timedelta, timezone
 from pathlib import Path
 from typing import Any, Iterable, TextIO
 
@@ -23,19 +24,31 @@ from . import protocol_io as pio
 
 
 _ANSI_RESET = "\033[0m"
-_KIND_COLORS: dict[str, str] = {
-    "agent_registered": "\033[36m",
-    "turn_started": "\033[34m",
-    "turn_progress": "\033[36m",
-    "tool_event": "\033[35m",
-    "artifact_event": "\033[32m",
-    "turn_warning": "\033[33m",
-    "turn_completed": "\033[32m",
-    "turn_failed": "\033[31m",
-    "visibility_degraded": "\033[31m",
-    "steer_ack": "\033[36m",
-    "capability_changed": "\033[36m",
-    "capability_manifest_updated": "\033[36m",
+_SEVERITY_COLORS: dict[str, str] = {
+    "debug": "\033[2m",
+    "info": "\033[36m",
+    "warn": "\033[33m",
+    "error": "\033[31m",
+}
+_RELATIVE_SINCE_UNITS: dict[str, float] = {
+    "s": 1,
+    "sec": 1,
+    "secs": 1,
+    "second": 1,
+    "seconds": 1,
+    "m": 60,
+    "min": 60,
+    "mins": 60,
+    "minute": 60,
+    "minutes": 60,
+    "h": 60 * 60,
+    "hr": 60 * 60,
+    "hrs": 60 * 60,
+    "hour": 60 * 60,
+    "hours": 60 * 60,
+    "d": 24 * 60 * 60,
+    "day": 24 * 60 * 60,
+    "days": 24 * 60 * 60,
 }
 
 
@@ -73,6 +86,28 @@ def _build_parser() -> argparse.ArgumentParser:
         help="Disable ANSI color even when stdout is a terminal",
     )
     p.add_argument(
+        "--json",
+        action="store_true",
+        help="Emit matching VisibilityEvent envelopes as JSON Lines",
+    )
+    p.add_argument(
+        "--filter-kind",
+        action="append",
+        default=[],
+        metavar="KIND[,KIND...]",
+        help="Only print events whose kind matches one of the provided values",
+    )
+    p.add_argument(
+        "--since",
+        type=_parse_since_arg,
+        metavar="WHEN",
+        help=(
+            "Only print events at or after WHEN. Accepts ISO-8601 timestamps "
+            "(for example 2026-04-27T15:30:00Z) or relative durations such "
+            "as 10m, 2h, or 1d."
+        ),
+    )
+    p.add_argument(
         "--max-events",
         type=int,
         default=None,
@@ -95,6 +130,71 @@ def _validate_name(value: str) -> str:
     if value in {".", ".."}:
         raise argparse.ArgumentTypeError(f"invalid name {value!r}")
     return value
+
+
+def _parse_timestamp(value: str) -> datetime | None:
+    text = value.strip()
+    if not text:
+        return None
+    if text.endswith("Z"):
+        text = text[:-1] + "+00:00"
+    try:
+        parsed = datetime.fromisoformat(text)
+    except ValueError:
+        return None
+    if parsed.tzinfo is None:
+        parsed = parsed.replace(tzinfo=timezone.utc)
+    return parsed.astimezone(timezone.utc)
+
+
+def _parse_since_arg(value: str) -> datetime:
+    parsed = _parse_timestamp(value)
+    if parsed is not None:
+        return parsed
+
+    text = value.strip().lower()
+    number = ""
+    unit = ""
+    for ch in text:
+        if ch.isdigit() or ch == ".":
+            if unit:
+                raise argparse.ArgumentTypeError(
+                    f"invalid --since value {value!r}: expected ISO timestamp or duration"
+                )
+            number += ch
+        elif ch.isalpha():
+            unit += ch
+        elif ch.isspace():
+            continue
+        else:
+            raise argparse.ArgumentTypeError(
+                f"invalid --since value {value!r}: expected ISO timestamp or duration"
+            )
+    if not number or not unit or unit not in _RELATIVE_SINCE_UNITS:
+        raise argparse.ArgumentTypeError(
+            f"invalid --since value {value!r}: expected ISO timestamp or duration"
+        )
+    try:
+        amount = float(number)
+    except ValueError as exc:
+        raise argparse.ArgumentTypeError(
+            f"invalid --since duration {value!r}"
+        ) from exc
+    if amount < 0:
+        raise argparse.ArgumentTypeError(f"invalid --since duration {value!r}")
+    return datetime.now(timezone.utc) - timedelta(
+        seconds=amount * _RELATIVE_SINCE_UNITS[unit]
+    )
+
+
+def _split_filter_kinds(values: Iterable[str]) -> set[str] | None:
+    kinds = {
+        item.strip()
+        for value in values
+        for item in value.split(",")
+        if item.strip()
+    }
+    return kinds or None
 
 
 def _truncate(text: str, *, limit: int = 220) -> str:
@@ -248,11 +348,15 @@ def format_event(event: VisibilityEvent, *, color: bool = True) -> str:
     """Render one VisibilityEvent as a single tri-card row."""
 
     kind = event.kind
+    severity = event.severity.upper()
     if color:
-        kind = f"{_KIND_COLORS.get(event.kind, '')}{event.kind}{_ANSI_RESET}"
+        severity_color = _SEVERITY_COLORS.get(event.severity, "")
+        if severity_color:
+            severity = f"{severity_color}{severity}{_ANSI_RESET}"
+            kind = f"{severity_color}{event.kind}{_ANSI_RESET}"
     prefix = (
         f"{event.timestamp} seq={event.seq} {event.agent} "
-        f"{event.backend} {event.severity.upper()} {kind}"
+        f"{event.backend} {severity} {kind}"
     )
     parts = [prefix, _args_card(event), _result_card(event)]
     error = _error_card(event)
@@ -335,6 +439,8 @@ def tail_events(
     *,
     team: str,
     agent: str | None = None,
+    filter_kinds: set[str] | None = None,
+    since: datetime | None = None,
     from_start: bool = False,
     follow: bool = True,
     poll_s: float = 0.2,
@@ -381,6 +487,12 @@ def tail_events(
                     continue
                 if agent and event.agent != agent:
                     continue
+                if filter_kinds is not None and event.kind not in filter_kinds:
+                    continue
+                if since is not None:
+                    event_time = _parse_timestamp(event.timestamp)
+                    if event_time is None or event_time < since:
+                        continue
                 if event.event_id in seen:
                     continue
                 seen.add(event.event_id)
@@ -403,8 +515,10 @@ def main(
     args = _build_parser().parse_args(argv)
     out = stdout if stdout is not None else sys.stdout
     err = stderr if stderr is not None else sys.stderr
+    filter_kinds = _split_filter_kinds(args.filter_kind)
     color = (
-        not args.no_color
+        not args.json
+        and not args.no_color
         and hasattr(out, "isatty")
         and bool(out.isatty())
     )
@@ -412,13 +526,18 @@ def main(
         for event in tail_events(
             team=args.team,
             agent=args.agent,
+            filter_kinds=filter_kinds,
+            since=args.since,
             from_start=args.from_start,
             follow=args.follow,
             poll_s=args.poll_s,
             max_events=args.max_events,
             stderr=err,
         ):
-            out.write(format_event(event, color=color) + "\n")
+            if args.json:
+                out.write(event.model_dump_json(by_alias=True, exclude_none=True) + "\n")
+            else:
+                out.write(format_event(event, color=color) + "\n")
             out.flush()
     except KeyboardInterrupt:
         return 130

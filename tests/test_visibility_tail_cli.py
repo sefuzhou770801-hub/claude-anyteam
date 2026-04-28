@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import io
+import json
 import threading
 import time
 from pathlib import Path
@@ -214,3 +215,78 @@ def test_visibility_tail_filters_agent_and_dispatches_from_top_level(
     assert rc == 0
     assert "gemini-a" in captured.out
     assert "codex-a" not in captured.out
+
+
+def test_visibility_tail_json_filters_kind_and_since(teams_root: Path):
+    pio.append_event(
+        "team-x",
+        "codex-a",
+        _event("turn_started", 1, summary="too old"),
+    )
+    pio.append_event(
+        "team-x",
+        "codex-a",
+        _event("tool_event", 2, summary="matching tool", payload={"tool_name": "read_file"}),
+    )
+    pio.append_event(
+        "team-x",
+        "codex-a",
+        _event("turn_completed", 3, summary="wrong kind", payload={"exit_code": 0}),
+    )
+
+    out = io.StringIO()
+    err = io.StringIO()
+    rc = visibility_tail.main(
+        [
+            "--team",
+            "team-x",
+            "--from-start",
+            "--no-follow",
+            "--json",
+            "--filter-kind",
+            "tool_event,turn_failed",
+            "--since",
+            "2026-04-27T15:30:02Z",
+        ],
+        stdout=out,
+        stderr=err,
+    )
+
+    assert rc == 0
+    assert err.getvalue() == ""
+    rows = [json.loads(line) for line in out.getvalue().splitlines()]
+    assert [row["kind"] for row in rows] == ["tool_event"]
+    assert rows[0]["summary"] == "matching tool"
+    assert rows[0]["payload"]["tool_name"] == "read_file"
+
+
+class _TtyStringIO(io.StringIO):
+    def isatty(self) -> bool:
+        return True
+
+
+def test_visibility_tail_colors_by_severity_when_tty(teams_root: Path):
+    pio.append_event(
+        "team-x",
+        "codex-a",
+        _event("turn_warning", 1, severity="warn", summary="warning event"),
+    )
+    pio.append_event(
+        "team-x",
+        "codex-a",
+        _event("turn_failed", 2, severity="error", summary="failure event"),
+    )
+
+    out = _TtyStringIO()
+    err = io.StringIO()
+    rc = visibility_tail.main(
+        ["--team", "team-x", "--from-start", "--no-follow"],
+        stdout=out,
+        stderr=err,
+    )
+
+    assert rc == 0
+    assert err.getvalue() == ""
+    rendered = out.getvalue()
+    assert "\033[33mWARN\033[0m \033[33mturn_warning\033[0m" in rendered
+    assert "\033[31mERROR\033[0m \033[31mturn_failed\033[0m" in rendered
