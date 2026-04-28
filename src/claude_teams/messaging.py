@@ -1,3 +1,13 @@
+"""Filesystem-backed inbox transport for the Agent Teams protocol.
+
+This module owns the on-disk mailbox primitives shared by Claude, Codex,
+Gemini, and Kimi teammates: inbox path discovery, locked read/append, typed
+attachment previews for oversized bodies, and optional per-target batching for
+high-volume fan-out.  Higher-level adapters should route through these helpers
+instead of mutating inbox JSON directly so lock, spill, and ordering invariants
+stay centralized.
+"""
+
 from __future__ import annotations
 
 import hashlib
