@@ -95,11 +95,76 @@ def _event_mentions_send_message_tool(value: Any) -> bool:
     return False
 
 
+def _event_mentions_direct_peer_delivery(value: Any) -> bool:
+    """Return True for successful host-shell peer-message delivery workarounds.
+
+    Codex App Server prose turns sometimes fail to surface wrapper MCP tools to
+    the model even though the wrapper is configured.  When that happens, Codex
+    can still use its host shell to call the team substrate directly
+    (``claude_teams.messaging.send_plain_message`` / ``append_message``), or to
+    instantiate the wrapper server and call ``send_message`` through a local
+    FastMCP client.  Those are not normal model tool-call shapes, but they have
+    already delivered a peer reply; the prose fallback guard must therefore
+    treat them like delivered-via-tool replies to avoid double-sending the
+    final assistant prose.
+
+    Keep this deliberately narrow: only successful ``commandExecution`` items
+    count, and only when the command text contains an actual call expression.
+    Source greps, signature inspection, or ``command -v send_message`` should
+    not suppress fallback prose.
+    """
+
+    if isinstance(value, dict):
+        item = value.get("item")
+        if not isinstance(item, dict):
+            params = value.get("params")
+            if isinstance(params, dict) and isinstance(params.get("item"), dict):
+                item = params["item"]
+            else:
+                item = value
+
+        item_type = str(item.get("type") or item.get("raw_backend_type") or "")
+        if item_type == "commandExecution":
+            status = str(item.get("status") or value.get("status") or "").lower()
+            exit_code = item.get("exitCode", item.get("exit_code", value.get("exit_code")))
+            try:
+                exit_code_int = int(exit_code) if exit_code is not None else 0
+            except (TypeError, ValueError):
+                exit_code_int = 1
+            command = str(item.get("command") or value.get("command") or "")
+            if status in {"completed", "success"} and exit_code_int == 0:
+                direct_delivery_needles = (
+                    "messaging.send_plain_message(",
+                    "messaging.append_message(",
+                    ".send_plain_message(",
+                    ".append_message(",
+                    "call_tool('send_message'",
+                    'call_tool("send_message"',
+                    "call_tool('mcp_anyteam_send_message'",
+                    'call_tool("mcp_anyteam_send_message"',
+                )
+                if any(needle in command for needle in direct_delivery_needles):
+                    return True
+
+        for nested_key in ("item", "params", "tool_calls", "call", "function"):
+            nested = value.get(nested_key)
+            if nested is not None and _event_mentions_direct_peer_delivery(nested):
+                return True
+        return False
+    if isinstance(value, list):
+        return any(_event_mentions_direct_peer_delivery(item) for item in value)
+    return False
+
+
 def result_has_send_message_tool_call(result: Any) -> bool:
     """Best-effort detection that a backend result called wrapper send_message."""
     events = getattr(result, "events", None)
     if isinstance(events, list) and events:
-        return any(_event_mentions_send_message_tool(event) for event in events)
+        return any(
+            _event_mentions_send_message_tool(event)
+            or _event_mentions_direct_peer_delivery(event)
+            for event in events
+        )
     # Legacy / unit-test duck type: early PR-#11/#12 tests only exposed a
     # successful tool-call count. Preserve that contract when no raw event stream
     # is available to inspect.

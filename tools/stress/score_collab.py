@@ -731,38 +731,20 @@ def m13_attribution_records(
             if terminal.collision:
                 sender_backend = agent_backend(sender, backend_by_agent)
                 sends_by_recipient = _earliest_send_by_recipient(window_sends)
-                if not sends_by_recipient:
+                for recipient, send in sorted(sends_by_recipient.items()):
+                    recipient_backend = agent_backend(recipient, backend_by_agent)
                     records.append(
                         M13Attribution(
                             terminal=terminal,
                             sender=sender,
                             sender_backend=sender_backend,
-                            recipient="N/A",
-                            recipient_backend="N/A",
-                            structured_reply_ts=None,
+                            recipient=recipient,
+                            recipient_backend=recipient_backend,
+                            structured_reply_ts=send.timestamp,
                             prose_fallback_ts=terminal_ts,
-                            terminal_event_kind="unknown",
+                            terminal_event_kind=terminal_event_kind(send.timestamp, terminal_ts),
                         )
                     )
-                else:
-                    for recipient, send in sorted(sends_by_recipient.items()):
-                        recipient_backend = (
-                            agent_backend(recipient, backend_by_agent)
-                            if recipient != "N/A"
-                            else "N/A"
-                        )
-                        records.append(
-                            M13Attribution(
-                                terminal=terminal,
-                                sender=sender,
-                                sender_backend=sender_backend,
-                                recipient=recipient,
-                                recipient_backend=recipient_backend,
-                                structured_reply_ts=send.timestamp,
-                                prose_fallback_ts=terminal_ts,
-                                terminal_event_kind=terminal_event_kind(send.timestamp, terminal_ts),
-                            )
-                        )
             if terminal_ts is not None:
                 previous_terminal_ts = terminal_ts
     return sorted(
@@ -912,7 +894,9 @@ def build_scorecards(
         steer_counter = delivery_breakdown(events)
         steer_observed, steer_total, steer_inflight, steer_rate = delivery_rate_parts(steer_counter)
         agent_terminals = [t for t in terminals if t.event.agent == agent]
-        collisions = sum(1 for t in agent_terminals if t.collision)
+        collisions = len(
+            [attribution for attribution in m13_attributions if attribution.sender == agent]
+        )
         peer_rejected = count_peer_steer_rejected(events)
         manifest_consulted = sum(
             1 for event in events if is_tool_call_event(event, "mcp_anyteam_capability_manifest")
