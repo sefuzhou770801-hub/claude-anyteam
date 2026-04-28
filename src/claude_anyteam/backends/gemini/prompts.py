@@ -41,6 +41,7 @@ def _tools_text() -> str:
         "- mcp_anyteam_list_directory(path, recursive?, glob?) — list files/directories.\n"
         "- mcp_anyteam_edit_file(path, old, new, replace_all?) — exact string replacement.\n"
         "- mcp_anyteam_search(pattern, path?, regex?, glob?) — search file contents.\n"
+        "- mcp_anyteam_grep(regex, directory) — recursively grep a directory with a regex.\n"
         "- mcp_anyteam_web_fetch(url, method?, headers?, body?) — fetch URLs without an allowlist.\n"
     )
 

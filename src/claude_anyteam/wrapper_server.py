@@ -116,6 +116,7 @@ EXPOSED_TOOLS: tuple[str, ...] = (
     "mcp_anyteam_list_directory",
     "mcp_anyteam_edit_file",
     "mcp_anyteam_search",
+    "mcp_anyteam_grep",
     "mcp_anyteam_web_fetch",
 )
 
@@ -277,6 +278,7 @@ SHADOW_TOOLS: frozenset[str] = frozenset(
         "mcp_anyteam_edit_file",
         "mcp_anyteam_list_directory",
         "mcp_anyteam_search",
+        "mcp_anyteam_grep",
         "mcp_anyteam_web_fetch",
     }
 )
@@ -421,6 +423,11 @@ def _tool_target(tool_name: str, bound_args: dict[str, Any]) -> str | None:
         return (
             f"pattern={_preview(bound_args.get('pattern'), limit=120)!r} "
             f"path={bound_args.get('path', '.')!r}"
+        )
+    if tool_name == "mcp_anyteam_grep":
+        return (
+            f"regex={_preview(bound_args.get('regex'), limit=120)!r} "
+            f"directory={bound_args.get('directory')!r}"
         )
     if tool_name == "mcp_anyteam_web_fetch":
         return str(bound_args.get("url"))
@@ -1324,6 +1331,47 @@ def build_server(argv: list[str] | None = None) -> FastMCP:
                         "encoding": encoding,
                     })
         return {"pattern": pattern, "path": str(root), "regex": regex, "glob": glob, "matches": matches}
+
+    @mcp.tool
+    @instrumented_tool(category="shadow_tool")
+    def mcp_anyteam_grep(regex: str, directory: str) -> dict:
+        """Recursively grep a directory with a regular expression.
+
+        Args:
+            regex: Python regular expression to match against each text line.
+            directory: directory path to search recursively.
+        """
+        root = Path(directory)
+        if not root.exists():
+            raise ToolError(f"directory does not exist: {directory}")
+        if not root.is_dir():
+            raise ToolError(f"path is not a directory: {directory}")
+        try:
+            rx = re.compile(regex)
+        except re.error as e:
+            raise ToolError(f"invalid regex: {e}")
+
+        matches: list[dict[str, Any]] = []
+        try:
+            files = sorted((p for p in root.rglob("*") if p.is_file()), key=lambda p: str(p))
+        except OSError as e:
+            raise ToolError(str(e))
+        for file_path in files:
+            try:
+                text, encoding = _decode_bytes(file_path.read_bytes())
+            except OSError:
+                continue
+            for line_no, line in enumerate(text.splitlines(), start=1):
+                if rx.search(line):
+                    matches.append(
+                        {
+                            "path": str(file_path),
+                            "line": line_no,
+                            "text": line,
+                            "encoding": encoding,
+                        }
+                    )
+        return {"regex": regex, "directory": str(root), "matches": matches}
 
     @mcp.tool
     @instrumented_tool(category="shadow_tool")

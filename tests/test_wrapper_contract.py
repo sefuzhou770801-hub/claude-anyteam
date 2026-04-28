@@ -255,8 +255,8 @@ def test_exposed_and_blocked_do_not_overlap():
 
 
 def test_exposed_count_includes_protocol_shadow_and_manifest_tools(identity):
-    """Canary: fourteen tools is intentional: six protocol tools, the R13 manifest tool, and seven shadow tools."""
-    assert len(_advertised_tool_names()) == 14
+    """Canary: fifteen tools is intentional: six protocol tools, the R13 manifest tool, and eight shadow tools."""
+    assert len(_advertised_tool_names()) == 15
 
 
 def test_every_exposed_tool_has_visibility_category():
@@ -364,6 +364,7 @@ def test_exposed_tools_covers_cs50victor_safe_subset():
     assert "mcp_anyteam_list_directory" in EXPOSED_TOOLS
     assert "mcp_anyteam_edit_file" in EXPOSED_TOOLS
     assert "mcp_anyteam_search" in EXPOSED_TOOLS
+    assert "mcp_anyteam_grep" in EXPOSED_TOOLS
     assert "mcp_anyteam_web_fetch" in EXPOSED_TOOLS
 
 
@@ -594,6 +595,15 @@ def test_shadow_list_and_search_contract(identity, tmp_path):
     regex = _call_tool("mcp_anyteam_search", {"pattern": "pr.nt", "path": str(tmp_path), "regex": True, "glob": "*.py"})
     assert len(regex["matches"]) == 1
     assert regex["matches"][0]["line"] == 1
+
+    grep = _call_tool("mcp_anyteam_grep", {"regex": "alpha", "directory": str(tmp_path)})
+    assert [
+        (m["path"].endswith(suffix), m["line"], m["text"])
+        for m, suffix in zip(grep["matches"], ["a.txt", "nested/b.py"])
+    ] == [
+        (True, 1, "alpha"),
+        (True, 1, "print('alpha')"),
+    ]
 
 
 def test_shadow_web_fetch_contract(identity, monkeypatch):
