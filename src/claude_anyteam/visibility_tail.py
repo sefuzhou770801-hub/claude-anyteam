@@ -9,7 +9,9 @@ feed that can be attached mid-run.
 from __future__ import annotations
 
 import argparse
+import asyncio
 import json
+import ipaddress
 import sys
 import textwrap
 import time
@@ -22,6 +24,12 @@ from pydantic import ValidationError
 
 from .messages import VisibilityEvent
 from . import protocol_io as pio
+
+
+@dataclass(frozen=True)
+class _ServeAddress:
+    host: str
+    port: int
 
 
 _ANSI_RESET = "\033[0m"
@@ -97,6 +105,21 @@ def _build_parser() -> argparse.ArgumentParser:
         help="Emit matching VisibilityEvent envelopes as JSON Lines",
     )
     p.add_argument(
+        "--serve",
+        type=_parse_serve_address,
+        metavar="BIND:PORT",
+        help=(
+            "Serve matching VisibilityEvent envelopes as JSON over WebSocket "
+            "from BIND:PORT instead of printing to stdout. Non-loopback binds "
+            "are rejected unless --allow-remote is passed."
+        ),
+    )
+    p.add_argument(
+        "--allow-remote",
+        action="store_true",
+        help="Allow --serve to bind to a non-loopback interface.",
+    )
+    p.add_argument(
         "--filter-kind",
         action="append",
         default=[],
@@ -136,6 +159,32 @@ def _validate_name(value: str) -> str:
     if value in {".", ".."}:
         raise argparse.ArgumentTypeError(f"invalid name {value!r}")
     return value
+
+
+def _parse_serve_address(value: str) -> _ServeAddress:
+    text = value.strip()
+    if not text or ":" not in text:
+        raise argparse.ArgumentTypeError("expected BIND:PORT")
+    host, port_text = text.rsplit(":", 1)
+    host = host.strip() or "127.0.0.1"
+    if host.startswith("[") and host.endswith("]"):
+        host = host[1:-1]
+    try:
+        port = int(port_text)
+    except ValueError as exc:
+        raise argparse.ArgumentTypeError(f"invalid port {port_text!r}") from exc
+    if port <= 0 or port > 65535:
+        raise argparse.ArgumentTypeError(f"invalid port {port!r}")
+    return _ServeAddress(host=host, port=port)
+
+
+def _is_loopback_host(host: str) -> bool:
+    if host.lower() == "localhost":
+        return True
+    try:
+        return ipaddress.ip_address(host).is_loopback
+    except ValueError:
+        return False
 
 
 def _parse_timestamp(value: str) -> datetime | None:
@@ -515,6 +564,41 @@ def _discover_paths(team: str, agent: str | None) -> list[Path]:
     return list(dict.fromkeys(paths))
 
 
+def _event_from_visibility_line(
+    line: str,
+    *,
+    path: Path,
+    stderr: TextIO,
+) -> VisibilityEvent | None:
+    if not line.strip():
+        return None
+    try:
+        raw = json.loads(line)
+        return VisibilityEvent.model_validate(raw)
+    except (json.JSONDecodeError, ValidationError, TypeError) as exc:
+        stderr.write(f"warning: skipped malformed visibility row in {path}: {exc}\n")
+        stderr.flush()
+        return None
+
+
+def _event_matches(
+    event: VisibilityEvent,
+    *,
+    agent: str | None = None,
+    filter_kinds: set[str] | None = None,
+    since: datetime | None = None,
+) -> bool:
+    if agent and event.agent != agent:
+        return False
+    if filter_kinds is not None and event.kind not in filter_kinds:
+        return False
+    if since is not None:
+        event_time = _parse_timestamp(event.timestamp)
+        if event_time is None or event_time < since:
+            return False
+    return True
+
+
 def tail_events(
     *,
     team: str,
@@ -556,23 +640,16 @@ def tail_events(
 
         for path in sorted(states):
             for line in states[path].read_lines():
-                if not line.strip():
+                event = _event_from_visibility_line(line, path=path, stderr=err)
+                if event is None:
                     continue
-                try:
-                    raw = json.loads(line)
-                    event = VisibilityEvent.model_validate(raw)
-                except (json.JSONDecodeError, ValidationError, TypeError) as exc:
-                    err.write(f"warning: skipped malformed visibility row in {path}: {exc}\n")
-                    err.flush()
+                if not _event_matches(
+                    event,
+                    agent=agent,
+                    filter_kinds=filter_kinds,
+                    since=since,
+                ):
                     continue
-                if agent and event.agent != agent:
-                    continue
-                if filter_kinds is not None and event.kind not in filter_kinds:
-                    continue
-                if since is not None:
-                    event_time = _parse_timestamp(event.timestamp)
-                    if event_time is None or event_time < since:
-                        continue
                 if event.event_id in seen:
                     continue
                 seen.add(event.event_id)
@@ -586,6 +663,114 @@ def tail_events(
         time.sleep(max(0.01, poll_s))
 
 
+async def _tail_aggregate_events_async(
+    *,
+    team: str,
+    agent: str | None = None,
+    filter_kinds: set[str] | None = None,
+    since: datetime | None = None,
+    from_start: bool = False,
+    poll_s: float = 0.2,
+    stderr: TextIO | None = None,
+) -> Any:
+    """Yield events from the per-team aggregate visibility stream."""
+
+    err = stderr if stderr is not None else sys.stderr
+    path = pio.team_visibility_event_path(team)
+    state = _TailState.create(path, from_start=from_start, initial=True)
+    seen: set[str] = set()
+    while True:
+        for line in state.read_lines():
+            event = _event_from_visibility_line(line, path=path, stderr=err)
+            if event is None:
+                continue
+            if not _event_matches(
+                event,
+                agent=agent,
+                filter_kinds=filter_kinds,
+                since=since,
+            ):
+                continue
+            if event.event_id in seen:
+                continue
+            seen.add(event.event_id)
+            yield event
+        await asyncio.sleep(max(0.01, poll_s))
+
+
+async def _visibility_ws_handler(
+    websocket: Any,
+    *,
+    team: str,
+    agent: str | None,
+    filter_kinds: set[str] | None,
+    since: datetime | None,
+    from_start: bool,
+    poll_s: float,
+    stderr: TextIO,
+) -> None:
+    async for event in _tail_aggregate_events_async(
+        team=team,
+        agent=agent,
+        filter_kinds=filter_kinds,
+        since=since,
+        from_start=from_start,
+        poll_s=poll_s,
+        stderr=stderr,
+    ):
+        await websocket.send(event.model_dump_json(by_alias=True, exclude_none=True))
+
+
+async def _serve_visibility_tail(
+    *,
+    bind: _ServeAddress,
+    team: str,
+    agent: str | None,
+    filter_kinds: set[str] | None,
+    since: datetime | None,
+    from_start: bool,
+    poll_s: float,
+    allow_remote: bool,
+    stdout: TextIO,
+    stderr: TextIO,
+) -> int:
+    if not allow_remote and not _is_loopback_host(bind.host):
+        stderr.write(
+            f"error: refusing to bind non-loopback host {bind.host!r}; "
+            "pass --allow-remote to expose the visibility stream\n"
+        )
+        stderr.flush()
+        return 2
+    try:
+        from websockets.asyncio.server import serve
+    except ModuleNotFoundError:
+        stderr.write(
+            "error: visibility-tail --serve requires the 'websockets' package\n"
+        )
+        stderr.flush()
+        return 2
+
+    async def handler(websocket: Any) -> None:
+        await _visibility_ws_handler(
+            websocket,
+            team=team,
+            agent=agent,
+            filter_kinds=filter_kinds,
+            since=since,
+            from_start=from_start,
+            poll_s=poll_s,
+            stderr=stderr,
+        )
+
+    async with serve(handler, bind.host, bind.port):
+        stdout.write(
+            f"visibility-tail websocket listening on ws://{bind.host}:{bind.port}\n"
+        )
+        stdout.flush()
+        await asyncio.Future()
+    return 0
+
+
 def main(
     argv: list[str] | None = None,
     *,
@@ -596,6 +781,24 @@ def main(
     out = stdout if stdout is not None else sys.stdout
     err = stderr if stderr is not None else sys.stderr
     filter_kinds = _split_filter_kinds(args.filter_kind)
+    if args.serve is not None:
+        try:
+            return asyncio.run(
+                _serve_visibility_tail(
+                    bind=args.serve,
+                    team=args.team,
+                    agent=args.agent,
+                    filter_kinds=filter_kinds,
+                    since=args.since,
+                    from_start=args.from_start,
+                    poll_s=args.poll_s,
+                    allow_remote=args.allow_remote,
+                    stdout=out,
+                    stderr=err,
+                )
+            )
+        except KeyboardInterrupt:
+            return 130
     color = (
         not args.json
         and not args.no_color

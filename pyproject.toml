@@ -25,6 +25,8 @@ dependencies = [
     # Event-driven teammate inbox wakeups: mirrors aproto-codex-bridge's
     # fs.watch-on-inbox-dir pattern with basename filtering.
     "watchfiles>=1.0",
+    # Tiny WebSocket projection for `visibility-tail --serve`.
+    "websockets>=12",
 ]
 
 [dependency-groups]
