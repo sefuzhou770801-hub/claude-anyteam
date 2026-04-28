@@ -187,6 +187,32 @@ def test_fragment_drops_when_peer_deregisters():
     assert PERMISSION_BRIDGE_MARKER in fragment
 
 
+def test_peer_prompt_fragments_cache_serves_repeat_calls():
+    """Phase4 #61: composition is cached per (requester, manifest-keys, version-tuple).
+
+    Per-turn invocation calls peer_prompt_fragments_for repeatedly with no
+    manifest change in between. The composition is microsecond-scale per the
+    #60 micro-benchmark, but caching makes the no-op path explicit and gives
+    operators confidence the substrate isn't doing redundant work on a hot
+    path. The cache invariant: repeat calls with no version change return
+    the SAME object (identity, not just equality), and any version change
+    invalidates the cache.
+    """
+
+    cache = _cache()
+    first = cache.peer_prompt_fragments_for(SELF)
+    second = cache.peer_prompt_fragments_for(SELF)
+    # Identity check — repeat call hits the cache, no recomposition.
+    assert first is second
+
+    # Mutating manifests dict (key removal) changes the manifest-keys
+    # tuple in the cache_key → cache miss → fresh composition.
+    del cache.manifests["codex-peer"]
+    third = cache.peer_prompt_fragments_for(SELF)
+    assert third is not first
+    assert THREAD_FORK_MARKER not in third
+
+
 def test_codex_task_prompt_excludes_self():
     fragment = _fragment()
     prompt = codex_prompts.v7_task_prompt(

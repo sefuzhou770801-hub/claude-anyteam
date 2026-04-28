@@ -497,6 +497,15 @@ class CapabilityManifestCache:
     root: Path = TEAMS_ROOT
     manifests: dict[str, dict[str, Any]] = field(default_factory=dict)
     capability_versions: dict[str, str] = field(default_factory=dict)
+    # Phase4 #61: cache R14 prompt-fragment composition keyed by
+    # (requester, capability_versions tuple). Composition costs ~81μs per call
+    # in the codex-profiler micro-benchmark (#60); not load-bearing on its own,
+    # but the cache simplifies any future per-turn invocation analysis and
+    # makes invalidation explicit. Invalidated whenever capability_versions
+    # changes (via apply_update / refresh_from_inbox / entries setter).
+    _peer_fragments_cache: dict[tuple[str, tuple[tuple[str, str], ...]], str] = field(
+        default_factory=dict, repr=False
+    )
 
     @property
     def entries(self) -> dict[str, dict[str, Any]]:
@@ -591,6 +600,32 @@ class CapabilityManifestCache:
         return self.manifests.get(agent_name)
 
     def peer_prompt_fragments_for(self, requester: str) -> str:
-        """Return R14 peer-capability prompt fragments for ``requester``."""
+        """Return R14 peer-capability prompt fragments for ``requester``.
 
-        return peer_prompt_fragments_for(requester, self)
+        Phase4 #61: memoize the composed text per ``(requester, version_tuple)``
+        so consecutive per-turn calls for the same manifest state don't re-run
+        the (~81μs) composition. The cache invalidates automatically because
+        the version_tuple changes whenever any peer's manifest version changes
+        — apply_update / refresh_from_inbox / entries-setter all rewrite
+        ``capability_versions``. The cache is also bounded: with N peers, at
+        most one entry per requester per version-set is held; in practice that
+        is one entry per requester per session.
+        """
+
+        # Cache key includes (a) the requester, (b) the full set of peer
+        # names currently in the manifest map, and (c) the version of each
+        # peer's manifest. Direct mutation of `self.manifests` (e.g. `del
+        # cache.manifests[name]`, observed in tests) bypasses the proper
+        # apply_update / entries-setter paths that maintain
+        # capability_versions; including the manifest key set in the cache
+        # key catches that case so removed peers don't linger in the
+        # composed fragment.
+        manifest_keys = tuple(sorted(self.manifests))
+        version_key = tuple(sorted(self.capability_versions.items()))
+        cache_key = (requester, manifest_keys, version_key)
+        cached = self._peer_fragments_cache.get(cache_key)
+        if cached is not None:
+            return cached
+        composed = peer_prompt_fragments_for(requester, self)
+        self._peer_fragments_cache[cache_key] = composed
+        return composed
