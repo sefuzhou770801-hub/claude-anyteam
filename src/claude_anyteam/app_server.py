@@ -29,6 +29,7 @@ class AppServerClient(JsonRpcStdioClient):
             stderr_log_prefix="app_server.stderr",
         )
         self._error_cls = AppServerError
+        self.last_thread_result: dict[str, Any] | None = None
 
     # ---- transport health / restart ---------------------------------------
 
@@ -178,6 +179,7 @@ class AppServerClient(JsonRpcStdioClient):
         if model is not None:
             params["model"] = model
         result = self.request("thread/start", params)
+        self.last_thread_result = result if isinstance(result, dict) else None
         return result["thread"]["id"] if isinstance(result.get("thread"), dict) else result["threadId"]
 
     def turn_start(
@@ -273,6 +275,7 @@ class AppServerClient(JsonRpcStdioClient):
             params["model"] = model
         try:
             result = self.request("thread/fork", params)
+            self.last_thread_result = result if isinstance(result, dict) else None
         except AppServerError as e:
             msg = str(e).lower()
             if "no rollout found" in msg or "not materialized" in msg:
@@ -345,6 +348,7 @@ class AppServerClient(JsonRpcStdioClient):
         if model is not None:
             params["model"] = model
         result = self.request("thread/resume", params)
+        self.last_thread_result = result if isinstance(result, dict) else None
         if not isinstance(result, dict):
             raise AppServerError(f"thread/resume response was not an object: {result}")
         if _thread_id_from_result(result) is None:

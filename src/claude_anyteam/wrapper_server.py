@@ -62,6 +62,7 @@ from .messages import (
     parse_protocol_text,
 )
 from . import protocol_io
+from .wrapper_mcp_diagnostics import append_wrapper_mcp_diagnostic
 from claude_teams import messaging as _cs_messaging  # type: ignore[import-untyped]
 from claude_teams import tasks as _cs_tasks  # type: ignore[import-untyped]
 from claude_teams import teams as _cs_teams  # type: ignore[import-untyped]
@@ -426,6 +427,40 @@ def _cwd_scope(argv: list[str] | None = None) -> Path:
 
 
 
+def _registered_tool_names(mcp: FastMCP) -> list[str]:
+    """Best-effort snapshot of FastMCP's local registered tool names."""
+
+    provider = getattr(mcp, "_local_provider", None)
+    components = getattr(provider, "_components", {})
+    names: list[str] = []
+    if isinstance(components, dict):
+        for key, component in components.items():
+            name = getattr(component, "name", None)
+            if isinstance(name, str) and name:
+                names.append(name)
+                continue
+            if isinstance(key, str) and key.startswith("tool:"):
+                names.append(key.removeprefix("tool:").split("@", 1)[0])
+    return sorted(set(names))
+
+
+def _tool_snapshot_payload(tools: list[str] | tuple[str, ...]) -> dict[str, Any]:
+    observed = sorted(set(tools))
+    expected = list(EXPOSED_TOOLS)
+    return {
+        "tools": observed,
+        "tool_count": len(observed),
+        "expected_tools": expected,
+        "expected_tool_count": len(expected),
+        "missing_expected_tools": [tool for tool in expected if tool not in observed],
+        "unexpected_tools": [tool for tool in observed if tool not in expected],
+        "send_message_registered": "send_message" in observed,
+        "task_update_registered": "task_update" in observed,
+        "read_config_registered": "read_config" in observed,
+    }
+
+
+
 def _decode_bytes(data: bytes) -> tuple[str, str]:
     """Decode arbitrary file/HTTP bytes without raising on bad text."""
     for encoding in ("utf-8", "utf-16"):
@@ -655,6 +690,66 @@ def build_server(argv: list[str] | None = None) -> FastMCP:
             "Python adapter owns those."
         ),
     )
+
+    diagnostics_root = _cs_teams.TEAMS_DIR
+
+    def _log_mcp_diag(event: str, payload: dict[str, Any] | None = None) -> None:
+        append_wrapper_mcp_diagnostic(
+            team=team,
+            agent=self_name,
+            event=event,
+            payload=payload,
+            root=diagnostics_root,
+        )
+
+    _log_mcp_diag(
+        "server_build_start",
+        {
+            "argv": list(argv) if argv is not None else sys.argv[1:],
+            "task_id": wrapper_task_id,
+            "expected_tools": list(EXPOSED_TOOLS),
+        },
+    )
+
+    original_list_tools = mcp.list_tools
+
+    async def _diagnostic_list_tools(*, run_middleware: bool = True):
+        started_at = time.monotonic()
+        try:
+            tools = await original_list_tools(run_middleware=run_middleware)
+        except Exception as exc:
+            if run_middleware:
+                _log_mcp_diag(
+                    "list_tools_failed",
+                    {
+                        "duration_ms": max(0, int((time.monotonic() - started_at) * 1000)),
+                        "error_class": exc.__class__.__name__,
+                        "error": _preview(str(exc), limit=600),
+                        "registered_snapshot": _tool_snapshot_payload(_registered_tool_names(mcp)),
+                    },
+                )
+            raise
+        if run_middleware:
+            names = sorted(
+                name
+                for name in (getattr(tool, "name", None) for tool in tools)
+                if isinstance(name, str) and name
+            )
+            payload = _tool_snapshot_payload(names)
+            payload["duration_ms"] = max(0, int((time.monotonic() - started_at) * 1000))
+            payload["registered_snapshot"] = _tool_snapshot_payload(_registered_tool_names(mcp))
+            _log_mcp_diag("list_tools", payload)
+        return tools
+
+    mcp.list_tools = _diagnostic_list_tools  # type: ignore[method-assign]
+
+    def register_mcp_tool(func: _F) -> Any:
+        tool = mcp.tool(func)
+        name = getattr(tool, "name", None) or getattr(func, "__name__", "<unknown>")
+        payload = _tool_snapshot_payload(_registered_tool_names(mcp))
+        payload["registered_tool"] = name
+        _log_mcp_diag("register_tool", payload)
+        return tool
 
     manifest_cache = CapabilityManifestCache(
         team,
@@ -930,6 +1025,14 @@ def build_server(argv: list[str] | None = None) -> FastMCP:
                 bound_args = _bind_tool_arguments(signature, args, kwargs)
                 target = _tool_target(tool_name, bound_args)
                 started_at = time.monotonic()
+                _log_mcp_diag(
+                    "call_tool_started",
+                    {
+                        "tool_name": tool_name,
+                        "category": category,
+                        "target": target,
+                    },
+                )
                 _emit_tool_event(
                     tool_name=tool_name,
                     category=category,
@@ -946,6 +1049,17 @@ def build_server(argv: list[str] | None = None) -> FastMCP:
                         target=target,
                         started_at=started_at,
                         exc=exc,
+                    )
+                    _log_mcp_diag(
+                        "call_tool_failed",
+                        {
+                            "tool_name": tool_name,
+                            "category": category,
+                            "target": target,
+                            "duration_ms": max(0, int((time.monotonic() - started_at) * 1000)),
+                            "error_class": exc.__class__.__name__,
+                            "error": _preview(str(exc), limit=600),
+                        },
                     )
                     if not isinstance(exc, PeerSteerManifestCheckError):
                         _emit_visibility_degraded(
@@ -971,6 +1085,17 @@ def build_server(argv: list[str] | None = None) -> FastMCP:
                         if exit_code is not None
                         else f"{tool_name} returned an error result"
                     )
+                    _log_mcp_diag(
+                        "call_tool_failed_result",
+                        {
+                            "tool_name": tool_name,
+                            "category": category,
+                            "target": target,
+                            "duration_ms": max(0, int((time.monotonic() - started_at) * 1000)),
+                            "reason": reason,
+                            "exit_code": exit_code,
+                        },
+                    )
                     _emit_visibility_degraded(
                         tool_name=tool_name,
                         category=category,
@@ -987,6 +1112,16 @@ def build_server(argv: list[str] | None = None) -> FastMCP:
                     started_at=started_at,
                     result=result,
                 )
+                _log_mcp_diag(
+                    "call_tool_completed",
+                    {
+                        "tool_name": tool_name,
+                        "category": category,
+                        "target": target,
+                        "duration_ms": max(0, int((time.monotonic() - started_at) * 1000)),
+                        "result": _tool_result_payload(result),
+                    },
+                )
                 return result
 
             setattr(wrapper, "__anyteam_instrumented_category__", category)
@@ -994,7 +1129,7 @@ def build_server(argv: list[str] | None = None) -> FastMCP:
 
         return decorate
 
-    @mcp.tool
+    @register_mcp_tool
     @instrumented_tool(category="team_tool")
     def mcp_anyteam_capability_manifest(
         agent_name: str,
@@ -1063,7 +1198,7 @@ def build_server(argv: list[str] | None = None) -> FastMCP:
         _record_manifest_query(agent_name)
         return entry
 
-    @mcp.tool
+    @register_mcp_tool
     @instrumented_tool(category="team_tool")
     def send_message(
         to: str,
@@ -1205,7 +1340,7 @@ def build_server(argv: list[str] | None = None) -> FastMCP:
             )
         return result
 
-    @mcp.tool
+    @register_mcp_tool
     @instrumented_tool(category="team_tool")
     def task_update(
         task_id: str,
@@ -1264,7 +1399,7 @@ def build_server(argv: list[str] | None = None) -> FastMCP:
             response["parentTaskId"] = parent_task_id
         return response
 
-    @mcp.tool
+    @register_mcp_tool
     @instrumented_tool(category="team_tool")
     def checkpoint_commit(message: str) -> dict:
         """Commit incremental work in this teammate's git repository.
@@ -1434,7 +1569,7 @@ def build_server(argv: list[str] | None = None) -> FastMCP:
                 payload[camel_key] = str(value)
         return BatchSummaryChild.model_validate(payload)
 
-    @mcp.tool
+    @register_mcp_tool
     @instrumented_tool(category="team_tool")
     def task_batch_summary(
         parent_task_id: str,
@@ -1488,7 +1623,7 @@ def build_server(argv: list[str] | None = None) -> FastMCP:
         _fanout_visibility_event(event, mailbox=True)
         return event.model_dump(by_alias=True, exclude_none=True)
 
-    @mcp.tool
+    @register_mcp_tool
     @instrumented_tool(category="team_tool")
     def read_inbox(unread_only: bool = True) -> list[dict]:
         """Read your own inbox. Useful if you want to see whether a
@@ -1511,7 +1646,7 @@ def build_server(argv: list[str] | None = None) -> FastMCP:
         )
         return [m.model_dump(by_alias=True, exclude_none=True) for m in msgs]
 
-    @mcp.tool
+    @register_mcp_tool
     @instrumented_tool(category="team_tool")
     def task_list() -> list[dict]:
         """List all tasks in your team with current status and owners."""
@@ -1521,7 +1656,7 @@ def build_server(argv: list[str] | None = None) -> FastMCP:
             raise ToolError(str(e))
         return [t.model_dump(by_alias=True, exclude_none=True) for t in result]
 
-    @mcp.tool
+    @register_mcp_tool
     @instrumented_tool(category="shadow_tool")
     def mcp_anyteam_shell(
         command: str,
@@ -1554,7 +1689,7 @@ def build_server(argv: list[str] | None = None) -> FastMCP:
         }
 
 
-    @mcp.tool
+    @register_mcp_tool
     @instrumented_tool(category="shadow_tool")
     def mcp_anyteam_read_file(path: str, offset: int = 0, limit: int | None = None) -> dict:
         """Read a local file as text with safe decoding fallback.
@@ -1587,7 +1722,7 @@ def build_server(argv: list[str] | None = None) -> FastMCP:
             "truncated": limit is not None and offset + limit < len(lines),
         }
 
-    @mcp.tool
+    @register_mcp_tool
     @instrumented_tool(category="shadow_tool")
     def mcp_anyteam_write_file(
         path: str,
@@ -1622,7 +1757,7 @@ def build_server(argv: list[str] | None = None) -> FastMCP:
             "bytes_written": len(content.encode("utf-8")),
         }
 
-    @mcp.tool
+    @register_mcp_tool
     @instrumented_tool(category="shadow_tool")
     def mcp_anyteam_list_directory(path: str, recursive: bool = False, glob: str | None = None) -> dict:
         """List directory entries with optional recursion and glob filtering.
@@ -1650,7 +1785,7 @@ def build_server(argv: list[str] | None = None) -> FastMCP:
         entries.sort(key=lambda item: item.get("path", ""))
         return {"path": str(root), "recursive": recursive, "glob": glob, "entries": entries}
 
-    @mcp.tool
+    @register_mcp_tool
     @instrumented_tool(category="shadow_tool")
     def mcp_anyteam_edit_file(path: str, old: str, new: str, replace_all: bool = False) -> dict:
         """Replace an exact string in a text file and return the replacement count.
@@ -1679,7 +1814,7 @@ def build_server(argv: list[str] | None = None) -> FastMCP:
             raise ToolError(str(e))
         return {"path": str(file_path), "replacements": count if replace_all else 1, "encoding_read": encoding}
 
-    @mcp.tool
+    @register_mcp_tool
     @instrumented_tool(category="shadow_tool")
     def mcp_anyteam_search(
         pattern: str,
@@ -1722,7 +1857,7 @@ def build_server(argv: list[str] | None = None) -> FastMCP:
                     })
         return {"pattern": pattern, "path": str(root), "regex": regex, "glob": glob, "matches": matches}
 
-    @mcp.tool
+    @register_mcp_tool
     @instrumented_tool(category="shadow_tool")
     def mcp_anyteam_grep(regex: str, directory: str) -> dict:
         """Recursively grep a directory with a regular expression.
@@ -1763,7 +1898,7 @@ def build_server(argv: list[str] | None = None) -> FastMCP:
                     )
         return {"regex": regex, "directory": str(root), "matches": matches}
 
-    @mcp.tool
+    @register_mcp_tool
     @instrumented_tool(category="shadow_tool")
     def mcp_anyteam_web_fetch(
         url: str,
@@ -1807,7 +1942,7 @@ def build_server(argv: list[str] | None = None) -> FastMCP:
         except (urllib.error.URLError, OSError) as e:
             raise ToolError(str(e))
 
-    @mcp.tool
+    @register_mcp_tool
     @instrumented_tool(category="team_tool")
     def read_config() -> dict:
         """Read the team config — useful to discover teammate names and
@@ -1836,6 +1971,8 @@ def build_server(argv: list[str] | None = None) -> FastMCP:
             self_manifest=manifest_cache.get(self_name),
         )
         return data
+
+    _log_mcp_diag("server_registered_snapshot", _tool_snapshot_payload(_registered_tool_names(mcp)))
 
     return mcp
 

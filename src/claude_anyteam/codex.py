@@ -50,6 +50,7 @@ from .env import (
 from .headless_visibility import HeadlessTurnVisibility, coerce_stream_text
 from .messages import VisibilityEvent
 from .prompts import TEAM_MESSAGING_BLOCK
+from .wrapper_mcp_diagnostics import append_wrapper_mcp_diagnostic
 
 # R1 (09 §3.1): schema files are versioned wire
 # assets, so resolve them as package resources instead of walking relative to
@@ -114,6 +115,83 @@ _WRAPPER_TOOL_NAMES = frozenset({
     "task_list",
     "read_config",
 })
+
+# Keep this diagnostic snapshot in sync with wrapper_server.EXPOSED_TOOLS.
+# Duplicated here intentionally so codex.py can log session-start state
+# without importing FastMCP/wrapper_server on the hot path.
+_WRAPPER_EXPECTED_TOOL_NAMES = (
+    "send_message",
+    "task_update",
+    "task_create",
+    "task_batch_summary",
+    "read_inbox",
+    "task_list",
+    "read_config",
+    "mcp_anyteam_capability_manifest",
+    "mcp_anyteam_shell",
+    "mcp_anyteam_read_file",
+    "mcp_anyteam_write_file",
+    "mcp_anyteam_list_directory",
+    "mcp_anyteam_edit_file",
+    "mcp_anyteam_search",
+    "mcp_anyteam_grep",
+    "mcp_anyteam_web_fetch",
+)
+
+
+
+def _bounded_preview(value: Any, *, limit: int = 1000) -> Any:
+    if value is None or isinstance(value, (bool, int, float)):
+        return value
+    if isinstance(value, str):
+        return value if len(value) <= limit else value[: limit - 1] + "…"
+    if isinstance(value, (list, tuple)):
+        return [_bounded_preview(item, limit=limit) for item in list(value)[:30]]
+    if isinstance(value, dict):
+        return {
+            str(k): _bounded_preview(v, limit=limit)
+            for k, v in list(value.items())[:50]
+        }
+    return _bounded_preview(repr(value), limit=limit)
+
+
+def _toolish_fields(value: Any, *, depth: int = 0, path: str = "") -> dict[str, Any]:
+    """Extract bounded tool/MCP-looking fields from App Server responses."""
+
+    if depth > 5:
+        return {}
+    found: dict[str, Any] = {}
+    if isinstance(value, dict):
+        for key, child in value.items():
+            child_path = f"{path}.{key}" if path else str(key)
+            key_l = str(key).lower()
+            if any(fragment in key_l for fragment in ("tool", "mcp", "server")):
+                found[child_path] = _bounded_preview(child)
+            found.update(_toolish_fields(child, depth=depth + 1, path=child_path))
+    elif isinstance(value, list):
+        for index, child in enumerate(value[:20]):
+            found.update(_toolish_fields(child, depth=depth + 1, path=f"{path}[{index}]"))
+    return found
+
+
+def _log_codex_tool_snapshot(
+    *,
+    team: str | None,
+    agent: str | None,
+    event: str,
+    payload: dict[str, Any],
+) -> None:
+    if not team or not agent:
+        return
+    append_wrapper_mcp_diagnostic(
+        team=team,
+        agent=agent,
+        event=event,
+        payload={
+            "expected_wrapper_tools": list(_WRAPPER_EXPECTED_TOOL_NAMES),
+            **payload,
+        },
+    )
 
 
 def _normalise(s: str) -> str:
@@ -502,6 +580,21 @@ def run(
         cwd=str(cwd),
         schema=str(schema) if schema else None,
         mcp_wrapper=bool(wrapper_identity),
+    )
+    _log_codex_tool_snapshot(
+        team=visibility_team,
+        agent=visibility_agent,
+        event="codex_exec_session_start",
+        payload={
+            "cwd": str(cwd),
+            "schema": str(schema) if schema else None,
+            "task_id": task_id,
+            "resume_session_id": resume_session_id,
+            "model": model,
+            "effort": effort,
+            "extra_args": list(extra_args or []),
+            "mcp_wrapper_configured": bool(wrapper_identity),
+        },
     )
 
     events: list[dict[str, Any]] = []
@@ -1282,6 +1375,17 @@ def app_server_invoke(
             }
         }
     }
+    _log_codex_tool_snapshot(
+        team=settings_team,
+        agent=settings_agent,
+        event="codex_app_server_mcp_config_prepared",
+        payload={
+            "task_id": task_id,
+            "wrapper_binary": wrapper_binary,
+            "wrapper_args": wrapper_args,
+            "mcp_config": mcp_config,
+        },
+    )
 
     # Common thread-start kwargs shared between fresh-start and fork paths.
     thread_kwargs: dict[str, Any] = {
@@ -1312,6 +1416,21 @@ def app_server_invoke(
             client,
             resume_thread_id=resume_thread_id,
             thread_kwargs=thread_kwargs,
+        )
+        thread_snapshot = getattr(client, "last_thread_result", None)
+        _log_codex_tool_snapshot(
+            team=settings_team,
+            agent=settings_agent,
+            event="codex_app_server_session_start",
+            payload={
+                "thread_id": thread_id,
+                "resume_thread_id": resume_thread_id,
+                "task_id": task_id,
+                "model": model,
+                "effort": effort,
+                "mcp_config": mcp_config,
+                "thread_response_toolish_fields": _toolish_fields(thread_snapshot),
+            },
         )
 
         current_turn_id = client.turn_start(
