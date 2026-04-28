@@ -527,6 +527,132 @@ def _prose_fallback_reply(
     )
 
 
+def _claims_send_message_unavailable(text: str | None) -> bool:
+    """Return True for the recurring invalid "send_message is missing" prose.
+
+    #51 diagnostics showed the wrapper MCP still advertises ``send_message``
+    when this prose appears. Treat it as a model-output flap, not a valid
+    teammate reply to relay.
+    """
+
+    if not isinstance(text, str) or not text.strip():
+        return False
+    lowered = " ".join(text.lower().split())
+    if "send_message" not in lowered and "send message" not in lowered:
+        return False
+    if "mcp" not in lowered and "tool" not in lowered:
+        return False
+
+    direct_markers = (
+        "don't have",
+        "do not have",
+        "don't see",
+        "do not see",
+        "cannot access",
+        "can't access",
+        "unable to access",
+        "not exposed",
+        "not registered",
+        "not listed",
+        "missing",
+    )
+    if any(marker in lowered for marker in direct_markers):
+        return True
+    if "not available" in lowered or "isn't available" in lowered:
+        return True
+    if "no " in lowered and "available" in lowered:
+        return True
+    return False
+
+
+def _truncate_for_prompt(text: str, *, limit: int = 4000) -> str:
+    if len(text) <= limit:
+        return text
+    return text[: limit - 1] + "…"
+
+
+def _send_message_repair_prompt(
+    *,
+    original_prompt: str,
+    senders: list[str],
+    previous_reply: str,
+) -> str:
+    recipients = ", ".join(repr(sender) for sender in senders)
+    per_sender = (
+        f"Call send_message(to={senders[0]!r}, body=<brief helpful reply>) exactly once."
+        if len(senders) == 1
+        else (
+            "Call send_message once for each original sender "
+            f"({recipients}), with a brief helpful reply tailored to that sender."
+        )
+    )
+    return (
+        "Retry the previous teammate-DM response.\n\n"
+        "# Why this is a retry\n"
+        "Your previous final prose claimed that the `send_message` MCP tool "
+        "was unavailable. That claim is invalid for claude-anyteam Codex "
+        "sessions: the wrapper MCP exposes lowercase `send_message`, and "
+        "`read_config().protocol_tools.send_message` reports the exact visible "
+        "tool name if you need to verify it.\n\n"
+        "# Required repair action\n"
+        "Do not repeat or paraphrase the missing-tool claim. If uncertain, "
+        "first call read_config() and inspect protocol_tools. Then use the "
+        "actual MCP tool delivery path: "
+        f"{per_sender} Final assistant prose, if any, must be empty or only "
+        "say that the reply was sent via the team mailbox.\n\n"
+        "# Invalid previous final prose\n"
+        f"{_truncate_for_prompt(previous_reply, limit=1200)}\n\n"
+        "# Original prompt to answer\n"
+        f"{_truncate_for_prompt(original_prompt)}"
+    )
+
+
+def _suppressed_send_message_claim_result(result: Any, *, previous_reply: str):
+    """Synthetic failure result used when the repair path still flaps.
+
+    Feeding this through the existing diagnostics-backed prose fallback keeps
+    the sender informed without leaking the invalid "I don't have the tool"
+    claim back into teammate chat.
+    """
+
+    return codex_mod.CodexResult(
+        exit_code=1,
+        structured=None,
+        last_message="",
+        events=list(getattr(result, "events", []) or []),
+        error=(
+            "send_message not available hallucination suppressed; "
+            f"invalid final prose was: {_truncate_for_prompt(previous_reply, limit=500)}"
+        ),
+        tool_call_events=int(getattr(result, "tool_call_events", 0) or 0),
+        session_id=getattr(result, "session_id", None),
+    )
+
+
+def _retry_after_send_message_claim(
+    state: LoopState,
+    *,
+    original_prompt: str,
+    event_sink,
+    senders: list[str],
+    previous_reply: str,
+):
+    logger.warn(
+        "prose.send_message_unavailable_claim",
+        senders=senders,
+        reply_head=previous_reply[:160],
+    )
+    return _invoke_codex_prose(
+        state,
+        prompt=_send_message_repair_prompt(
+            original_prompt=original_prompt,
+            senders=senders,
+            previous_reply=previous_reply,
+        ),
+        event_sink=event_sink,
+    )
+
+
 def _handle_prose(state: LoopState, msg: Any) -> None:
     """Handle an inbound prose (non-protocol) message while idle.
 
@@ -560,10 +686,11 @@ def _handle_prose(state: LoopState, msg: Any) -> None:
     )
 
     reply: str | None = None
+    event_sink = _prose_visibility_event_sink(state)
     result, exc = _invoke_codex_prose(
         state,
         prompt=prompt,
-        event_sink=_prose_visibility_event_sink(state),
+        event_sink=event_sink,
     )
     if exc is not None:
         logger.warn("prose.codex_crash", sender=sender, error=str(exc))
@@ -576,7 +703,52 @@ def _handle_prose(state: LoopState, msg: Any) -> None:
             )
             return
         if result.exit_code == 0 and result.last_message:
-            reply = result.last_message
+            if _claims_send_message_unavailable(result.last_message):
+                invalid_reply = result.last_message
+                retry_result, retry_exc = _retry_after_send_message_claim(
+                    state,
+                    original_prompt=prompt,
+                    event_sink=event_sink,
+                    senders=[sender],
+                    previous_reply=invalid_reply,
+                )
+                if retry_exc is not None:
+                    logger.warn(
+                        "prose.send_message_repair_crash",
+                        sender=sender,
+                        error=str(retry_exc),
+                    )
+                    result = _suppressed_send_message_claim_result(
+                        result,
+                        previous_reply=invalid_reply,
+                    )
+                elif retry_result is not None:
+                    if pio.should_skip_prose_fallback(retry_result):
+                        logger.info(
+                            "prose.repaired_via_send_message_tool",
+                            sender=sender,
+                            tool_calls=getattr(retry_result, "tool_call_events", 0),
+                        )
+                        return
+                    result = retry_result
+                    if (
+                        retry_result.exit_code == 0
+                        and retry_result.last_message
+                        and not _claims_send_message_unavailable(retry_result.last_message)
+                    ):
+                        reply = retry_result.last_message
+                    else:
+                        result = _suppressed_send_message_claim_result(
+                            retry_result,
+                            previous_reply=invalid_reply,
+                        )
+                else:
+                    result = _suppressed_send_message_claim_result(
+                        result,
+                        previous_reply=invalid_reply,
+                    )
+            else:
+                reply = result.last_message
         else:
             logger.warn(
                 "prose.codex_fail",
@@ -658,10 +830,11 @@ def _handle_prose_batch(state: LoopState, messages: list[Any]) -> None:
         f"informational only — the per-sender deliveries happen via the tool."
     )
 
+    event_sink = _prose_visibility_event_sink(state)
     result, exc = _invoke_codex_prose(
         state,
         prompt=prompt,
-        event_sink=_prose_visibility_event_sink(state),
+        event_sink=event_sink,
     )
     if exc is not None:
         logger.warn("prose_batch.codex_crash", error=str(exc), count=len(messages))
@@ -672,6 +845,48 @@ def _handle_prose_batch(state: LoopState, messages: list[Any]) -> None:
             error=result.error,
             count=len(messages),
         )
+
+    if (
+        exc is None
+        and result is not None
+        and result.exit_code == 0
+        and result.last_message
+        and not pio.should_skip_prose_fallback(result)
+        and _claims_send_message_unavailable(result.last_message)
+    ):
+        invalid_reply = result.last_message
+        retry_result, retry_exc = _retry_after_send_message_claim(
+            state,
+            original_prompt=prompt,
+            event_sink=event_sink,
+            senders=senders,
+            previous_reply=invalid_reply,
+        )
+        if retry_exc is not None:
+            logger.warn(
+                "prose_batch.send_message_repair_crash",
+                error=str(retry_exc),
+                count=len(messages),
+            )
+            result = _suppressed_send_message_claim_result(
+                result,
+                previous_reply=invalid_reply,
+            )
+        elif retry_result is not None:
+            result = retry_result
+            if (
+                not pio.should_skip_prose_fallback(retry_result)
+                and _claims_send_message_unavailable(retry_result.last_message)
+            ):
+                result = _suppressed_send_message_claim_result(
+                    retry_result,
+                    previous_reply=invalid_reply,
+                )
+        else:
+            result = _suppressed_send_message_claim_result(
+                result,
+                previous_reply=invalid_reply,
+            )
 
     # Success path: Codex delivered per-sender via send_message tool calls.
     # When result is healthy and at least one tool call was emitted, we have

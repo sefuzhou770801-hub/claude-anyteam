@@ -200,13 +200,13 @@ def _normalise(s: str) -> str:
 
 def _event_mentions_wrapper_tool(ev: dict[str, Any]) -> bool:
     """True if the event carries (top-level or nested) a wrapper tool name."""
-    for key in ("name", "tool_name", "function_name"):
+    for key in ("name", "tool", "tool_name", "function_name"):
         val = ev.get(key)
         if isinstance(val, str) and val in _WRAPPER_TOOL_NAMES:
             return True
     item = ev.get("item")
     if isinstance(item, dict):
-        for key in ("name", "tool_name", "function_name"):
+        for key in ("name", "tool", "tool_name", "function_name"):
             val = item.get(key)
             if isinstance(val, str) and val in _WRAPPER_TOOL_NAMES:
                 return True
@@ -235,13 +235,13 @@ def _tool_name_from_event(ev: dict[str, Any]) -> str | None:
     Returns None if the event doesn't carry a recognizable tool name; the
     raw event is still logged by the caller so forensics aren't lost.
     """
-    for key in ("name", "tool_name", "function_name"):
+    for key in ("name", "tool", "tool_name", "function_name"):
         val = ev.get(key)
         if isinstance(val, str) and val:
             return val
     item = ev.get("item")
     if isinstance(item, dict):
-        for key in ("name", "tool_name", "function_name"):
+        for key in ("name", "tool", "tool_name", "function_name"):
             val = item.get(key)
             if isinstance(val, str) and val:
                 return val

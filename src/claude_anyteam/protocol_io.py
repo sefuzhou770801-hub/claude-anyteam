@@ -79,7 +79,7 @@ def _event_mentions_send_message_tool(value: Any) -> bool:
     result classes.
     """
     if isinstance(value, dict):
-        for key in ("name", "tool_name", "function_name"):
+        for key in ("name", "tool", "tool_name", "function_name"):
             if _is_send_message_tool_name(value.get(key)):
                 return True
         function = value.get("function")
