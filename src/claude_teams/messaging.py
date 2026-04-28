@@ -4,7 +4,9 @@ import hashlib
 import json
 import os
 import re
+import threading
 import time
+from collections import defaultdict
 from datetime import datetime, timezone
 from pathlib import Path
 from uuid import uuid4
@@ -278,6 +280,173 @@ def append_message(
         raw_list.append(stored_message.model_dump(by_alias=True, exclude_none=True))
         path.write_text(json.dumps(raw_list))
         return stored_message
+
+
+def append_messages_batch(
+    team_name: str,
+    agent_name: str,
+    messages: list[InboxMessage],
+    base_dir: Path | None = None,
+) -> list[InboxMessage]:
+    """Atomically append N messages to ``agent_name``'s inbox under one lock.
+
+    Phase4 #35 (2026-04-28): aproto-codex-bridge's MessageRouter micro-batches
+    sends per recipient with a 50ms debounce window. The single-message
+    ``append_message`` acquires + releases the inbox filelock per call; under
+    visibility-storm fan-out (one high-volume sender, many fast events), the
+    lock churn dominates. ``append_messages_batch`` collapses N writes into
+    one lock acquisition + one read-modify-write of the JSON file.
+
+    Each message is independently spilled to an artifact if its body exceeds
+    the configured threshold, so the per-message attachment contract from
+    #36 is preserved exactly.
+
+    Empty ``messages`` is a no-op (returns ``[]`` without taking the lock).
+    """
+
+    if not messages:
+        return []
+    path = ensure_inbox(team_name, agent_name, base_dir)
+    lock_path = path.parent / ".lock"
+
+    stored: list[InboxMessage] = []
+    with file_lock(lock_path):
+        raw_list = json.loads(path.read_text())
+        for message in messages:
+            stored_message = _spill_message_if_needed(
+                team_name,
+                agent_name,
+                message,
+                base_dir=base_dir,
+            )
+            stored.append(stored_message)
+            raw_list.append(
+                stored_message.model_dump(by_alias=True, exclude_none=True)
+            )
+        path.write_text(json.dumps(raw_list))
+    return stored
+
+
+DEFAULT_DEBOUNCE_S = 0.05  # 50ms — matches aproto-codex-bridge MessageRouter
+
+
+class BatchedSender:
+    """Per-target micro-batching writer for high-volume inbox fan-out.
+
+    Phase4 #35: ``BatchedSender.send(team, recipient, message)`` enqueues the
+    message into a per-recipient buffer and schedules a flush after
+    ``debounce_s`` seconds. Subsequent calls within the window extend the
+    batch instead of acquiring the inbox filelock per message. ``flush()``
+    forces immediate writes for tests / time-sensitive callers, and
+    ``close()`` drains everything before exit.
+
+    Existing single-message senders remain synchronous; this class is
+    additive for callers that opt in (e.g. visibility-event fan-out, where
+    one tool call may produce many small inbox writes).
+
+    The enqueue path itself is synchronous in observable side effects: the
+    *only* thing the recipient observes later is the inbox file mtime/size
+    change. ``BatchedSender`` does not change the data layout, the lock
+    semantics during the actual flush (still one ``file_lock`` per batch),
+    or any ordering invariant within a single (team, recipient) pair.
+    """
+
+    def __init__(
+        self,
+        *,
+        debounce_s: float = DEFAULT_DEBOUNCE_S,
+        base_dir: Path | None = None,
+    ) -> None:
+        self._debounce_s = max(0.0, float(debounce_s))
+        self._base_dir = base_dir
+        self._lock = threading.Lock()
+        self._buffers: dict[
+            tuple[str, str], list[InboxMessage]
+        ] = defaultdict(list)
+        self._timers: dict[tuple[str, str], threading.Timer] = {}
+        self._closed = False
+
+    @property
+    def debounce_s(self) -> float:
+        return self._debounce_s
+
+    def send(
+        self, team_name: str, recipient: str, message: InboxMessage
+    ) -> None:
+        """Enqueue ``message`` for ``recipient``; flush after debounce window."""
+
+        if self._closed:
+            # Closed sender refuses new work — caller must use append_message
+            # synchronously for shutdown-time messaging.
+            raise RuntimeError("BatchedSender is closed")
+        key = (team_name, recipient)
+        with self._lock:
+            self._buffers[key].append(message)
+            existing_timer = self._timers.get(key)
+        if existing_timer is None and self._debounce_s > 0:
+            timer = threading.Timer(self._debounce_s, self._flush_key, args=(key,))
+            timer.daemon = True
+            with self._lock:
+                # Race: another thread may have scheduled while we held nothing.
+                if key not in self._timers:
+                    self._timers[key] = timer
+                    timer.start()
+                else:
+                    timer = None
+        if self._debounce_s == 0:
+            # Zero debounce = synchronous flush; primarily for tests.
+            self._flush_key(key)
+
+    def flush(
+        self, team_name: str | None = None, recipient: str | None = None
+    ) -> None:
+        """Force immediate flush of buffered messages.
+
+        With no args, flushes all pending targets. Otherwise filters to the
+        specific (team, recipient) pair. Useful for tests / lifecycle events
+        that need synchronous visibility semantics.
+        """
+
+        with self._lock:
+            keys = list(self._buffers.keys())
+            if team_name is not None or recipient is not None:
+                keys = [
+                    k
+                    for k in keys
+                    if (team_name is None or k[0] == team_name)
+                    and (recipient is None or k[1] == recipient)
+                ]
+        for key in keys:
+            self._flush_key(key)
+
+    def close(self) -> None:
+        """Drain all buffers; refuse subsequent ``send()`` calls."""
+
+        self.flush()
+        with self._lock:
+            self._closed = True
+            timers = list(self._timers.values())
+            self._timers.clear()
+        for timer in timers:
+            timer.cancel()
+
+    def _flush_key(self, key: tuple[str, str]) -> None:
+        with self._lock:
+            messages = self._buffers.pop(key, [])
+            timer = self._timers.pop(key, None)
+        if timer is not None:
+            timer.cancel()
+        if not messages:
+            return
+        team_name, recipient = key
+        try:
+            append_messages_batch(team_name, recipient, messages, self._base_dir)
+        except Exception:
+            # Re-buffer on failure so a transient error doesn't drop messages
+            # silently; next flush attempt picks them up.
+            with self._lock:
+                self._buffers[key] = messages + self._buffers.get(key, [])
+            raise
 
 
 def send_plain_message(
