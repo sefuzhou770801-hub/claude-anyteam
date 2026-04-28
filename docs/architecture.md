@@ -1,9 +1,5 @@
 # Architecture
 
-claude-anyteam is now a multi-backend spawn-shim adapter. The same Claude Code teammate pane path provides TUI presence; backend routing is selected by teammate name (`codex-*`, `gemini-*`, or `kimi-*`). Codex retains its app-server path for mid-turn steering. Gemini and Kimi both use CLI-native transports with documented non-parity where their CLIs differ from Codex.
-
-# Architecture
-
 claude-anyteam is a protocol adapter, not an LLM wrapper. It lets external coding agents participate in Claude Code's [Agent Teams](https://code.claude.com/docs/en/agent-teams) protocol as first-class teammates without routing their reasoning through a Claude instance.
 
 ## The core principle: the harness IS the teammate
@@ -24,6 +20,20 @@ This implies two distinct protocol layers — see [CLAUDE.md §1 "The two layers
 - **Capability** is per-harness: identity declaration, typed capability inventory (`turn_steer`, `thread_fork`, `permission_bridge`, `live_tool_events`, `large_context`, `native_swarm`, …), invocation schemas, and semantic guidance (when to use, when not to, failure modes). Lightweight flags live in `config.json` for roster discovery; the rich manifest is exposed via the wrapper MCP and loaded into peer context on demand — same precedent that already works for MCP tool descriptions, extended one level up.
 
 The router-style alternative (proxy `ANTHROPIC_BASE_URL`, route through a single session loop, expose multiple models from one harness) loses every harness-specific feature: no Codex App Server, no Gemini ACP permission bridge, no Kimi swarm. It also has no capability layer at all — every teammate gets the host's tool surface, period. To match the claude-anyteam differentiator a router would have to throw out its session loop and rebuild around external process orchestration; at that point it is no longer a router.
+
+## Proto-rev substrate primitives by north star
+
+The 2026-04-28 closure set adds concrete substrate primitives that operationalize the three north stars from `CLAUDE.md`. Each paragraph below names the code surface, the comparison-matrix lift ID from `references/external-claude-code-re/proto-rev-execution-log/research-digest/_comparison-matrix.md`, and the source pattern it adopts.
+
+### §1 Harness-preserving capability substrate
+
+**Startup capability-manifest prewarm and bounded supervisor.** Every routed teammate writes a rich Agent Card at registration and broadcasts `capability_manifest_updated` before peers try to invoke harness-specific primitives (`src/claude_anyteam/registration.py:224-239`). Codex, Gemini, Kimi, and the wrapper MCP all call `CapabilityManifestCache.load_startup()` before normal inbox/tool handling (`src/claude_anyteam/loop.py:171-179`, `src/claude_anyteam/backends/gemini/loop.py:127-137`, `src/claude_anyteam/backends/kimi/loop.py:94-104`, `src/claude_anyteam/wrapper_server.py:582-587`), and the cache loader walks the roster through bounded `ThreadPoolExecutor` fan-out with per-manifest timeouts (`src/claude_anyteam/capability_manifest.py:204-220`, `src/claude_anyteam/capability_manifest.py:241-317`, `src/claude_anyteam/capability_manifest.py:522-554`). Matrix lifts **L2** and **L10**; source pattern: HydraTeams' pre-hydrated control context plus maorinka-claude-rs' bounded supervisor/channel prewarm, with clawcode's per-call MCP startup called out as the counterexample.
+
+**`read_config()` protocol-tool enumeration.** The wrapper exposes a self-healing `protocol_tools` object that computes the exact callable names for the caller's backend, including Gemini's `mcp_anyteam_*` prefix, and embeds direct entries for `send_message`, `read_config`, and capability lookup (`src/claude_anyteam/wrapper_server.py:231-270`). The `read_config()` MCP tool attaches that object to the sanitized team roster so a model can verify the protocol surface instead of hallucinating missing tools (`src/claude_anyteam/wrapper_server.py:1666-1692`). Matrix lift **L11**; source pattern: Piebald's ToolSearch/load-then-call and “look before assert” prompt pattern.
+
+**Capability hook registry validation.** Capability flags are treated as promises, not marketing copy: `CAPABILITY_HOOKS` ties each declared primitive to runtime paths and focused regression tests (`src/claude_anyteam/capabilities.py:72-87`), `assert_known_capabilities()` rejects unknown or unbacked roster flags (`src/claude_anyteam/capabilities.py:344-361`), and `validate_capability_manifest_entries()` requires schema, guidance, failure modes, and peer-callability before an Agent Card is written (`src/claude_anyteam/capabilities.py:377-430`). Matrix lift **L12**; source pattern: clawcode's advertised-but-ignored feature fields, maorinka's unregistered SendMessage drift, and Piebald's exact-context tool boundary as the validation bar.
+
+**Manifest-gated peer steer.** Peer-to-peer steer is opt-in and recipient-defined: the wrapper checks the recipient manifest before delivering `send_message(kind="steer")`, treats missing data as `manifest_not_queried`, and treats denied manifests as `manifest_denies_peer_steer` (`src/claude_anyteam/wrapper_server.py:738-775`, `src/claude_anyteam/wrapper_server.py:1052-1079`). The authorization bit is parsed conservatively from the rich Agent Card by `manifest_accepts_peer_steer()` (`src/claude_anyteam/capabilities.py:433-470`). Matrix lift **L5**; source pattern: aproto-codex-bridge's “all active-turn inbound becomes steer” anti-pattern, corrected with nwyin-cleanroom's typed lifecycle/authorization stance.
 
 ## The core insight
 
