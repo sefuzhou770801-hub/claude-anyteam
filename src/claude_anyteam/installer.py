@@ -2943,40 +2943,102 @@ def _signin_command(provider_key: str) -> tuple[str, str | None]:
     return (provider_key, None)
 
 
-def _format_signin_cta(
+def _install_command_for_provider(provider_key: str) -> tuple[str, str | None] | None:
+    """Returns (command, optional hint) for installing a missing provider CLI."""
+    if provider_key == "codex":
+        return (CODEX_CLI_INSTALL_COMMAND, None)
+    if provider_key == "gemini":
+        return (GEMINI_CLI_INSTALL_COMMAND, None)
+    if provider_key == "kimi":
+        return (KIMI_CLI_INSTALL_COMMAND, "or: " + KIMI_CLI_CURL_INSTALL_COMMAND)
+    return None
+
+
+def _format_action_required_cta(
     statuses: tuple[ProviderStatus, ...] | list[ProviderStatus],
 ) -> str:
-    """Big, prominent box at the very end of install output telling the user
-    EXACTLY which sign-in commands to run for installed-but-not-signed-in
-    providers. The walkthroughs above already mention this, but they're
-    buried mid-output. This is the action-required-before-you-can-use-it CTA.
+    """Big, prominent box at the very end of install output listing every
+    action the user needs to take before they can use each teammate. Covers:
+
+    - MISSING providers (declined install or install failed): show install +
+      sign-in commands so they can finish setup later.
+    - NEEDS_SIGNIN providers (installed but not authenticated): show the
+      one-command sign-in.
+    - NEEDS_UPGRADE (have an older version than required): show the upgrade
+      command.
+
+    Skipped entirely when every provider is READY — no noise for users who
+    are fully set up. Plain-text fallback for non-color terminals + tests.
     """
-    pending = [s for s in statuses if s.state == "NEEDS_SIGNIN"]
+    pending = [s for s in statuses if s.state in ("MISSING", "NEEDS_SIGNIN", "NEEDS_UPGRADE")]
     if not pending:
         return ""
     theme = get_theme()
+
+    def _provider_block_themed(status: ProviderStatus) -> list[str]:
+        lines: list[str] = []
+        if status.state == "MISSING":
+            lines.append(f"{theme.symbols['info']} {theme.heading(status.display_name)} {theme.muted('— not installed')}")
+            install = _install_command_for_provider(status.provider_key)
+            if install is not None:
+                cmd, install_hint = install
+                lines.append(f"  {theme.symbols['arrow']} {theme.muted('Install:')} {theme.accent(cmd)}")
+                if install_hint:
+                    lines.append(f"    {theme.muted(install_hint)}")
+            signin_cmd, signin_hint = _signin_command(status.provider_key)
+            lines.append(f"  {theme.symbols['arrow']} {theme.muted('Then sign in:')} {theme.accent(signin_cmd)}")
+            if signin_hint:
+                lines.append(f"    {theme.muted(f'({signin_hint})')}")
+        elif status.state == "NEEDS_SIGNIN":
+            signin_cmd, signin_hint = _signin_command(status.provider_key)
+            lines.append(f"{theme.symbols['info']} {theme.heading(status.display_name)} {theme.muted('— signed in: no')}")
+            lines.append(f"  {theme.symbols['arrow']} {theme.muted('Run:')} {theme.accent(signin_cmd)}")
+            if signin_hint:
+                lines.append(f"    {theme.muted(f'({signin_hint})')}")
+        elif status.state == "NEEDS_UPGRADE":
+            install = _install_command_for_provider(status.provider_key)
+            current = f"have {status.version}" if status.version else "version too old"
+            lines.append(f"{theme.symbols['warn']} {theme.heading(status.display_name)} {theme.muted(f'— upgrade needed ({current})')}")
+            if install is not None:
+                cmd, _ = install
+                lines.append(f"  {theme.symbols['arrow']} {theme.muted('Upgrade:')} {theme.accent(cmd)}")
+        return lines
+
     if theme.color:
         body: list[str] = []
         for idx, status in enumerate(pending):
-            cmd, hint = _signin_command(status.provider_key)
             if idx > 0:
                 body.append("")
-            body.append(f"{theme.symbols['info']} {theme.heading(status.display_name)} {theme.muted('— signed in: no')}")
-            body.append(f"  {theme.symbols['arrow']} {theme.muted('Run:')} {theme.accent(cmd)}")
-            if hint:
-                body.append(f"    {theme.muted(f'({hint})')}")
+            body.extend(_provider_block_themed(status))
         body.append("")
-        body.append(f"{theme.symbols['warn']} {theme.warn('Then restart Claude Code')} {theme.muted('so the new sign-in state is picked up.')}")
-        return render_box(theme.heading("Action required — sign in to start using teammates"), body, "magenta", theme=theme)
-    # Plain-text fallback for tests / piped output.
-    lines = ["Action required — sign in to start using teammates:", ""]
+        body.append(f"{theme.symbols['warn']} {theme.warn('Then restart Claude Code')} {theme.muted('so the new state is picked up.')}")
+        return render_box(theme.heading("Action required to start using your teammates"), body, "magenta", theme=theme)
+
+    # Plain-text fallback.
+    lines = ["Action required to start using your teammates:", ""]
     for status in pending:
-        cmd, hint = _signin_command(status.provider_key)
         lines.append(f"  {status.display_name}:")
-        suffix = f"  ({hint})" if hint else ""
-        lines.append(f"    Run: {cmd}{suffix}")
-    lines.append("")
-    lines.append("Then restart Claude Code so the new sign-in state is picked up.")
+        if status.state == "MISSING":
+            install = _install_command_for_provider(status.provider_key)
+            if install is not None:
+                cmd, install_hint = install
+                lines.append(f"    Install: {cmd}")
+                if install_hint:
+                    lines.append(f"      {install_hint}")
+            signin_cmd, signin_hint = _signin_command(status.provider_key)
+            suffix = f"  ({signin_hint})" if signin_hint else ""
+            lines.append(f"    Then sign in: {signin_cmd}{suffix}")
+        elif status.state == "NEEDS_SIGNIN":
+            signin_cmd, signin_hint = _signin_command(status.provider_key)
+            suffix = f"  ({signin_hint})" if signin_hint else ""
+            lines.append(f"    Run: {signin_cmd}{suffix}")
+        elif status.state == "NEEDS_UPGRADE":
+            install = _install_command_for_provider(status.provider_key)
+            if install is not None:
+                cmd, _ = install
+                lines.append(f"    Upgrade: {cmd}")
+        lines.append("")
+    lines.append("Then restart Claude Code so the new state is picked up.")
     return "\n".join(lines)
 
 
@@ -3164,7 +3226,7 @@ def format_install_message(result: InstallResult, *, include_provider_status: bo
 
     # Final CTA: if any installed providers still need sign-in, render a big
     # action-required box AT THE BOTTOM so the user can't miss the next step.
-    cta = _format_signin_cta((codex_status, gemini_status, kimi_status))
+    cta = _format_action_required_cta((codex_status, gemini_status, kimi_status))
     if cta:
         lines.append(cta)
     return "\n\n".join(lines)
