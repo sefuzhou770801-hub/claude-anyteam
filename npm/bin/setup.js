@@ -628,15 +628,30 @@ async function main() {
 
   let tool;
   const existingTool = await findInstalledTool({ uvPath: uv.path }).catch(() => null);
-  if (existingTool) {
-    tool = existingTool;
+  // Always run `uv tool install --force --prerelease=allow` so a cached older
+  // claude-anyteam binary gets refreshed to the latest published wheel. Without
+  // this, a user who installed at v0.5.x and re-runs `npx --yes claude-anyteam`
+  // never sees handholding/prompt logic shipped in later releases.
+  const installLabel = existingTool ? 'Refreshing' : 'Installing';
+  try {
+    tool = await withSpinner(`${installLabel} ${TOOL_NAME} with uv tool install`, !silent, () => installTool({ uvPath: uv.path, pythonPath: python.path, refresh: true }));
     if (!silent) {
-      console.log(`${theme.symbols.success} ${theme.heading('existing claude-anyteam tool detected')} ${theme.accent(formatDisplayPath(tool.binaryPath))}`);
+      const status = tool.installMode === 'refreshed' ? 'refreshed to latest' : 'installed';
+      console.log(`${theme.symbols.success} ${theme.heading(`claude-anyteam tool ${status}`)} ${theme.accent(formatDisplayPath(tool.binaryPath))}`);
     }
-  } else {
-    try {
-      tool = await withSpinner(`Installing ${TOOL_NAME} with uv tool install`, !silent, () => installTool({ uvPath: uv.path, pythonPath: python.path }));
-    } catch (error) {
+  } catch (error) {
+    if (existingTool) {
+      // Refresh failed but we still have a working older copy — degrade
+      // gracefully rather than blocking on a transient registry error.
+      tool = existingTool;
+      if (!silent) {
+        console.log(`${theme.symbols.warn} ${theme.heading('Could not refresh claude-anyteam')} ${theme.muted('— continuing with existing copy')} ${theme.accent(formatDisplayPath(tool.binaryPath))}`);
+        const refreshDetail = (error.details || error.message || '').split(/\r?\n/, 1)[0];
+        if (refreshDetail) {
+          console.log(`${theme.symbols.info} ${theme.muted(`Refresh error: ${refreshDetail}`)}`);
+        }
+      }
+    } else {
       if (silent) {
         postinstallHint(error);
         return 0;

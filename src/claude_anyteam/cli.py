@@ -382,6 +382,65 @@ def _manual_provider_steps(provider_key: str) -> list[str]:
     ]
 
 
+def _multiplexer_install_command() -> tuple[str, list[str]] | None:
+    if sys.platform == "darwin":
+        brew = shutil.which("brew")
+        if brew:
+            return "brew install tmux", [brew, "install", "tmux"]
+        return None
+    if sys.platform.startswith("linux"):
+        for pm, install_args in (
+            ("apt-get", ["sudo", "apt-get", "install", "-y", "tmux"]),
+            ("dnf", ["sudo", "dnf", "install", "-y", "tmux"]),
+            ("pacman", ["sudo", "pacman", "-S", "--noconfirm", "tmux"]),
+            ("apk", ["sudo", "apk", "add", "tmux"]),
+        ):
+            if shutil.which(pm):
+                return " ".join(install_args), install_args
+    return None
+
+
+def _offer_multiplexer_install(*, no_input: bool, stream: TextIO) -> None:
+    """Prompt the user to install tmux when missing on Linux/macOS.
+
+    Runs before install_settings()'s prereq check so a successful auto-install
+    means the subsequent check finds tmux on PATH and the install proceeds
+    without raising. Failure or decline falls through to the existing
+    InstallError, which already prints platform-aware manual instructions.
+    """
+    check = installer_mod._check_terminal_multiplexer()
+    if check.found:
+        return
+    if no_input or not (sys.stdin.isatty() and sys.stdout.isatty()):
+        # Stay silent here; the InstallError later will print full instructions.
+        return
+    answer = _yes_default_prompt(
+        "We need tmux (a terminal multiplexer that lets teammates appear in their own panes). "
+        "Want me to try installing it for you?"
+    )
+    if answer is None or not answer:
+        if answer is False:
+            print("Okay — I will not install tmux. Manual steps will be shown below.", file=stream)
+        return
+    command = _multiplexer_install_command()
+    if command is None:
+        print("I could not find a package manager (brew/apt-get/dnf/pacman/apk) to install tmux automatically.", file=stream)
+        return
+    display, argv = command
+    print(f"Trying: {display}", file=stream)
+    if argv and argv[0] == "sudo":
+        print("(You may be prompted for your sudo password.)", file=stream)
+    ok, output = _run_install_command(argv)
+    if ok:
+        print("Installed tmux. Continuing with claude-anyteam setup.", file=stream)
+        return
+    print("I tried to install tmux, but it failed.", file=stream)
+    print("Raw installer output:", file=stream)
+    for line in output.splitlines() or ["No output captured."]:
+        print(f"  {line}", file=stream)
+    print("Falling through to manual instructions below.", file=stream)
+
+
 def _offer_provider_dependency_installs(*, no_input: bool, stream: TextIO) -> None:
     checks = [
         ("codex", "Codex CLI", installer_mod._check_codex_cli()),
@@ -463,6 +522,10 @@ def _install_command(
     else:
         prompt_fn = _interactive_prompt
 
+    # --assume-yes is the npm wrapper's "approve settings.json modifications"
+    # signal, NOT a "skip every chance to ask the user about installing a
+    # missing dep" signal. TTY detection inside the helpers gates the prompts.
+    _offer_multiplexer_install(no_input=no_input or self_heal, stream=stream)
     _offer_provider_dependency_installs(
         no_input=no_input or self_heal,
         stream=stream,
