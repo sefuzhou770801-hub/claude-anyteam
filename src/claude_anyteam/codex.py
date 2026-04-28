@@ -962,6 +962,135 @@ def _visibility_for_app_server_item(
     )
 
 
+def _app_server_transport_alive(client: Any) -> bool:
+    checker = getattr(client, "is_transport_alive", None)
+    if callable(checker):
+        try:
+            return bool(checker())
+        except Exception as e:
+            logger.debug("app_server.transport_health_check_failed", error=str(e))
+            return True
+    # Test doubles / older clients that do not expose a health hook are
+    # presumed healthy so the existing empty-queue polling behavior is
+    # preserved.
+    return True
+
+
+def _app_server_transport_status(client: Any) -> dict[str, Any]:
+    status = getattr(client, "transport_status", None)
+    if callable(status):
+        try:
+            value = status()
+            if isinstance(value, dict):
+                return value
+        except Exception as e:
+            logger.debug("app_server.transport_status_failed", error=str(e))
+    return {}
+
+
+def _thread_id_from_app_server_payload(payload: Any) -> str | None:
+    if not isinstance(payload, dict):
+        return None
+    thread = payload.get("thread")
+    if isinstance(thread, dict):
+        tid = thread.get("id")
+        if isinstance(tid, str) and tid:
+            return tid
+    tid = payload.get("threadId")
+    if isinstance(tid, str) and tid:
+        return tid
+    return None
+
+
+def _thread_turns_from_app_server_payload(payload: Any) -> list[dict[str, Any]]:
+    if not isinstance(payload, dict):
+        return []
+    thread = payload.get("thread")
+    turns = thread.get("turns") if isinstance(thread, dict) else payload.get("turns")
+    if not isinstance(turns, list):
+        return []
+    return [turn for turn in turns if isinstance(turn, dict)]
+
+
+def _turn_error_summary(turn: dict[str, Any]) -> str | None:
+    err = turn.get("error")
+    if isinstance(err, dict):
+        message = _first_present(err, "message", "error", "summary")
+        if isinstance(message, str) and message:
+            return message
+        return _json_preview(err, limit=500)
+    if isinstance(err, str) and err:
+        return err
+    return None
+
+
+def _latest_agent_message(turn: dict[str, Any]) -> str | None:
+    items = turn.get("items")
+    if not isinstance(items, list):
+        return None
+    for item in reversed(items):
+        if not isinstance(item, dict):
+            continue
+        if item.get("type") != "agentMessage":
+            continue
+        text = item.get("text")
+        if isinstance(text, str) and text:
+            return text
+    return None
+
+
+def _resume_turn_snapshot(
+    payload: Any,
+    *,
+    preferred_turn_id: str | None,
+) -> tuple[str | None, str | None, str | None, str | None]:
+    """Return (turn_id, status, last_agent_message, error_summary).
+
+    `thread/resume` responses populate `thread.turns[*].items`; during
+    transport recovery this lets us salvage a final agentMessage if the turn
+    completed while our stdio/WebSocket pipe was down.
+    """
+
+    turns = _thread_turns_from_app_server_payload(payload)
+    if not turns:
+        return None, None, None, None
+    selected: dict[str, Any] | None = None
+    if preferred_turn_id:
+        for turn in turns:
+            if turn.get("id") == preferred_turn_id:
+                selected = turn
+                break
+    if selected is None:
+        selected = turns[-1]
+    turn_id = selected.get("id")
+    status = selected.get("status")
+    return (
+        turn_id if isinstance(turn_id, str) else None,
+        status if isinstance(status, str) else None,
+        _latest_agent_message(selected),
+        _turn_error_summary(selected),
+    )
+
+
+def _app_server_recovery_prompt(task_prompt: str, *, schema: dict[str, Any] | None) -> str:
+    contract = (
+        "Finish by returning exactly the requested JSON object for the output "
+        "schema. No markdown fences and no prose outside the JSON."
+        if schema is not None
+        else "Finish by replying to the user normally."
+    )
+    return (
+        "Transport recovery: the adapter reconnected to Codex App Server after "
+        "the previous transport died mid-turn. Continue the same request from "
+        "the current repository and conversation state. Preserve any durable "
+        "work that is already done, avoid repeating expensive work unless you "
+        "need to verify it, and complete the original request.\n\n"
+        f"{contract}\n\n"
+        "# Original request\n"
+        f"{task_prompt}"
+    )
+
+
 def app_server_invoke(
     *,
     task_prompt: str,
@@ -1221,7 +1350,262 @@ def app_server_invoke(
         non_progress_warned = False
         non_progress_warned_at: float | None = None
         non_progress_interrupted = False
+        transport_reconnect_attempts = 0
         done = False
+
+        def _resume_kwargs() -> dict[str, Any]:
+            """Map thread/start kwargs to the subset accepted by thread/resume."""
+
+            return {
+                "cwd": thread_kwargs.get("cwd"),
+                "base_instructions": thread_kwargs.get("base_instructions"),
+                "developer_instructions": thread_kwargs.get("developer_instructions"),
+                "sandbox": thread_kwargs.get("sandbox", "danger-full-access"),
+                "approval_policy": thread_kwargs.get("approval_policy", "never"),
+                "config": thread_kwargs.get("config"),
+                "model": thread_kwargs.get("model"),
+            }
+
+        def _mark_transport_recovery_failed(
+            *,
+            summary: str,
+            payload: dict[str, Any],
+        ) -> None:
+            nonlocal done, error, exit_code
+            error = summary
+            exit_code = 1
+            logger.error(
+                "app_server.transport_recovery_failed",
+                turn_id=current_turn_id,
+                thread_id=thread_id,
+                error=summary,
+                payload=payload,
+            )
+            _emit_visibility_event(
+                kind="visibility_degraded",
+                severity="error",
+                summary=summary[:200],
+                visibility={
+                    "mailbox": True,
+                    "task_state": True,
+                    "event_log": True,
+                    "stderr": True,
+                },
+                payload={
+                    "surface": "codex_app_server_transport",
+                    "reason": "reconnect_failed",
+                    **payload,
+                },
+            )
+            done = True
+
+        def _attempt_transport_recovery(reason: str) -> None:
+            nonlocal transport_reconnect_attempts, thread_id, current_turn_id
+            nonlocal last_message, last_progress_at, last_tool_count, last_message_len
+            nonlocal non_progress_warned, non_progress_warned_at, done
+
+            if done:
+                return
+            if thread_id is None or current_turn_id is None:
+                _mark_transport_recovery_failed(
+                    summary=(
+                        "Codex App Server transport died before a resumable "
+                        "thread/turn id was available"
+                    ),
+                    payload={
+                        "action": "abort",
+                        "reason_detail": reason,
+                        "thread_id": thread_id,
+                        "turn_id": current_turn_id,
+                        "transport_status": _app_server_transport_status(client),
+                    },
+                )
+                return
+            if transport_reconnect_attempts >= 1:
+                _mark_transport_recovery_failed(
+                    summary=(
+                        "Codex App Server transport died again after one "
+                        "reconnect attempt"
+                    ),
+                    payload={
+                        "action": "abort",
+                        "reason_detail": reason,
+                        "thread_id": thread_id,
+                        "turn_id": current_turn_id,
+                        "attempts": transport_reconnect_attempts,
+                        "transport_status": _app_server_transport_status(client),
+                    },
+                )
+                return
+
+            transport_reconnect_attempts += 1
+            previous_turn_id = current_turn_id
+            status_before = _app_server_transport_status(client)
+            logger.warn(
+                "app_server.transport_lost",
+                thread_id=thread_id,
+                turn_id=previous_turn_id,
+                reason=reason,
+                attempt=transport_reconnect_attempts,
+                transport_status=status_before,
+            )
+            _emit_visibility_event(
+                kind="turn_warning",
+                severity="warn",
+                summary="Codex App Server transport disconnected; attempting reconnect/resume",
+                visibility={
+                    "mailbox": True,
+                    "task_state": True,
+                    "event_log": True,
+                    "stderr": True,
+                },
+                payload={
+                    "surface": "codex_app_server_transport",
+                    "reason": reason,
+                    "action": "reconnect_and_resume",
+                    "attempt": transport_reconnect_attempts,
+                    "thread_id": thread_id,
+                    "turn_id": previous_turn_id,
+                    "transport_status": status_before,
+                },
+            )
+
+            try:
+                reconnect_and_resume = getattr(client, "reconnect_and_resume", None)
+                if callable(reconnect_and_resume):
+                    resume_payload = reconnect_and_resume(
+                        thread_id=thread_id,
+                        **_resume_kwargs(),
+                    )
+                else:
+                    client.close()
+                    client.start()
+                    client.initialize()
+                    resume_payload = client.thread_resume(
+                        thread_id=thread_id,
+                        **_resume_kwargs(),
+                    )
+            except AppServerError as e:
+                _mark_transport_recovery_failed(
+                    summary=f"Codex App Server reconnect/resume failed: {e}",
+                    payload={
+                        "action": "abort",
+                        "reason_detail": reason,
+                        "thread_id": thread_id,
+                        "turn_id": previous_turn_id,
+                        "attempt": transport_reconnect_attempts,
+                        "transport_status": status_before,
+                    },
+                )
+                return
+
+            resumed_thread_id = _thread_id_from_app_server_payload(resume_payload)
+            if resumed_thread_id:
+                thread_id = resumed_thread_id
+
+            (
+                resumed_turn_id,
+                resumed_status,
+                resumed_last_message,
+                resumed_error,
+            ) = _resume_turn_snapshot(
+                resume_payload,
+                preferred_turn_id=previous_turn_id,
+            )
+            if resumed_last_message:
+                last_message = resumed_last_message
+
+            if resumed_status in {"completed", "interrupted"} and resumed_last_message:
+                logger.info(
+                    "app_server.transport_recovered_terminal_turn",
+                    thread_id=thread_id,
+                    turn_id=resumed_turn_id or previous_turn_id,
+                    status=resumed_status,
+                )
+                _emit_visibility_event(
+                    kind="turn_progress",
+                    severity="info",
+                    summary=(
+                        "Codex App Server reconnected; recovered completed "
+                        "turn output from resumed thread"
+                    ),
+                    visibility={
+                        "mailbox": False,
+                        "task_state": True,
+                        "event_log": True,
+                        "stderr": True,
+                    },
+                    payload={
+                        "surface": "codex_app_server_transport",
+                        "action": "resume_recovered_terminal_turn",
+                        "thread_id": thread_id,
+                        "turn_id": resumed_turn_id or previous_turn_id,
+                        "resumed_status": resumed_status,
+                    },
+                )
+                done = True
+                return
+
+            try:
+                current_turn_id = client.turn_start(
+                    thread_id=thread_id,
+                    text=_app_server_recovery_prompt(task_prompt, schema=schema),
+                    output_schema=schema,
+                    model=model,
+                    effort=effort,
+                )
+            except AppServerError as e:
+                _mark_transport_recovery_failed(
+                    summary=f"Codex App Server recovery turn/start failed: {e}",
+                    payload={
+                        "action": "abort",
+                        "reason_detail": reason,
+                        "thread_id": thread_id,
+                        "previous_turn_id": previous_turn_id,
+                        "resumed_turn_id": resumed_turn_id,
+                        "resumed_status": resumed_status,
+                        "resumed_error": resumed_error,
+                        "attempt": transport_reconnect_attempts,
+                    },
+                )
+                return
+
+            now = time.monotonic()
+            last_progress_at = now
+            last_tool_count = tool_call_events
+            last_message_len = len(last_message)
+            non_progress_warned = False
+            non_progress_warned_at = None
+            logger.info(
+                "app_server.transport_recovered",
+                thread_id=thread_id,
+                previous_turn_id=previous_turn_id,
+                recovery_turn_id=current_turn_id,
+                resumed_status=resumed_status,
+            )
+            _emit_visibility_event(
+                kind="turn_progress",
+                severity="info",
+                summary="Codex App Server reconnected; continuation turn started",
+                visibility={
+                    "mailbox": False,
+                    "task_state": True,
+                    "event_log": True,
+                    "stderr": True,
+                },
+                payload={
+                    "surface": "codex_app_server_transport",
+                    "action": "recovery_turn_started",
+                    "thread_id": thread_id,
+                    "previous_turn_id": previous_turn_id,
+                    "turn_id": current_turn_id,
+                    "resumed_turn_id": resumed_turn_id,
+                    "resumed_status": resumed_status,
+                    "resumed_error": resumed_error,
+                    "attempt": transport_reconnect_attempts,
+                },
+            )
+
         while not done and time.monotonic() < deadline:
             # 1. Deliver any pending steers. Non-blocking pop.
             if steer_queue is not None:
@@ -1263,6 +1647,9 @@ def app_server_invoke(
             try:
                 notif = client.notifications.get(timeout=0.5)
             except Exception:
+                if not _app_server_transport_alive(client):
+                    _attempt_transport_recovery("notification_transport_closed")
+                    continue
                 # No notification this iteration — check the soft watchdog.
                 # Triggers at most once per turn; doesn't kill, just warns
                 # the lead and nudges the model. The optional hard interrupt
