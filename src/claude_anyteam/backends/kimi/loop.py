@@ -16,7 +16,12 @@ from typing import Any
 from claude_anyteam import logger, protocol_io as pio
 from claude_anyteam.auth_preflight import AuthPreflightFailure
 from claude_anyteam.capability_manifest import CapabilityManifestCache
-from claude_anyteam.capabilities import KIMI_HEADLESS_CAPABILITIES, assert_known_capabilities, rich_capability_manifest
+from claude_anyteam.capabilities import (
+    KIMI_HEADLESS_CAPABILITIES,
+    assert_known_capabilities,
+    effective_peer_steer_capabilities,
+    rich_capability_manifest,
+)
 from claude_anyteam.messages import CapabilityManifestUpdatedIn, PlanApprovalRequestIn, ShutdownRequestIn, SteerIn, parse_protocol_text
 from claude_anyteam.registration import BackendMetadata, deregister, register
 from claude_anyteam.schema_validation import inline_schema_prompt_fragment, load_schema
@@ -312,7 +317,16 @@ def _handle_message(state: KimiLoopState, msg: Any) -> None:
             removed=payload.removed,
         )
     elif isinstance(payload, SteerIn):
-        _handle_steer(state, payload, msg)
+        sender = getattr(msg, "from_", None) or payload.from_
+        if sender != "team-lead" and _message_kind(msg) != "steer":
+            logger.info(
+                "kimi.steer_payload.deferred_as_prose",
+                sender=sender,
+                message_kind=_message_kind(msg),
+            )
+            _handle_prose(state, msg)
+        else:
+            _handle_steer(state, payload, msg)
     else:
         logger.debug("kimi.inbox.protocol_noop", type=payload.__class__.__name__)
 
@@ -406,7 +420,10 @@ MAX_STEER_PREFIX_CHARS = 8192
 
 def _handle_steer(state: KimiLoopState, payload: SteerIn, msg: Any) -> None:
     sender = getattr(msg, "from_", None) or payload.from_
-    capabilities = _backend_metadata(state.settings).capabilities
+    capabilities = effective_peer_steer_capabilities(
+        _backend_metadata(state.settings).capabilities,
+        state.self_capability_manifest,
+    )
     if sender != "team-lead" and "accepts_peer_steer" not in capabilities:
         logger.warn(
             "kimi.steer.rejected",

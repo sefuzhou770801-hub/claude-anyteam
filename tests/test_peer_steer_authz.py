@@ -57,6 +57,7 @@ def _steer_msg(sender: str, message: str = "Please use the revised constraint.")
     return SimpleNamespace(
         from_=sender,
         text=json.dumps({"type": "steer", "from": sender, "message": message}),
+        message_kind="steer",
     )
 
 

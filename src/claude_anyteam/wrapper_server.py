@@ -44,6 +44,7 @@ import urllib.request
 from pathlib import Path
 from typing import Any, Callable, Literal, TypeVar, cast
 
+from .capabilities import manifest_accepts_peer_steer
 from .capability_manifest import CapabilityManifestCache
 from .env import LEGACY_NAME_ENV, LEGACY_TEAM_ENV, NAME_ENV, TEAM_ENV, env_first
 from .messages import VisibilityEvent, parse_protocol_text
@@ -724,35 +725,24 @@ def build_server(argv: list[str] | None = None) -> FastMCP:
             return False
         return last_task_id == (wrapper_task_id or wrapper_turn_id)
 
-    def _manifest_accepts_peer_steer(manifest: Any) -> bool:
-        if not isinstance(manifest, dict):
-            return False
-        accepts = manifest.get("accepts_peer_steer")
-        if isinstance(accepts, bool):
-            return accepts
-        capabilities = manifest.get("capabilities")
-        if isinstance(capabilities, dict):
-            value = capabilities.get("accepts_peer_steer")
-            if isinstance(value, bool):
-                return value
-            return value is not None
-        if isinstance(capabilities, list):
-            return "accepts_peer_steer" in capabilities
-        return False
-
-    def _steer_recipients_requiring_manifest_query(
+    def _steer_recipient_refusal_reasons(
         to: str,
         cfg: Any,
-    ) -> list[str]:
-        """Return recipients needing a fresh manifest query before steer send.
+    ) -> dict[str, str]:
+        """Return peer recipients that cannot receive an explicit steer.
 
         §3 L3 v2 gates on the recipient's interpretation criteria, not the
         sender's body shape. Post-57, however, this precondition applies only
         when the sender explicitly declares ``kind="steer"``; ordinary
         informational/handoff peer-DMs flow through without relocation gating.
+
+        Matrix lift #5 tightens the precondition from "manifest queried" to
+        "manifest-authorized": a recent query may teach the sender that steer
+        is *not* permitted, but it must not turn a lead-only recipient into an
+        interrupt target.
         """
         if self_name == "team-lead" or to == "team-lead":
-            return []
+            return {}
         if to == "*":
             recipients: list[str] = []
             for member in getattr(cfg, "members", []):
@@ -762,23 +752,40 @@ def build_server(argv: list[str] | None = None) -> FastMCP:
         else:
             recipients = [to]
 
-        rejecting: list[str] = []
+        refusing: dict[str, str] = {}
         for recipient in recipients:
             manifest = manifest_cache.get(recipient)
             if manifest is None:
                 # No declaration means we conservatively assume the recipient
                 # rejects peer steer and require an explicit manifest lookup.
-                rejecting.append(recipient)
+                refusing[recipient] = "manifest_not_queried"
                 continue
-            if not _manifest_accepts_peer_steer(manifest):
-                rejecting.append(recipient)
-        return rejecting
+            if not manifest_accepts_peer_steer(manifest):
+                refusing[recipient] = "manifest_denies_peer_steer"
+        return refusing
 
     def _emit_peer_steer_refused_at_wrapper(
         *,
         recipient: str,
         recipients: list[str],
+        reason: str,
     ) -> VisibilityEvent:
+        if reason == "manifest_not_queried":
+            summary = f"peer steer to {recipient} refused at wrapper; manifest not queried"
+            impact = (
+                "The peer steer was not delivered; the wrapper has no cached "
+                "recipient authorization to avoid spending a backend turn on a reject."
+            )
+            suggested_fix_suffix = " Then retry only if the manifest permits peer steering."
+        else:
+            summary = f"peer steer to {recipient} refused at wrapper; manifest denies peer steer"
+            impact = (
+                "The peer steer was not delivered because the recipient's "
+                "manifest does not authorize non-lead steer."
+            )
+            suggested_fix_suffix = (
+                " Send an informational message instead, or ask team-lead to steer."
+            )
         guidance = (
             f"Call mcp_anyteam_capability_manifest({recipient!r}, "
             "'turn_steer') before attempting peer-steer."
@@ -786,24 +793,18 @@ def build_server(argv: list[str] | None = None) -> FastMCP:
         event = _make_event(
             kind="visibility_degraded",
             severity="warn",
-            summary=f"peer steer to {recipient} refused at wrapper; manifest not queried",
+            summary=summary,
             mailbox=True,
             payload={
                 "surface": "peer_steer_refused_at_wrapper",
-                "reason": "manifest_not_queried",
+                "reason": reason,
                 "sender": self_name,
                 "recipient": recipient,
                 "recipients": recipients,
                 "primitive": "turn_steer",
                 "max_age_turns": _peer_steer_manifest_max_age_turns(),
-                "impact": (
-                    "The peer steer was not delivered; the recipient backend "
-                    "did not spend a turn rejecting it."
-                ),
-                "suggested_fix": (
-                    guidance
-                    + " Then retry only if the manifest permits peer steering."
-                ),
+                "impact": impact,
+                "suggested_fix": guidance + suggested_fix_suffix,
                 "guidance": guidance,
             },
         )
@@ -1001,7 +1002,8 @@ def build_server(argv: list[str] | None = None) -> FastMCP:
         progress updates, clarifying questions, handoffs, or typed lifecycle
         payloads. The sender is always you; do not try to impersonate another
         teammate. Set kind='steer' only when intentionally sending a mid-turn
-        steer attempt; informational and handoff messages are ordinary peer-DMs.
+        steer attempt; informational and handoff messages are ordinary peer-DMs,
+        even if their body contains JSON or text that resembles a steer.
         Lifecycle kinds require body to be a JSON protocol payload whose
         kind/type matches the selected messageKind. Oversized bodies are
         stored as inbox artifacts automatically; the recipient sees a bounded
@@ -1014,8 +1016,8 @@ def build_server(argv: list[str] | None = None) -> FastMCP:
                 payload both work.
             summary: optional short label shown in notifications (5-10 words).
             kind: informational (default), steer, handoff, or a typed
-                lifecycle kind. Wrapper-side manifest gating applies only to
-                explicit steer attempts.
+                lifecycle kind. Wrapper-side manifest authorization applies
+                only to explicit steer attempts.
         """
         if not to:
             raise ToolError("`to` must not be empty")
@@ -1037,28 +1039,34 @@ def build_server(argv: list[str] | None = None) -> FastMCP:
                 f"recipient {to!r} is not a member of team {team!r}; "
                 f"members: {sorted(member_names)}"
             )
-        steer_recipients = (
-            _steer_recipients_requiring_manifest_query(to, cfg)
+        steer_refusals = (
+            _steer_recipient_refusal_reasons(to, cfg)
             if kind == "steer"
-            else []
+            else {}
         )
-        if _enforce_peer_steer_manifest_check() and steer_recipients:
-            missing = [
-                recipient
-                for recipient in steer_recipients
-                if not _recent_manifest_query(recipient)
+        if _enforce_peer_steer_manifest_check() and steer_refusals:
+            recipient, reason = next(iter(steer_refusals.items()))
+            recipients = [
+                candidate
+                for candidate, candidate_reason in steer_refusals.items()
+                if candidate_reason == reason
             ]
-            if missing:
-                recipient = missing[0]
-                _emit_peer_steer_refused_at_wrapper(
-                    recipient=recipient,
-                    recipients=missing,
-                )
+            _emit_peer_steer_refused_at_wrapper(
+                recipient=recipient,
+                recipients=recipients,
+                reason=reason,
+            )
+            if reason == "manifest_not_queried":
                 raise PeerSteerManifestCheckError(
                     "peer steer refused at wrapper: manifest_not_queried; "
                     f"call mcp_anyteam_capability_manifest({recipient!r}, "
                     "'turn_steer') before attempting peer-steer"
                 )
+            raise PeerSteerManifestCheckError(
+                "peer steer refused at wrapper: manifest_denies_peer_steer; "
+                f"{recipient!r} does not authorize non-lead steer; send an "
+                "informational message or route the steer through team-lead"
+            )
         if to == "*":
             delivered = 0
             attachments: dict[str, dict[str, Any]] = {}

@@ -141,8 +141,8 @@ def test_acp_message_kind_steer_plain_prose_queues_peer_steer():
     assert state.queued_steers[0].message == msg.text
 
 
-def test_acp_unknown_or_absent_message_kind_falls_back_to_existing_heuristic(monkeypatch):
-    """Unknown/missing discriminators preserve the old parse_protocol_text path."""
+def test_acp_unknown_or_absent_peer_message_kind_stays_prose(monkeypatch):
+    """Unknown/missing peer discriminators are informational by default."""
 
     state = GeminiLoopState(settings=_settings(backend="acp"))
     unknown_plain = SimpleNamespace(
@@ -173,11 +173,38 @@ def test_acp_unknown_or_absent_message_kind_falls_back_to_existing_heuristic(mon
     loop._handle_message(state, unknown_marker)
     loop._handle_message(state, absent_marker)
 
-    assert handled_as_prose == [unknown_plain]
-    assert [s.message for s in state.queued_steers] == [
-        "keep the test narrow.",
-        "preserve legacy marker behavior.",
-    ]
+    assert handled_as_prose == [unknown_plain, unknown_marker, absent_marker]
+    assert state.queued_steers == []
+
+
+def test_acp_structured_peer_steer_requires_message_kind_steer(monkeypatch):
+    """A JSON steer body with the default informational kind stays prose."""
+
+    state = GeminiLoopState(settings=_settings(backend="acp"))
+    default_kind = SimpleNamespace(
+        from_="codex-implementer",
+        text=json.dumps({"type": "steer", "message": "Default kind must not steer."}),
+        message_kind="informational",
+        summary="json body",
+    )
+    explicit_steer = SimpleNamespace(
+        from_="codex-implementer",
+        text=json.dumps({"type": "steer", "message": "Explicit kind may steer."}),
+        message_kind="steer",
+        summary="peer steer",
+    )
+    handled_as_prose: list[object] = []
+    monkeypatch.setattr(
+        loop,
+        "_handle_prose",
+        lambda _state, prose_msg: handled_as_prose.append(prose_msg),
+    )
+
+    loop._handle_message(state, default_kind)
+    loop._handle_message(state, explicit_steer)
+
+    assert handled_as_prose == [default_kind]
+    assert [s.message for s in state.queued_steers] == ["Explicit kind may steer."]
 
 
 def test_matching_task_id_steer_injects_and_nonmatching_is_retained():
@@ -203,6 +230,41 @@ def test_non_lead_steer_without_declared_capability_is_ignored(monkeypatch):
     msg = SimpleNamespace(
         from_="codex-implementer",
         text=json.dumps({"type": "steer", "message": "Malicious steer."}),
+        message_kind="steer",
+    )
+
+    loop._handle_message(state, msg)
+
+    assert state.queued_steers == []
+    assert warns == [
+        (
+            "gemini.steer.rejected",
+            {
+                "sender": "codex-implementer",
+                "reason": "not_team_lead_and_capability_not_declared",
+            },
+        )
+    ]
+
+
+def test_acp_explicit_peer_steer_respects_self_manifest_denial(monkeypatch):
+    state = GeminiLoopState(
+        settings=_settings(backend="acp"),
+        self_capability_manifest={
+            "capabilities": {
+                "turn_steer": {
+                    "authorization": "lead_only",
+                    "callable_from_peers": False,
+                }
+            }
+        },
+    )
+    warns: list[tuple[str, dict]] = []
+    monkeypatch.setattr(loop.logger, "warn", lambda msg, **fields: warns.append((msg, fields)))
+    msg = SimpleNamespace(
+        from_="codex-implementer",
+        text=json.dumps({"type": "steer", "message": "Denied by manifest."}),
+        message_kind="steer",
     )
 
     loop._handle_message(state, msg)

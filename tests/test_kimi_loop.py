@@ -208,6 +208,56 @@ def test_kimi_unknown_or_absent_message_kind_falls_back_to_existing_heuristic(
     ]
 
 
+def test_kimi_structured_peer_steer_body_default_kind_stays_prose(
+    tmp_path: Path, monkeypatch
+):
+    state = loop.KimiLoopState(settings=_settings(tmp_path))
+    msg = SimpleNamespace(
+        from_="codex-implementer",
+        text='{"type":"steer","message":"Default kind must not steer."}',
+        message_kind="informational",
+        summary="json body",
+    )
+    handled_as_prose: list[object] = []
+    monkeypatch.setattr(
+        loop,
+        "_handle_prose",
+        lambda _state, prose_msg: handled_as_prose.append(prose_msg),
+    )
+
+    loop._handle_message(state, msg)
+
+    assert handled_as_prose == [msg]
+    assert state.queued_steers == []
+
+
+def test_kimi_explicit_peer_steer_can_be_authorized_by_self_manifest(
+    tmp_path: Path,
+):
+    state = loop.KimiLoopState(
+        settings=_settings(tmp_path),
+        self_capability_manifest={
+            "capabilities": {
+                "turn_steer": {
+                    "authorization": "any_peer",
+                    "callable_from_peers": True,
+                }
+            }
+        },
+    )
+    msg = SimpleNamespace(
+        from_="codex-implementer",
+        text='{"type":"steer","message":"Manifest allows this."}',
+        message_kind="steer",
+        summary="peer steer",
+    )
+
+    loop._handle_message(state, msg)
+
+    assert len(state.queued_steers) == 1
+    assert state.queued_steers[0].message == "Manifest allows this."
+
+
 def test_kimi_prose_paths_pass_visibility_event_sink(tmp_path: Path, monkeypatch):
     state = loop.KimiLoopState(settings=_settings(tmp_path))
     invocations: list[dict] = []

@@ -798,6 +798,26 @@ def test_informational_peer_dm_allowed_without_manifest_query(
     assert _wrapper_refusals() == []
 
 
+def test_default_informational_kind_allows_json_steer_body_without_interrupt_gate(
+    identity,
+    monkeypatch,
+):
+    mcp = _seeded_wrapper(identity, monkeypatch)
+
+    result = _call_existing_tool(
+        mcp,
+        "send_message",
+        {"to": "peer-a", "body": _steer_body(), "summary": "coordination"},
+    )
+
+    assert result == {"delivered_to": "peer-a", "sender": "contract-test"}
+    inbox = _peer_a_inbox(identity)
+    assert len(inbox) == 1
+    assert inbox[0]["text"] == _steer_body()
+    assert inbox[0]["messageKind"] == "informational"
+    assert _wrapper_refusals() == []
+
+
 def test_handoff_peer_dm_allowed_without_manifest_query(
     identity,
     monkeypatch,
@@ -945,13 +965,13 @@ def test_send_message_rejects_unknown_kind(
     assert _wrapper_refusals() == []
 
 
-def test_wrapper_peer_steer_refused_without_recent_manifest_query(
+def test_wrapper_peer_steer_refused_when_manifest_denies_peer_steer(
     identity,
     monkeypatch,
 ):
     mcp = _seeded_wrapper(identity, monkeypatch)
 
-    with pytest.raises(Exception, match="manifest_not_queried"):
+    with pytest.raises(Exception, match="manifest_denies_peer_steer"):
         _call_existing_tool(
             mcp,
             "send_message",
@@ -968,13 +988,14 @@ def test_wrapper_peer_steer_refused_without_recent_manifest_query(
     assert len(refusals) == 1
     assert refusals[0].payload["sender"] == "contract-test"
     assert refusals[0].payload["recipient"] == "peer-a"
+    assert refusals[0].payload["reason"] == "manifest_denies_peer_steer"
 
 
 def test_wrapper_peer_steer_allowed_with_recent_manifest_query(
     identity,
     monkeypatch,
 ):
-    mcp = _seeded_wrapper(identity, monkeypatch)
+    mcp = _seeded_wrapper(identity, monkeypatch, peer_accepts_steer=True)
 
     manifest = _call_existing_tool(
         mcp,
@@ -1000,7 +1021,7 @@ def test_wrapper_peer_steer_manifest_query_stays_fresh_after_intervening_tools(
     identity,
     monkeypatch,
 ):
-    mcp = _seeded_wrapper(identity, monkeypatch)
+    mcp = _seeded_wrapper(identity, monkeypatch, peer_accepts_steer=True)
 
     _call_existing_tool(
         mcp,
@@ -1018,6 +1039,32 @@ def test_wrapper_peer_steer_manifest_query_stays_fresh_after_intervening_tools(
     assert result == {"delivered_to": "peer-a", "sender": "contract-test"}
     assert len(_peer_a_inbox(identity)) == 1
     assert _wrapper_refusals() == []
+
+
+def test_wrapper_peer_steer_still_refused_after_query_when_manifest_denies(
+    identity,
+    monkeypatch,
+):
+    mcp = _seeded_wrapper(identity, monkeypatch)
+
+    manifest = _call_existing_tool(
+        mcp,
+        "mcp_anyteam_capability_manifest",
+        {"agent_name": "peer-a", "capability": "turn_steer"},
+    )
+    assert manifest["description"] == "Peer steer"
+
+    with pytest.raises(Exception, match="manifest_denies_peer_steer"):
+        _call_existing_tool(
+            mcp,
+            "send_message",
+            {"to": "peer-a", "body": _steer_body(), "summary": "peer steer", "kind": "steer"},
+        )
+
+    assert _peer_a_inbox(identity) == []
+    refusals = _wrapper_refusals()
+    assert len(refusals) == 1
+    assert refusals[0].payload["reason"] == "manifest_denies_peer_steer"
 
 
 def test_wrapper_enforce_disabled_ablation(
@@ -1044,7 +1091,7 @@ def test_visibility_envelope_emitted_on_wrapper_refusal(
 ):
     mcp = _seeded_wrapper(identity, monkeypatch)
 
-    with pytest.raises(Exception, match="manifest_not_queried"):
+    with pytest.raises(Exception, match="manifest_denies_peer_steer"):
         _call_existing_tool(
             mcp,
             "send_message",
@@ -1055,7 +1102,7 @@ def test_visibility_envelope_emitted_on_wrapper_refusal(
     assert event.backend == "wrapper_mcp"
     assert event.visibility.mailbox is True
     assert event.payload["surface"] == "peer_steer_refused_at_wrapper"
-    assert event.payload["reason"] == "manifest_not_queried"
+    assert event.payload["reason"] == "manifest_denies_peer_steer"
     assert event.payload["primitive"] == "turn_steer"
     assert event.payload["max_age_turns"] == 1
     assert "mcp_anyteam_capability_manifest('peer-a', 'turn_steer')" in event.payload["guidance"]
