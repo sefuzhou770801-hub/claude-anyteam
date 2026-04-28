@@ -1,5 +1,7 @@
 from __future__ import annotations
 
+import asyncio
+from contextlib import asynccontextmanager
 import io
 import json
 import threading
@@ -13,6 +15,8 @@ from claude_anyteam import cli
 from claude_anyteam import protocol_io as pio
 from claude_anyteam import visibility_tail
 from claude_anyteam.messages import VisibilityEvent
+from websockets.asyncio.client import connect
+from websockets.asyncio.server import serve
 
 
 @pytest.fixture
@@ -48,6 +52,53 @@ def _event(
             "payload": payload or {},
         }
     )
+
+
+@asynccontextmanager
+async def _visibility_ws_server(
+    team: str,
+    *,
+    agent: str | None = None,
+    filter_kinds: set[str] | None = None,
+    since=None,
+    from_start: bool = False,
+    poll_s: float = 0.01,
+):
+    err = io.StringIO()
+    hub = visibility_tail._VisibilityFanoutHub(
+        team=team,
+        from_start=from_start,
+        poll_s=poll_s,
+        stderr=err,
+    )
+    await hub.start()
+
+    async def handler(websocket):
+        await visibility_tail._visibility_ws_handler(
+            websocket,
+            hub=hub,
+            subscription=visibility_tail._base_subscription(
+                agent=agent,
+                filter_kinds=filter_kinds,
+                since=since,
+            ),
+            allow_remote=False,
+        )
+
+    try:
+        async with serve(handler, "127.0.0.1", 0) as server:
+            assert server.sockets is not None
+            host, port = server.sockets[0].getsockname()[:2]
+            yield f"ws://{host}:{port}", err
+    finally:
+        await hub.stop()
+
+
+async def _recv_event(websocket, *, timeout: float = 2.0) -> dict:
+    while True:
+        row = json.loads(await asyncio.wait_for(websocket.recv(), timeout=timeout))
+        if "event_id" in row:
+            return row
 
 
 def test_visibility_tail_golden_tricard_output(teams_root: Path):
@@ -310,6 +361,115 @@ def test_visibility_tail_json_filters_kind_and_since(teams_root: Path):
     assert [row["kind"] for row in rows] == ["tool_event"]
     assert rows[0]["summary"] == "matching tool"
     assert rows[0]["payload"]["tool_name"] == "read_file"
+
+
+async def test_visibility_tail_websocket_streams_golden_json(teams_root: Path):
+    event = _event(
+        "tool_event",
+        1,
+        summary="websocket event",
+        payload={"tool_name": "read_file", "status": "success"},
+    )
+
+    async with _visibility_ws_server("team-x") as (url, err):
+        async with connect(url) as websocket:
+            pio.append_event("team-x", "codex-a", event)
+            row = await _recv_event(websocket)
+
+    assert err.getvalue() == ""
+    assert row == json.loads(event.model_dump_json(by_alias=True, exclude_none=True))
+
+
+async def test_visibility_tail_websocket_fans_out_to_multiple_clients(
+    teams_root: Path,
+):
+    event = _event(
+        "turn_completed",
+        2,
+        summary="fan-out event",
+        payload={"exit_code": 0},
+    )
+
+    async with _visibility_ws_server("team-x") as (url, err):
+        async with connect(url) as first, connect(url) as second:
+            pio.append_event("team-x", "codex-a", event)
+            first_row, second_row = await asyncio.gather(
+                _recv_event(first),
+                _recv_event(second),
+            )
+
+    assert err.getvalue() == ""
+    assert first_row["event_id"] == event.event_id
+    assert second_row["event_id"] == event.event_id
+
+
+async def test_visibility_tail_websocket_subscription_filters_route_events(
+    teams_root: Path,
+):
+    too_old = _event("tool_event", 2, summary="too old")
+    wrong_kind = _event("turn_started", 3, summary="wrong kind")
+    gemini_tool = _event("tool_event", 4, agent="gemini-a", summary="gemini tool")
+    codex_tool = _event("tool_event", 5, summary="matching codex tool")
+
+    async with _visibility_ws_server("team-x") as (url, err):
+        async with connect(url) as codex_client, connect(url) as gemini_client:
+            await codex_client.send(
+                json.dumps(
+                    {
+                        "type": "subscribe",
+                        "kind": "tool_event",
+                        "agent": "codex-a",
+                        "since": "2026-04-27T15:30:05Z",
+                    }
+                )
+            )
+            assert json.loads(await codex_client.recv()) == {
+                "filter": {
+                    "agent": "codex-a",
+                    "kind": ["tool_event"],
+                    "since": "2026-04-27T15:30:05Z",
+                },
+                "type": "subscribed",
+            }
+
+            await gemini_client.send(
+                json.dumps({"type": "subscribe", "filter": {"agent": "gemini-a"}})
+            )
+            assert json.loads(await gemini_client.recv()) == {
+                "filter": {"agent": "gemini-a"},
+                "type": "subscribed",
+            }
+
+            pio.append_event("team-x", "codex-a", too_old)
+            pio.append_event("team-x", "codex-a", wrong_kind)
+            pio.append_event("team-x", "gemini-a", gemini_tool)
+            pio.append_event("team-x", "codex-a", codex_tool)
+
+            codex_row, gemini_row = await asyncio.gather(
+                _recv_event(codex_client),
+                _recv_event(gemini_client),
+            )
+
+    assert err.getvalue() == ""
+    assert codex_row["summary"] == "matching codex tool"
+    assert codex_row["event_id"] == codex_tool.event_id
+    assert gemini_row["summary"] == "gemini tool"
+    assert gemini_row["event_id"] == gemini_tool.event_id
+
+
+def test_visibility_tail_websocket_rejects_non_loopback_bind(teams_root: Path):
+    out = io.StringIO()
+    err = io.StringIO()
+
+    rc = visibility_tail.main(
+        ["--team", "team-x", "--serve", "0.0.0.0:8765"],
+        stdout=out,
+        stderr=err,
+    )
+
+    assert rc == 2
+    assert out.getvalue() == ""
+    assert "refusing to bind non-loopback host" in err.getvalue()
 
 
 class _TtyStringIO(io.StringIO):
