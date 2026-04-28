@@ -47,6 +47,18 @@ The 2026-04-28 closure set adds concrete substrate primitives that operationaliz
 
 **Delegated batch summaries and parent task linkage.** Delegated work keeps normal per-task files while adding a one-way `parentTaskId` link with acyclicity validation (`src/claude_teams/models.py:102-110`, `src/claude_teams/tasks.py:52-63`). The visibility layer adds `BatchSummaryPayload` and the `batch_summary` event kind (`src/claude_anyteam/messages.py:298-325`), and the wrapper's `task_batch_summary()` tool wires child links and emits a mailbox-visible summary event with per-child status/session/stop-reason detail (`src/claude_anyteam/wrapper_server.py:1293-1343`). Matrix lift **L13**; source pattern: clawcode delegated group result summaries with child session ids/status/stop reasons, but grounded in real Agent Teams task files.
 
+### §3 Peer-efficiency substrate
+
+**Event-driven `WatchInbox`.** The control loops no longer pay a fixed poll sleep after every empty drain: `WatchInbox` watches the current teammate's inbox basename, wakes on file changes, and falls back to bounded sleep when the watcher is unavailable (`src/claude_anyteam/watch_inbox.py:47-87`, `src/claude_anyteam/watch_inbox.py:116-193`). Codex, Gemini, and Kimi loops all install the watcher and use adaptive active/idle waits at the loop boundary (`src/claude_anyteam/loop.py:237-285`, `src/claude_anyteam/backends/gemini/loop.py:296-329`, `src/claude_anyteam/backends/kimi/loop.py:252-286`). Matrix lift **L1**; source pattern: aproto-codex-bridge's `fs.watch` plus active/fallback polling, with maorinka-claude-rs' evented supervisor shape as the durability model.
+
+**Per-target `BatchedSender` and `append_messages_batch()`.** High-volume fan-out can opt into a per-recipient buffer with a 50ms debounce (`DEFAULT_DEBOUNCE_S = 0.05`) and explicit `flush()`/`close()` hooks (`src/claude_teams/messaging.py:340-430`). The underlying `append_messages_batch()` performs one locked read-modify-write for N messages and still applies the attachment spill contract independently to each row (`src/claude_teams/messaging.py:295-337`). Matrix lift **L6**; source pattern: aproto-codex-bridge's MessageRouter per-target debounce and CAS writer, adapted to the file-lock JSON inbox substrate.
+
+**SendMessage visibility invariant.** Routed prompts now repeat the native-team invariant that final/prose output is not a teammate-visible DM and that `send_message` must be called instead; the prompt also tells agents to use `read_config().protocol_tools` when tool availability is uncertain (`src/claude_anyteam/prompts.py:15-23`, `src/claude_anyteam/prompts.py:51-68`, `src/claude_anyteam/prompts.py:96-108`). The wrapper tool description carries the same invariant and explains typed lifecycle/attachment behavior at the schema boundary (`src/claude_anyteam/wrapper_server.py:991-1031`). Matrix lift **L3**; source pattern: Piebald's extracted SendMessageTool wording and nwyin-cleanroom's team prompt invariant.
+
+**L4 `messageKind` discriminator across Codex/Gemini/Kimi.** `InboxMessage` persists an explicit `messageKind` field with default `peer_dm`, so routing decisions filter by a cheap discriminator rather than parsing prose (`src/claude_teams/models.py:159-166`). Codex App Server converts mid-turn peer prose into steer only when `messageKind=steer` and the recipient advertises peer-steer capability (`src/claude_anyteam/loop.py:74-97`, `src/claude_anyteam/loop.py:1283-1326`), while Gemini ACP and Kimi headless mirror that gate before prose batching or JSON-steer handling (`src/claude_anyteam/backends/gemini/loop.py:341-372`, `src/claude_anyteam/backends/gemini/loop.py:416-432`, `src/claude_anyteam/backends/kimi/loop.py:298-329`, `src/claude_anyteam/backends/kimi/loop.py:380-396`). Matrix lift **L5**; source pattern: aproto-codex-bridge's unconditional busy-turn steer anti-pattern, corrected by nwyin-cleanroom's typed lifecycle discriminator.
+
+**Typed lifecycle payloads on `send_message`.** Lifecycle messages are now first-class protocol payloads rather than prose conventions: the message module defines idle, task-complete, task-blocked, plan-blocked, approval, permission, shutdown, and capability-manifest variants (`src/claude_anyteam/messages.py:224-268`), `protocol_io` sends those variants with matching `messageKind` values (`src/claude_anyteam/protocol_io.py:981-1183`), and the wrapper validates `send_message(kind=...)` bodies by parsing JSON and ensuring `kind`/`type` matches the requested discriminator (`src/claude_anyteam/wrapper_server.py:426-451`, `src/claude_anyteam/wrapper_server.py:1036-1039`). Matrix lift **L4**; source pattern: nwyin-cleanroom's `SendMessage.message` union and named lifecycle hooks, with maorinka/clawcode's prose-ish mail as the counterexample.
+
 ## The core insight
 
 Claude Code's Agent Teams feature is file-based. Team state lives in `~/.claude/teams/{team}/config.json` and inbox messages in `~/.claude/teams/{team}/inboxes/{name}.json`. The team protocol is an on-disk contract — mailbox polling, atomic task claims, idle notifications, shutdown requests. Any process that speaks this contract can be a teammate.
@@ -139,14 +151,14 @@ Both pieces (leader mirror + adapter entry) are required. The shim enables step 
 ## What happens per task
 
 1. Lead creates a task via Claude Code's task list
-2. Adapter picks it up in its poll loop (1.5s default)
+2. Adapter picks it up in its event-driven inbox/task loop (with polling fallback)
 3. Adapter claims it via compare-and-set under a file lock
-4. Adapter sends the task description to the selected backend: Codex via App Server or fresh `codex exec`; Gemini via headless `gemini --prompt ... --output-format stream-json`; Kimi via headless `kimi --print --output-format stream-json`
+4. Adapter sends the task description to the selected backend: Codex via App Server or fresh `codex exec`; Gemini via ACP or headless `gemini --prompt ... --output-format stream-json`; Kimi via headless `kimi --print --output-format stream-json`
 5. The backend executes: reads files, writes files, runs commands, calls wrapper MCP tools to update task status / send messages to peers
 6. Task completes; adapter writes `task_complete` to lead's inbox
 7. Codex App Server teammates can incorporate peer messages mid-execution via `turn/steer`; Gemini and Kimi teammates currently receive peer messages on the next poll / prompt boundary rather than live App Server steering.
 
-The wrapper MCP server exposes a narrowed 6-tool surface to external backends (`send_message`, `task_update`, `task_create`, `read_inbox`, `task_list`, `read_config`). Destructive tools like `team_delete` and `force_kill_teammate` are deliberately blocked — Codex, Gemini, or Kimi has full coding access but cannot break the team.
+The wrapper MCP server exposes a narrowed protocol surface to external backends: core team tools (`send_message`, `task_update`, `task_create`, `task_batch_summary`, `read_inbox`, `task_list`, `read_config`), rich capability lookup (`mcp_anyteam_capability_manifest`), and non-destructive shadow helpers for filesystem/search/web access. Destructive tools like `team_delete` and `force_kill_teammate` are deliberately blocked — Codex, Gemini, or Kimi has full coding access but cannot break the team.
 
 ## Extending to new models
 
