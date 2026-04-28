@@ -11,6 +11,7 @@ from __future__ import annotations
 import json
 import inspect
 import time
+from pathlib import Path
 from typing import Any
 
 from claude_teams._filelock import file_lock as _file_lock  # type: ignore[import-untyped]
@@ -102,7 +103,12 @@ def result_has_send_message_tool_call(result: Any) -> bool:
     return getattr(result, "tool_call_events", 0) > 0
 
 
-def read_agent_manifest(team: str, agent: str) -> dict[str, Any] | None:
+def read_agent_manifest(
+    team: str,
+    agent: str,
+    *,
+    teams_root: Any | None = None,
+) -> dict[str, Any] | None:
     """Read one cached Agent Card manifest if present.
 
     Native host Claude teammates may have no routed-backend manifest; callers
@@ -110,7 +116,8 @@ def read_agent_manifest(team: str, agent: str) -> dict[str, Any] | None:
     default regime.
     """
 
-    path = _teams.TEAMS_DIR / team / "manifests" / f"{agent}.json"
+    root = Path(teams_root) if teams_root is not None else _teams.TEAMS_DIR
+    path = root / team / "manifests" / f"{agent}.json"
     try:
         raw = json.loads(path.read_text(encoding="utf-8"))
     except FileNotFoundError:

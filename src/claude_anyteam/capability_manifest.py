@@ -132,6 +132,92 @@ def load_manifest_cache(team_root: Path, *, self_name: str | None = None) -> dic
     return cache
 
 
+def _team_config_member_names(team_root: Path) -> list[str] | None:
+    """Return roster names from ``config.json`` or ``None`` when unavailable.
+
+    R12 originally filled the cache by scanning ``manifests/*.json``.  The
+    HydraTeams-style prewarm path is roster-driven instead: at formation/boot,
+    enumerate known teammates and call the protocol helper
+    ``read_agent_manifest`` for each one.  Falling back to a manifest-dir scan
+    keeps older tests and partially-created teams tolerant when ``config.json``
+    is not available yet.
+    """
+
+    try:
+        raw = json.loads((team_root / "config.json").read_text(encoding="utf-8"))
+    except FileNotFoundError:
+        return None
+    except (OSError, json.JSONDecodeError) as e:
+        logger.warn("capability_manifest.config_scan_fail", team_root=str(team_root), error=str(e))
+        return None
+
+    members = raw.get("members") if isinstance(raw, dict) else None
+    if not isinstance(members, list):
+        return []
+
+    names: list[str] = []
+    for member in members:
+        if not isinstance(member, dict):
+            continue
+        name = member.get("name")
+        if isinstance(name, str) and name and name not in names:
+            names.append(name)
+    return names
+
+
+def load_manifest_cache_from_roster(
+    team: str,
+    *,
+    root: Path = TEAMS_ROOT,
+) -> dict[str, dict[str, Any]] | None:
+    """Prewarm manifests by walking the team roster and reading each Agent Card.
+
+    This is the HydraTeams-pattern lift: do the capability-manifest discovery
+    once at team formation / wrapper boot, before the first peer-DM or inbox
+    poll, rather than lazily discovering on first invocation.  ``None`` means
+    "no roster to drive from"; callers should fall back to the legacy directory
+    scan in that case.
+    """
+
+    team_root = root / team
+    names = _team_config_member_names(team_root)
+    if names is None:
+        return None
+
+    from . import protocol_io as pio
+
+    cache: dict[str, dict[str, Any]] = {}
+    for agent_name in names:
+        # Adapter peer caches historically kept the caller's own manifest in
+        # memory too; keep that behavior so wrapper MCP can answer self-lookups.
+        try:
+            manifest = pio.read_agent_manifest(team, agent_name, teams_root=root)
+        except (OSError, ValueError, json.JSONDecodeError) as e:
+            logger.warn(
+                "capability_manifest.roster_load_skip",
+                team=team,
+                agent=agent_name,
+                error=str(e),
+            )
+            continue
+        if manifest is None:
+            continue
+        agent = _manifest_agent_name(manifest_path_for_team_dir(team_root, agent_name), manifest)
+        cache[agent] = manifest
+    return cache
+
+
+def manifest_version_map(cache: dict[str, dict[str, Any]]) -> dict[str, str]:
+    """Return ``agent -> capability_version`` for every cached manifest."""
+
+    versions: dict[str, str] = {}
+    for agent, manifest in cache.items():
+        version = manifest_version(manifest)
+        if version is not None:
+            versions[agent] = version
+    return versions
+
+
 def apply_update_to_cache(
     cache: dict[str, dict[str, Any]],
     team_root: Path,
@@ -290,15 +376,37 @@ class CapabilityManifestCache:
     self_name: str | None = None
     root: Path = TEAMS_ROOT
     manifests: dict[str, dict[str, Any]] = field(default_factory=dict)
+    capability_versions: dict[str, str] = field(default_factory=dict)
+
+    @property
+    def entries(self) -> dict[str, dict[str, Any]]:
+        """Alias for the cached manifest entries keyed by teammate name.
+
+        The implementation historically called this map ``manifests``.  The
+        prewarm path uses the more explicit Agent-Card wording from the §3
+        lift target; keep both names pointing at the same cache so older call
+        sites and tests remain compatible.
+        """
+
+        return self.manifests
+
+    @entries.setter
+    def entries(self, value: dict[str, dict[str, Any]]) -> None:
+        self.manifests = value
+        self.capability_versions = manifest_version_map(self.manifests)
 
     @property
     def team_root(self) -> Path:
         return self.root / self.team
 
     def load_startup(self) -> None:
-        # Load the complete local Agent Card cache. Adapter consumers usually
-        # read peers from it; wrapper MCP can also answer questions about the
-        # caller's own manifest without a special case.
+        # Prewarm the complete local Agent Card cache. Adapter consumers
+        # usually read peers from it; wrapper MCP can also answer questions
+        # about the caller's own manifest without a special case. Prefer the
+        # HydraTeams-style roster walk (read_agent_manifest for every member)
+        # so discovery is complete before the first inbox poll / peer-DM.
+        # Fall back to the legacy directory scan when no team config exists
+        # yet (e.g. focused unit tests with only manifests on disk).
         #
         # S10b ablation per S10-ablation-implementation-spec.md §1: when
         # ``CLAUDE_ANYTEAM_DISABLE_MANIFEST_CACHE=1``, skip the load so peers
@@ -307,30 +415,50 @@ class CapabilityManifestCache:
         if os.environ.get("CLAUDE_ANYTEAM_DISABLE_MANIFEST_CACHE") == "1":
             logger.info("capability_manifest.cache_disabled_by_env")
             self.manifests = {}
+            self.capability_versions = {}
             return
-        self.manifests = load_manifest_cache(self.team_root)
+        manifests = load_manifest_cache_from_roster(
+            self.team,
+            root=self.root,
+        )
+        if manifests is None:
+            manifests = load_manifest_cache(self.team_root)
+        self.manifests = manifests
+        self.capability_versions = manifest_version_map(self.manifests)
 
     def refresh_from_inbox(self, *, unread_only: bool = False) -> int:
         if not self.self_name:
             return 0
-        return refresh_cache_from_inbox(
+        changed = refresh_cache_from_inbox(
             self.manifests,
             self.team_root,
             self_name=self.self_name,
             unread_only=unread_only,
         )
+        if changed:
+            self.capability_versions = manifest_version_map(self.manifests)
+        return changed
 
     def apply_update(self, update: CapabilityManifestUpdatedIn) -> bool:
         # S10b ablation: no-op when manifest cache is disabled — incoming
         # capability updates are silently dropped so peers remain unaware.
         if os.environ.get("CLAUDE_ANYTEAM_DISABLE_MANIFEST_CACHE") == "1":
             return False
-        return apply_update_to_cache(
+        changed = apply_update_to_cache(
             self.manifests,
             self.team_root,
             update,
             self_name=self.self_name,
         )
+        if update.removed:
+            self.capability_versions.pop(update.agent_name, None)
+        elif changed:
+            version = manifest_version(self.manifests.get(update.agent_name))
+            if version is not None:
+                self.capability_versions[update.agent_name] = version
+            else:
+                self.capability_versions.pop(update.agent_name, None)
+        return changed
 
     def get(self, agent_name: str) -> dict[str, Any] | None:
         return self.manifests.get(agent_name)
