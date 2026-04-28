@@ -354,6 +354,20 @@ def visibility_event_path(team: str, agent: str):
     return _visibility_events_dir(team) / f"{agent}.jsonl"
 
 
+def team_visibility_event_path(team: str):
+    """Return the aggregate per-team VisibilityEvent JSONL stream path.
+
+    The canonical durable store remains the per-agent ``events/<agent>.jsonl``
+    files from R16.  The lightweight live UI projector added for §2 also needs
+    a single attach point, so every append is mirrored into this team stream
+    under the same ``events/.lock``.  Keep the aggregate outside ``events/`` so
+    scorer-time readers that glob per-agent ``events/*.jsonl`` never double
+    count the mirrored rows.
+    """
+
+    return _m.TEAMS_DIR / team / "visibility.jsonl"
+
+
 def append_visibility_event(
     team: str,
     agent: str,
@@ -379,6 +393,12 @@ def append_visibility_event(
     line = envelope.model_dump_json(by_alias=True, exclude_none=True)
     with _file_lock(events_dir / ".lock"):
         with (events_dir / f"{agent}.jsonl").open("a", encoding="utf-8") as f:
+            f.write(line)
+            f.write("\n")
+        # §2 UI projection attach point: mirror the same full-fidelity
+        # envelope into a per-team stream so a lead can attach once without
+        # knowing every active teammate file up front.
+        with team_visibility_event_path(team).open("a", encoding="utf-8") as f:
             f.write(line)
             f.write("\n")
     # Some filelock implementations may unlink an empty lockfile on release;

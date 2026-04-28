@@ -79,7 +79,8 @@ def _build_run_parser() -> argparse.ArgumentParser:
             "  claude-anyteam team-config  Print resolved spawn-time config for a teammate (host model + adapter overrides)\n"
             "  claude-anyteam team-prune-dead  Remove members whose backing tmux pane is gone (use --yes to apply)\n"
             "  claude-anyteam diagnose     Inspect adapter incident artifacts under ~/.claude/teams/<team>/diagnostics/\n"
-            "  claude-anyteam status       One-screen team snapshot — roster, adapter overrides, incidents, last activity"
+            "  claude-anyteam status       One-screen team snapshot — roster, adapter overrides, incidents, last activity\n"
+            "  claude-anyteam visibility-tail  Follow the live VisibilityEvent JSONL stream"
         ),
         formatter_class=argparse.RawDescriptionHelpFormatter,
     )
@@ -395,6 +396,9 @@ def main(argv: list[str] | None = None) -> int:
         if command == "status":
             from . import status_cli
             return status_cli.main(argv[1:])
+        if command == "visibility-tail":
+            from . import visibility_tail
+            return visibility_tail.main(argv[1:])
 
     args = _parse_args(argv)
 
