@@ -2932,6 +2932,54 @@ def _format_provider_walkthroughs(
     return "\n\n".join(blocks)
 
 
+def _signin_command(provider_key: str) -> tuple[str, str | None]:
+    """Returns (command, optional alternative hint) for the sign-in step."""
+    if provider_key == "codex":
+        return (f"{CODEX_CLI_BINARY}", "opens an OAuth flow on first run")
+    if provider_key == "gemini":
+        return (f"{GEMINI_CLI_BINARY}", "or set GEMINI_API_KEY / configure Vertex")
+    if provider_key == "kimi":
+        return (f"{KIMI_CLI_BINARY} login", None)
+    return (provider_key, None)
+
+
+def _format_signin_cta(
+    statuses: tuple[ProviderStatus, ...] | list[ProviderStatus],
+) -> str:
+    """Big, prominent box at the very end of install output telling the user
+    EXACTLY which sign-in commands to run for installed-but-not-signed-in
+    providers. The walkthroughs above already mention this, but they're
+    buried mid-output. This is the action-required-before-you-can-use-it CTA.
+    """
+    pending = [s for s in statuses if s.state == "NEEDS_SIGNIN"]
+    if not pending:
+        return ""
+    theme = get_theme()
+    if theme.color:
+        body: list[str] = []
+        for idx, status in enumerate(pending):
+            cmd, hint = _signin_command(status.provider_key)
+            if idx > 0:
+                body.append("")
+            body.append(f"{theme.symbols['info']} {theme.heading(status.display_name)} {theme.muted('— signed in: no')}")
+            body.append(f"  {theme.symbols['arrow']} {theme.muted('Run:')} {theme.accent(cmd)}")
+            if hint:
+                body.append(f"    {theme.muted(f'({hint})')}")
+        body.append("")
+        body.append(f"{theme.symbols['warn']} {theme.warn('Then restart Claude Code')} {theme.muted('so the new sign-in state is picked up.')}")
+        return render_box(theme.heading("Action required — sign in to start using teammates"), body, "magenta", theme=theme)
+    # Plain-text fallback for tests / piped output.
+    lines = ["Action required — sign in to start using teammates:", ""]
+    for status in pending:
+        cmd, hint = _signin_command(status.provider_key)
+        lines.append(f"  {status.display_name}:")
+        suffix = f"  ({hint})" if hint else ""
+        lines.append(f"    Run: {cmd}{suffix}")
+    lines.append("")
+    lines.append("Then restart Claude Code so the new sign-in state is picked up.")
+    return "\n".join(lines)
+
+
 def _format_no_provider_refusal_message() -> str:
     return (
         "Refusing to install — no provider is ready.\n"
@@ -3113,6 +3161,12 @@ def format_install_message(result: InstallResult, *, include_provider_status: bo
         lines.append(render_box(theme.success("Setup applied"), themed_lines, "green", theme=theme))
     else:
         lines.append("\n".join(receipt_lines))
+
+    # Final CTA: if any installed providers still need sign-in, render a big
+    # action-required box AT THE BOTTOM so the user can't miss the next step.
+    cta = _format_signin_cta((codex_status, gemini_status, kimi_status))
+    if cta:
+        lines.append(cta)
     return "\n\n".join(lines)
 
 
