@@ -417,6 +417,15 @@ def _wait_for_binary(name: str, *, attempts: int = 6, delay_s: float = 0.25) -> 
             for ext in ("", ".exe", ".cmd", ".bat"):
                 cand = os.path.join(bin_dir, f"{name}{ext}")
                 if os.path.isfile(cand):
+                    # Critical: ensure the directory containing this binary
+                    # is on PATH so later shutil.which() calls (e.g. inside
+                    # _check_kimi_cli) succeed too. Without this, _wait_for_binary
+                    # returns a path the install-success message uses, but the
+                    # provider-status table still reports the binary as missing.
+                    current = os.environ.get("PATH", "")
+                    parts = current.split(os.pathsep) if current else []
+                    if bin_dir not in parts:
+                        os.environ["PATH"] = bin_dir + os.pathsep + current
                     return cand
         time.sleep(delay_s)
         _refresh_path_for_uv_tools()
@@ -632,6 +641,7 @@ def _offer_provider_dependency_installs(*, no_input: bool, stream: TextIO) -> No
                 file=stream,
             )
         else:
+            issue_url = _issue_url(title=f"{label} auto-install failed", raw_error=output)
             body = [
                 f"{theme.symbols['error']} {theme.heading(f'I tried to install {label}, but it failed.')}",
                 theme.muted("Raw installer output:"),
@@ -639,11 +649,14 @@ def _offer_provider_dependency_installs(*, no_input: bool, stream: TextIO) -> No
                 "",
                 theme.muted("Try this next:"),
                 *(f"  {theme.muted(f'{idx}.')} {step}" for idx, step in enumerate(_manual_provider_steps(key), start=1)),
-                "",
-                theme.muted("Still stuck? Report it:"),
-                f"  {theme.accent(_issue_url(title=f'{label} auto-install failed', raw_error=output))}",
             ]
             print(render_box(theme.danger(f"{label} auto-install failed"), body, "red", theme=theme), file=stream)
+            # URL outside the box so terminals render it as one clickable line
+            # instead of word-wrapping the prefilled body into ~17 lines.
+            print(
+                f"{theme.symbols['info']} {theme.muted('Open in browser to report:')}\n  {theme.accent(issue_url)}",
+                file=stream,
+            )
 
 
 def _install_command(
@@ -699,7 +712,11 @@ def _install_command(
             provider_status_callback=_print_provider_status,
             force_empty=force_empty or self_heal,
             no_allowlist=no_allowlist,
-            register_plugin=True,
+            # Skip plugin registration when invoked from the npm wrapper —
+            # setup.js handles `claude plugin install` itself afterward and
+            # has better error UX. Letting the Python child also try produces
+            # a redundant warning box for the same failure.
+            register_plugin=os.environ.get("CLAUDE_ANYTEAM_NPM_PARENT") != "1",
         )
     except InstallError as exc:
         exit_code = getattr(exc, "cli_exit_code", 2)
