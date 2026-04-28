@@ -414,6 +414,11 @@ def _offer_provider_dependency_installs(*, no_input: bool, stream: TextIO) -> No
             print(f"I could not find the installer tool for {label}. Try this next:", file=stream)
             for idx, step in enumerate(_manual_provider_steps(key), start=1):
                 print(f"  {idx}. {step}", file=stream)
+            print("Still stuck? Report it:", file=stream)
+            print(
+                f"  {_issue_url(title=f'{label} installer tool missing', raw_error=f'No installer command found for {label}')}",
+                file=stream,
+            )
             continue
         display, argv = command
         print(f"Trying: {display}", file=stream)
