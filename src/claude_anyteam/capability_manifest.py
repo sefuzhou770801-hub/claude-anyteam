@@ -12,6 +12,8 @@ from __future__ import annotations
 
 import json
 import os
+import time
+from concurrent.futures import FIRST_COMPLETED, Future, ThreadPoolExecutor, wait
 from dataclasses import dataclass, field
 from pathlib import Path
 from tempfile import NamedTemporaryFile
@@ -25,6 +27,10 @@ from .messages import CapabilityManifestUpdatedIn, CapabilityManifestUpdatedOut,
 
 TEAMS_ROOT = Path.home() / ".claude" / "teams"
 MANIFEST_MESSAGE_KIND = "capability_manifest_updated"
+DEFAULT_PREWARM_CONCURRENCY = 4
+DEFAULT_PREWARM_TIMEOUT_S = 2.0
+PREWARM_CONCURRENCY_ENV = "CLAUDE_ANYTEAM_MANIFEST_PREWARM_CONCURRENCY"
+PREWARM_TIMEOUT_ENV = "CLAUDE_ANYTEAM_MANIFEST_PREWARM_TIMEOUT_S"
 
 
 def team_dir(team: str) -> Path:
@@ -108,6 +114,36 @@ def manifest_version(manifest: dict[str, Any] | None) -> str | None:
     return str(value) if value is not None else None
 
 
+def _positive_int_from_env(name: str, default: int) -> int:
+    raw = os.environ.get(name)
+    if raw in (None, ""):
+        return default
+    try:
+        return max(1, int(raw))
+    except ValueError:
+        logger.warn("capability_manifest.invalid_int_env", name=name, value=raw, default=default)
+        return default
+
+
+def _positive_float_from_env(name: str, default: float) -> float:
+    raw = os.environ.get(name)
+    if raw in (None, ""):
+        return default
+    try:
+        return max(0.001, float(raw))
+    except ValueError:
+        logger.warn("capability_manifest.invalid_float_env", name=name, value=raw, default=default)
+        return default
+
+
+def prewarm_concurrency() -> int:
+    return _positive_int_from_env(PREWARM_CONCURRENCY_ENV, DEFAULT_PREWARM_CONCURRENCY)
+
+
+def prewarm_timeout_s() -> float:
+    return _positive_float_from_env(PREWARM_TIMEOUT_ENV, DEFAULT_PREWARM_TIMEOUT_S)
+
+
 def load_manifest_cache(team_root: Path, *, self_name: str | None = None) -> dict[str, dict[str, Any]]:
     """Load all cached manifests for ``team_root`` into memory.
 
@@ -169,14 +205,18 @@ def load_manifest_cache_from_roster(
     team: str,
     *,
     root: Path = TEAMS_ROOT,
+    concurrency: int | None = None,
+    timeout_s: float | None = None,
 ) -> dict[str, dict[str, Any]] | None:
     """Prewarm manifests by walking the team roster and reading each Agent Card.
 
     This is the HydraTeams-pattern lift: do the capability-manifest discovery
     once at team formation / wrapper boot, before the first peer-DM or inbox
-    poll, rather than lazily discovering on first invocation.  ``None`` means
-    "no roster to drive from"; callers should fall back to the legacy directory
-    scan in that case.
+    poll, rather than lazily discovering on first invocation. Reads are driven
+    through a bounded fan-out so large teams cannot create an unbounded burst of
+    filesystem/protocol work; each peer read has an independent soft timeout
+    and failures are logged/skipped. ``None`` means "no roster to drive from";
+    callers should fall back to the legacy directory scan in that case.
     """
 
     team_root = root / team
@@ -186,24 +226,104 @@ def load_manifest_cache_from_roster(
 
     from . import protocol_io as pio
 
+    max_workers = min(max(1, concurrency or prewarm_concurrency()), max(1, len(names)))
+    per_manifest_timeout = timeout_s if timeout_s is not None else prewarm_timeout_s()
+    per_manifest_timeout = max(0.001, float(per_manifest_timeout))
+
     cache: dict[str, dict[str, Any]] = {}
-    for agent_name in names:
+    name_iter = iter(names)
+
+    def _read_one(agent_name: str) -> dict[str, Any] | None:
         # Adapter peer caches historically kept the caller's own manifest in
         # memory too; keep that behavior so wrapper MCP can answer self-lookups.
+        return pio.read_agent_manifest(team, agent_name, teams_root=root)
+
+    executor = ThreadPoolExecutor(
+        max_workers=max_workers,
+        thread_name_prefix="cap-manifest-prewarm",
+    )
+    pending: dict[Future[dict[str, Any] | None], tuple[str, float]] = {}
+
+    def _submit_next() -> bool:
         try:
-            manifest = pio.read_agent_manifest(team, agent_name, teams_root=root)
-        except (OSError, ValueError, json.JSONDecodeError) as e:
-            logger.warn(
-                "capability_manifest.roster_load_skip",
-                team=team,
-                agent=agent_name,
-                error=str(e),
+            agent_name = next(name_iter)
+        except StopIteration:
+            return False
+        pending[executor.submit(_read_one, agent_name)] = (agent_name, time.monotonic())
+        return True
+
+    for _ in range(max_workers):
+        if not _submit_next():
+            break
+
+    try:
+        while pending:
+            now = time.monotonic()
+            timed_out = [
+                (future, agent_name)
+                for future, (agent_name, started_at) in pending.items()
+                if now - started_at >= per_manifest_timeout
+            ]
+            for future, agent_name in timed_out:
+                pending.pop(future, None)
+                future.cancel()
+                logger.warn(
+                    "capability_manifest.roster_load_timeout",
+                    team=team,
+                    agent=agent_name,
+                    timeout_s=per_manifest_timeout,
+                )
+
+            if not pending:
+                break
+
+            now = time.monotonic()
+            next_timeout = min(
+                max(0.0, started_at + per_manifest_timeout - now)
+                for _agent_name, started_at in pending.values()
             )
-            continue
-        if manifest is None:
-            continue
-        agent = _manifest_agent_name(manifest_path_for_team_dir(team_root, agent_name), manifest)
-        cache[agent] = manifest
+            done, _not_done = wait(
+                pending.keys(),
+                timeout=next_timeout,
+                return_when=FIRST_COMPLETED,
+            )
+            if not done:
+                continue
+
+            for future in done:
+                agent_name, _started_at = pending.pop(future)
+                try:
+                    manifest = future.result()
+                except (OSError, ValueError, json.JSONDecodeError) as e:
+                    logger.warn(
+                        "capability_manifest.roster_load_skip",
+                        team=team,
+                        agent=agent_name,
+                        error=str(e),
+                    )
+                    _submit_next()
+                    continue
+                if manifest is not None:
+                    agent = _manifest_agent_name(
+                        manifest_path_for_team_dir(team_root, agent_name),
+                        manifest,
+                    )
+                    cache[agent] = manifest
+                _submit_next()
+    finally:
+        # Do not wait for timed-out reads. They are fail-soft by design and may
+        # still finish on their worker thread; pending-but-unstarted futures are
+        # cancelled so shutdown does not add more work after we return.
+        executor.shutdown(wait=False, cancel_futures=True)
+
+    logger.info(
+        "capability_manifest.roster_prewarm_complete",
+        team=team,
+        members=len(names),
+        loaded=len(cache),
+        concurrency=max_workers,
+        timeout_s=per_manifest_timeout,
+    )
     return cache
 
 
@@ -399,7 +519,12 @@ class CapabilityManifestCache:
     def team_root(self) -> Path:
         return self.root / self.team
 
-    def load_startup(self) -> None:
+    def load_startup(
+        self,
+        *,
+        concurrency: int | None = None,
+        timeout_s: float | None = None,
+    ) -> None:
         # Prewarm the complete local Agent Card cache. Adapter consumers
         # usually read peers from it; wrapper MCP can also answer questions
         # about the caller's own manifest without a special case. Prefer the
@@ -420,6 +545,8 @@ class CapabilityManifestCache:
         manifests = load_manifest_cache_from_roster(
             self.team,
             root=self.root,
+            concurrency=concurrency,
+            timeout_s=timeout_s,
         )
         if manifests is None:
             manifests = load_manifest_cache(self.team_root)

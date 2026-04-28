@@ -1,15 +1,23 @@
 from __future__ import annotations
 
 import os
+import json
 import shlex
 import shutil
 import subprocess
 import time
+from concurrent.futures import FIRST_COMPLETED, Future, ThreadPoolExecutor, wait
 from pathlib import Path
+from typing import Any
 
 from claude_teams import messaging, teams
 from claude_teams.models import COLOR_PALETTE, InboxMessage, TeammateMember
 from claude_teams.teams import _VALID_NAME_RE
+
+DEFAULT_MANIFEST_READ_CONCURRENCY = 4
+DEFAULT_MANIFEST_READ_TIMEOUT_S = 2.0
+MANIFEST_READ_CONCURRENCY_ENV = "CLAUDE_TEAMS_MANIFEST_READ_CONCURRENCY"
+MANIFEST_READ_TIMEOUT_ENV = "CLAUDE_TEAMS_MANIFEST_READ_TIMEOUT_S"
 
 
 def discover_harness_binary(name: str) -> str | None:
@@ -41,6 +49,135 @@ def assign_color(team_name: str, base_dir: Path | None = None) -> str:
     config = teams.read_config(team_name, base_dir)
     count = sum(1 for m in config.members if isinstance(m, TeammateMember))
     return COLOR_PALETTE[count % len(COLOR_PALETTE)]
+
+
+def _teams_dir(base_dir: Path | None = None) -> Path:
+    return (base_dir / "teams") if base_dir else teams.TEAMS_DIR
+
+
+def _positive_int_env(name: str, default: int) -> int:
+    raw = os.environ.get(name)
+    if raw in (None, ""):
+        return default
+    try:
+        return max(1, int(raw))
+    except ValueError:
+        return default
+
+
+def _positive_float_env(name: str, default: float) -> float:
+    raw = os.environ.get(name)
+    if raw in (None, ""):
+        return default
+    try:
+        return max(0.001, float(raw))
+    except ValueError:
+        return default
+
+
+def read_team_manifests_parallel(
+    team_name: str,
+    *,
+    agent_names: list[str] | None = None,
+    base_dir: Path | None = None,
+    concurrency: int | None = None,
+    timeout_s: float | None = None,
+) -> dict[str, dict[str, Any]]:
+    """Read rich teammate manifests with bounded parallelism.
+
+    This is the substrate-side companion to adapter prewarm: callers that need
+    many Agent Cards can fan out without one thread per teammate. Missing,
+    invalid, or slow manifests are skipped so a large team with one stale peer
+    does not block formation/spawn-time discovery.
+    """
+
+    if agent_names is None:
+        config = teams.read_config(team_name, base_dir)
+        agent_names = [m.name for m in config.members if getattr(m, "name", None)]
+    if not agent_names:
+        return {}
+
+    max_workers = min(
+        max(1, concurrency or _positive_int_env(
+            MANIFEST_READ_CONCURRENCY_ENV,
+            DEFAULT_MANIFEST_READ_CONCURRENCY,
+        )),
+        len(agent_names),
+    )
+    per_manifest_timeout = max(
+        0.001,
+        float(
+            timeout_s
+            if timeout_s is not None
+            else _positive_float_env(
+                MANIFEST_READ_TIMEOUT_ENV,
+                DEFAULT_MANIFEST_READ_TIMEOUT_S,
+            )
+        ),
+    )
+    manifest_dir = _teams_dir(base_dir) / team_name / "manifests"
+    names_iter = iter(agent_names)
+    results: dict[str, dict[str, Any]] = {}
+
+    def _read_one(agent_name: str) -> dict[str, Any] | None:
+        path = manifest_dir / f"{agent_name}.json"
+        try:
+            raw = json.loads(path.read_text(encoding="utf-8"))
+        except (FileNotFoundError, OSError, json.JSONDecodeError):
+            return None
+        return raw if isinstance(raw, dict) else None
+
+    executor = ThreadPoolExecutor(
+        max_workers=max_workers,
+        thread_name_prefix="team-manifest-read",
+    )
+    pending: dict[Future[dict[str, Any] | None], tuple[str, float]] = {}
+
+    def _submit_next() -> bool:
+        try:
+            agent_name = next(names_iter)
+        except StopIteration:
+            return False
+        pending[executor.submit(_read_one, agent_name)] = (agent_name, time.monotonic())
+        return True
+
+    for _ in range(max_workers):
+        if not _submit_next():
+            break
+
+    try:
+        while pending:
+            now = time.monotonic()
+            for future, (agent_name, started_at) in list(pending.items()):
+                if now - started_at >= per_manifest_timeout:
+                    pending.pop(future, None)
+                    future.cancel()
+
+            if not pending:
+                break
+
+            now = time.monotonic()
+            next_timeout = min(
+                max(0.0, started_at + per_manifest_timeout - now)
+                for _agent_name, started_at in pending.values()
+            )
+            done, _not_done = wait(
+                pending.keys(),
+                timeout=next_timeout,
+                return_when=FIRST_COMPLETED,
+            )
+            if not done:
+                continue
+            for future in done:
+                agent_name, _started_at = pending.pop(future)
+                manifest = future.result()
+                if manifest is not None:
+                    results[agent_name] = manifest
+                _submit_next()
+    finally:
+        executor.shutdown(wait=False, cancel_futures=True)
+
+    return results
 
 
 def skip_permissions() -> bool:
