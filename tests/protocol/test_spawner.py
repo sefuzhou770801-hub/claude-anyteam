@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import subprocess as sp
 from pathlib import Path
 from unittest.mock import patch, MagicMock
 
@@ -19,6 +20,31 @@ from claude_teams.spawner import (
 
 TEAM = "test-team"
 SESSION_ID = "test-session-id"
+
+
+def _git(cwd: Path, *args: str) -> str:
+    result = sp.run(
+        ["git", "-C", str(cwd), *args],
+        capture_output=True,
+        text=True,
+        check=True,
+    )
+    return result.stdout.strip()
+
+
+def _git_index(cwd: Path) -> Path:
+    raw = _git(cwd, "rev-parse", "--git-path", "index")
+    path = Path(raw)
+    return path.resolve() if path.is_absolute() else (cwd / path).resolve()
+
+
+def _init_repo(path: Path) -> None:
+    _git(path.parent, "init", "-q", path.name)
+    _git(path, "config", "user.name", "Spawner Test")
+    _git(path, "config", "user.email", "spawner-test@example.invalid")
+    (path / "README.md").write_text("base\n")
+    _git(path, "add", "README.md")
+    _git(path, "commit", "-q", "-m", "base")
 
 
 @pytest.fixture
@@ -209,6 +235,66 @@ class TestSpawnTeammate:
         config = teams.read_config(TEAM, base_dir=team_dir)
         names = [m.name for m in config.members]
         assert "broken-worker" not in names
+
+    @patch("claude_teams.spawner.subprocess")
+    def test_colliding_git_cwd_spawns_into_isolated_worktree(
+        self,
+        mock_subprocess: MagicMock,
+        team_dir: Path,
+        tmp_path: Path,
+        monkeypatch: pytest.MonkeyPatch,
+    ) -> None:
+        mock_subprocess.run.return_value.stdout = "%42\n"
+        repo = tmp_path / "repo"
+        _init_repo(repo)
+        teams.add_member(
+            TEAM,
+            _make_member("existing-worker", cwd=str(repo)),
+            base_dir=team_dir,
+        )
+        monkeypatch.setenv(
+            "CLAUDE_TEAMS_WORKTREE_ROOT", str(tmp_path / "isolated-worktrees")
+        )
+
+        member = spawn_teammate(
+            TEAM,
+            "new-worker",
+            "Do research",
+            "/usr/local/bin/claude",
+            SESSION_ID,
+            cwd=str(repo),
+            base_dir=team_dir,
+        )
+
+        isolated = Path(member.cwd)
+        assert isolated != repo
+        assert isolated.is_dir()
+        assert _git(isolated, "rev-parse", "--show-toplevel") == str(isolated)
+        assert _git_index(isolated) != _git_index(repo)
+
+        def commit_file(cwd: Path, name: str, body: str) -> None:
+            (cwd / name).write_text(body)
+            _git(cwd, "add", name)
+            _git(cwd, "commit", "-q", "-m", f"add {name}")
+
+        from concurrent.futures import ThreadPoolExecutor
+
+        with ThreadPoolExecutor(max_workers=2) as pool:
+            original = pool.submit(commit_file, repo, "original.txt", "original\n")
+            isolated_commit = pool.submit(
+                commit_file, isolated, "isolated.txt", "isolated\n"
+            )
+            original.result(timeout=5)
+            isolated_commit.result(timeout=5)
+
+        assert _git(repo, "show", "--name-only", "--format=", "HEAD").splitlines() == [
+            "original.txt"
+        ]
+        assert _git(
+            isolated, "show", "--name-only", "--format=", "HEAD"
+        ).splitlines() == ["isolated.txt"]
+        assert _git(repo, "status", "--short") == ""
+        assert _git(isolated, "status", "--short") == ""
 
 
 class TestKillTmuxPane:
