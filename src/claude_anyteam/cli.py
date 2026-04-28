@@ -9,6 +9,7 @@ from __future__ import annotations
 
 import argparse
 import importlib.metadata
+import locale
 import os
 import platform
 import shutil
@@ -43,20 +44,55 @@ def _strip_ansi(text: str) -> str:
     return text.replace("\033[1m", "").replace("\033[0m", "")
 
 
+def _supports_unicode() -> bool:
+    if os.environ.get("CLAUDE_ANYTEAM_ASCII") == "1" or os.environ.get("CLAUDE_ANYTEAM_FORCE_ASCII") == "1":
+        return False
+    if os.environ.get("CLAUDE_ANYTEAM_UNICODE") == "1" or os.environ.get("CLAUDE_ANYTEAM_FORCE_UNICODE") == "1":
+        return True
+    env_locale = os.environ.get("LC_ALL") or os.environ.get("LC_CTYPE") or os.environ.get("LANG") or ""
+    if env_locale.upper() in {"C", "POSIX"}:
+        return False
+    if "UTF-8" in env_locale.upper() or "UTF8" in env_locale.upper():
+        return True
+    locale_name = " ".join(
+        value
+        for value in (
+            locale.getpreferredencoding(False),
+            getattr(sys.stdout, "encoding", None),
+        )
+        if value
+    )
+    if "UTF-8" in locale_name.upper() or "UTF8" in locale_name.upper():
+        return True
+    if sys.platform == "win32":
+        return bool(
+            os.environ.get("WT_SESSION")
+            or os.environ.get("TERM_PROGRAM")
+            or os.environ.get("ConEmuANSI") == "ON"
+            or os.environ.get("ANSICON")
+        )
+    return False
+
+
 def _render_box(title: str, lines: list[str]) -> str:
     rows = [title, *lines]
     width = max((len(_strip_ansi(row)) for row in rows), default=0)
+    if _supports_unicode():
+        borders = ("╭", "╮", "├", "┤", "╰", "╯", "─", "│")
+    else:
+        borders = ("+", "+", "+", "+", "+", "+", "-", "|")
+    tl, tr, ml, mr, bl, br, h, v = borders
 
     def fill(row: str) -> str:
         return row + " " * (width - len(_strip_ansi(row)))
 
     return "\n".join(
         [
-            f"╭{'─' * (width + 2)}╮",
-            f"│ {fill(rows[0])} │",
-            f"├{'─' * (width + 2)}┤",
-            *(f"│ {fill(row)} │" for row in rows[1:]),
-            f"╰{'─' * (width + 2)}╯",
+            f"{tl}{h * (width + 2)}{tr}",
+            f"{v} {fill(rows[0])} {v}",
+            f"{ml}{h * (width + 2)}{mr}",
+            *(f"{v} {fill(row)} {v}" for row in rows[1:]),
+            f"{bl}{h * (width + 2)}{br}",
         ]
     )
 
@@ -464,7 +500,7 @@ def _install_command(
         prompt_fn = _interactive_prompt
 
     _offer_provider_dependency_installs(
-        no_input=no_input or self_heal,
+        no_input=no_input or self_heal or assume_yes,
         stream=stream,
     )
 

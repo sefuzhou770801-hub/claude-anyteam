@@ -536,6 +536,38 @@ def test_dependency_installer_skips_cleanly_without_tty(monkeypatch):
     assert "Skipping interactive dependency install" in stream.getvalue()
 
 
+def test_install_command_assume_yes_suppresses_provider_auto_install(monkeypatch):
+    captured: dict[str, bool] = {}
+
+    def _capture_provider_install_mode(*, no_input: bool, stream: StringIO) -> None:
+        captured["no_input"] = no_input
+
+    def _raise_install_error(**_kwargs: Any) -> installer_mod.InstallResult:
+        raise installer_mod.InstallError(
+            title="stop",
+            explanation="done after provider check",
+            action="retry",
+            severity="blocker",
+        )
+
+    monkeypatch.setattr(cli_mod, "_offer_provider_dependency_installs", _capture_provider_install_mode)
+    monkeypatch.setattr(cli_mod, "install_settings", _raise_install_error)
+
+    cli_mod._install_command(assume_yes=True, out=StringIO())
+
+    assert captured["no_input"] is True
+
+
+def test_python_box_uses_ascii_when_locale_is_not_utf8(monkeypatch):
+    monkeypatch.setenv("LC_ALL", "C")
+    rendered = cli_mod._render_box("TITLE", ["body"])
+
+    assert rendered.startswith("+")
+    assert "|" in rendered
+    assert "╭" not in rendered
+    assert "│" not in rendered
+
+
 def test_npm_uv_tool_invocations_allow_prerelease_dependencies(tmp_path: Path):
     """Regression for fastmcp==3.0.0b1: every claude-anyteam uv tool resolve
     must opt into pre-releases so clean machines do not hit uv's resolver hint.

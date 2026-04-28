@@ -319,63 +319,128 @@ export async function detectUv() {
   return { path: candidate, version: result.stdout.trim() || result.stderr.trim() || 'uv' };
 }
 
-export async function installUv() {
+function uvPackageManagerPlans() {
   if (process.platform === 'win32') {
-    const attempts = [
-      { command: 'winget', args: ['install', '--id', 'Astral-sh.uv', '-e', '--accept-package-agreements', '--accept-source-agreements'] },
-      { command: 'scoop', args: ['install', 'uv'] },
-      { command: 'choco', args: ['install', 'uv', '-y'] },
+    return [
+      { name: 'winget', steps: [{ command: 'winget', args: ['install', '--id', 'Astral-sh.uv', '-e', '--accept-package-agreements', '--accept-source-agreements'] }] },
+      { name: 'scoop', steps: [{ command: 'scoop', args: ['install', 'uv'] }] },
+      { name: 'choco', steps: [{ command: 'choco', args: ['install', 'uv', '-y'] }] },
     ];
-    const failures = [];
-    for (const attempt of attempts) {
-      if (!(await which(attempt.command))) {
-        failures.push(`${attempt.command}: not found`);
-        continue;
+  }
+  if (process.platform === 'darwin') {
+    return [
+      { name: 'brew', steps: [{ command: 'brew', args: ['install', 'uv'] }] },
+    ];
+  }
+  return [
+    { name: 'apt-get', steps: [{ command: 'apt-get', args: ['update'] }, { command: 'apt-get', args: ['install', '-y', 'uv'] }] },
+    { name: 'dnf', steps: [{ command: 'dnf', args: ['install', '-y', 'uv'] }] },
+    { name: 'pacman', steps: [{ command: 'pacman', args: ['-S', '--noconfirm', 'uv'] }] },
+    { name: 'apk', steps: [{ command: 'apk', args: ['add', 'uv'] }] },
+  ];
+}
+
+function pythonPackageManagerPlans() {
+  if (process.platform === 'win32') {
+    return [
+      { name: 'winget', steps: [{ command: 'winget', args: ['install', '--id', 'Python.Python.3.12', '-e', '--accept-package-agreements', '--accept-source-agreements'] }] },
+      { name: 'scoop', steps: [{ command: 'scoop', args: ['install', 'python'] }] },
+      { name: 'choco', steps: [{ command: 'choco', args: ['install', 'python', '-y'] }] },
+    ];
+  }
+  if (process.platform === 'darwin') {
+    return [
+      { name: 'brew', steps: [{ command: 'brew', args: ['install', 'python'] }] },
+    ];
+  }
+  return [
+    { name: 'apt-get', steps: [{ command: 'apt-get', args: ['update'] }, { command: 'apt-get', args: ['install', '-y', 'python3', 'python3-venv', 'curl'] }] },
+    { name: 'dnf', steps: [{ command: 'dnf', args: ['install', '-y', 'python3', 'curl'] }] },
+    { name: 'pacman', steps: [{ command: 'pacman', args: ['-S', '--noconfirm', 'python', 'curl'] }] },
+    { name: 'apk', steps: [{ command: 'apk', args: ['add', 'python3', 'py3-pip', 'curl'] }] },
+  ];
+}
+
+async function runnableInstallStep(step) {
+  if (process.platform === 'win32' || process.platform === 'darwin' || process.getuid?.() === 0) {
+    return step;
+  }
+  const sudo = await which('sudo');
+  return sudo ? { command: 'sudo', args: [step.command, ...step.args] } : step;
+}
+
+async function runPackageManagerPlans(plans, verifyInstalled, failures) {
+  for (const plan of plans) {
+    let planFailed = false;
+    for (const step of plan.steps) {
+      if (!(await which(step.command))) {
+        failures.push(`${plan.name}: ${step.command} not found`);
+        planFailed = true;
+        break;
       }
-      const result = await runCommand(attempt.command, attempt.args, { env: process.env });
-      if (result.code === 0) {
-        const installed = await detectUv();
-        if (installed) {
-          return installed;
-        }
-        failures.push(`${attempt.command}: completed, but uv was not found on PATH yet`);
-      } else {
-        failures.push(`${attempt.command}: ${(result.stderr || result.stdout).trim() || `exit ${result.code}`}`);
+      const runnable = await runnableInstallStep(step);
+      const result = await runCommand(runnable.command, runnable.args, { env: process.env });
+      if (result.code !== 0) {
+        failures.push(`${runnable.command} ${runnable.args.join(' ')}: ${(result.stderr || result.stdout).trim() || `exit ${result.code}`}`);
+        planFailed = true;
+        break;
       }
     }
-
-    const shell = await which('pwsh') || await which('powershell.exe') || await which('powershell');
-    if (shell) {
-      const result = await runCommand(shell, [
-        '-NoProfile',
-        '-ExecutionPolicy',
-        'Bypass',
-        '-Command',
-        'irm https://astral.sh/uv/install.ps1 | iex',
-      ], { env: { ...process.env, UV_INSTALL_DIR } });
-      if (result.code === 0) {
-        const installed = await detectUv();
-        if (installed) {
-          return installed;
-        }
-        failures.push('official PowerShell installer: completed, but uv was not found on PATH yet');
-      } else {
-        failures.push(`official PowerShell installer: ${(result.stderr || result.stdout).trim() || `exit ${result.code}`}`);
-      }
-    } else {
-      failures.push('PowerShell: not found');
+    if (planFailed) {
+      continue;
     }
+    const installed = await verifyInstalled();
+    if (installed) {
+      return installed;
+    }
+    failures.push(`${plan.name}: completed, but the command was not found on PATH yet`);
+  }
+  return null;
+}
 
-    const error = new Error('Automatic uv installation did not finish on Windows.');
-    error.details = failures.join('\n');
-    throw error;
+async function installUvWithOfficialPowerShell(failures) {
+  const shell = await which('pwsh') || await which('powershell.exe') || await which('powershell');
+  if (!shell) {
+    failures.push('PowerShell: not found');
+    return null;
+  }
+  const result = await runCommand(shell, [
+    '-NoProfile',
+    '-ExecutionPolicy',
+    'Bypass',
+    '-Command',
+    'irm https://astral.sh/uv/install.ps1 | iex',
+  ], { env: { ...process.env, UV_INSTALL_DIR } });
+  if (result.code !== 0) {
+    failures.push(`official PowerShell installer: ${(result.stderr || result.stdout).trim() || `exit ${result.code}`}`);
+    return null;
+  }
+  const installed = await detectUv();
+  if (installed) {
+    return installed;
+  }
+  failures.push('official PowerShell installer: completed, but uv was not found on PATH yet');
+  return null;
+}
+
+async function installUvWithOfficialShell(failures) {
+  if (!(await which('sh'))) {
+    failures.push('official shell installer: sh not found');
+    return null;
   }
   const workingDir = await fs.mkdtemp(path.join(tmpdir(), 'claude-anyteam-uv-'));
   const scriptPath = path.join(workingDir, 'install-uv.sh');
   try {
-    const response = await fetch('https://astral.sh/uv/install.sh');
+    let response;
+    try {
+      response = await fetch('https://astral.sh/uv/install.sh');
+    } catch (error) {
+      failures.push(`official shell installer: download failed (${error.message})`);
+      return null;
+    }
     if (!response.ok) {
-      throw new Error(`Unable to download the official uv installer (${response.status} ${response.statusText}).`);
+      failures.push(`official shell installer: download failed (${response.status} ${response.statusText})`);
+      return null;
     }
     const script = await response.text();
     await fs.mkdir(UV_INSTALL_DIR, { recursive: true });
@@ -388,59 +453,44 @@ export async function installUv() {
       },
     });
     if (result.code !== 0) {
-      const error = new Error('The official uv installer exited unsuccessfully.');
-      error.details = (result.stderr || result.stdout).trim();
-      throw error;
+      failures.push(`official shell installer: ${(result.stderr || result.stdout).trim() || `exit ${result.code}`}`);
+      return null;
     }
     const installed = await detectUv();
-    if (!installed) {
-      throw new Error(`uv did not appear at ${path.join(UV_INSTALL_DIR, 'uv')} after installation.`);
+    if (installed) {
+      return installed;
     }
-    return installed;
+    failures.push(`official shell installer: completed, but uv did not appear at ${path.join(UV_INSTALL_DIR, 'uv')}`);
+    return null;
   } finally {
     await fs.rm(workingDir, { recursive: true, force: true });
   }
 }
 
-export async function installPython() {
-  const attempts = [];
-  if (process.platform === 'win32') {
-    attempts.push(
-      { command: 'winget', args: ['install', '--id', 'Python.Python.3.12', '-e', '--accept-package-agreements', '--accept-source-agreements'] },
-      { command: 'scoop', args: ['install', 'python'] },
-      { command: 'choco', args: ['install', 'python', '-y'] },
-    );
-  } else if (process.platform === 'darwin') {
-    attempts.push({ command: 'brew', args: ['install', 'python'] });
-  } else {
-    attempts.push(
-      { command: 'apt-get', args: ['update'] },
-      { command: 'apt-get', args: ['install', '-y', 'python3', 'python3-venv', 'curl'] },
-      { command: 'dnf', args: ['install', '-y', 'python3', 'curl'] },
-      { command: 'pacman', args: ['-S', '--noconfirm', 'python', 'curl'] },
-    );
+export async function installUv() {
+  const failures = [];
+  const fromPackageManager = await runPackageManagerPlans(uvPackageManagerPlans(), detectUv, failures);
+  if (fromPackageManager) {
+    return fromPackageManager;
   }
 
+  const installed = process.platform === 'win32'
+    ? await installUvWithOfficialPowerShell(failures)
+    : await installUvWithOfficialShell(failures);
+  if (installed) {
+    return installed;
+  }
+
+  const error = new Error(`Automatic uv installation did not finish on ${process.platform}.`);
+  error.details = failures.join('\n');
+  throw error;
+}
+
+export async function installPython() {
   const failures = [];
-  for (const attempt of attempts) {
-    if (!(await which(attempt.command))) {
-      failures.push(`${attempt.command}: not found`);
-      continue;
-    }
-    const command = process.platform === 'win32' || process.platform === 'darwin'
-      ? attempt.command
-      : (process.getuid?.() === 0 ? attempt.command : (await which('sudo') ? 'sudo' : attempt.command));
-    const args = command === attempt.command ? attempt.args : [attempt.command, ...attempt.args];
-    const result = await runCommand(command, args, { env: process.env });
-    if (result.code !== 0) {
-      failures.push(`${command} ${args.join(' ')}: ${(result.stderr || result.stdout).trim() || `exit ${result.code}`}`);
-      continue;
-    }
-    const detected = await detectPython();
-    if (detected) {
-      return detected;
-    }
-    failures.push(`${command} ${args.join(' ')}: completed, but Python was not found on PATH yet`);
+  const installed = await runPackageManagerPlans(pythonPackageManagerPlans(), detectPython, failures);
+  if (installed) {
+    return installed;
   }
 
   const error = new Error('Automatic Python installation did not finish.');

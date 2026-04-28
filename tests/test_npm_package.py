@@ -1,7 +1,12 @@
 from __future__ import annotations
 
 import json
+import os
+import shutil
+import subprocess
 from pathlib import Path
+
+import pytest
 
 
 ROOT = Path(__file__).resolve().parents[1]
@@ -139,6 +144,58 @@ def test_npm_installer_contains_windows_hardening_paths() -> None:
     assert 'Windows Defender PowerShell' in detect_source
     assert 'Windows single-terminal compatibility' in setup_source
     assert 'PowerShell as Administrator' in setup_source
+
+
+def test_npm_dependency_auto_install_paths_are_cross_platform() -> None:
+    detect_source = (NPM_DIR / 'lib' / 'detect.js').read_text(encoding='utf-8')
+
+    assert 'function uvPackageManagerPlans()' in detect_source
+    assert "'winget'" in detect_source
+    assert "'scoop'" in detect_source
+    assert "'choco'" in detect_source
+    assert "args: ['install', 'uv']" in detect_source
+    assert "command: 'apt-get'" in detect_source
+    assert "command: 'dnf'" in detect_source
+    assert "command: 'pacman'" in detect_source
+    assert "command: 'apk'" in detect_source
+    assert "args: ['add', 'uv']" in detect_source
+    assert "args: ['add', 'python3', 'py3-pip', 'curl']" in detect_source
+
+
+def test_npm_art_ascii_fallback_under_c_locale() -> None:
+    node = shutil.which('node')
+    if node is None:
+        pytest.skip('node is required for npm art fallback test')
+
+    script = """
+        import { renderBanner, renderBox, supportsUnicode, theme } from './npm/lib/art.js';
+        console.log(JSON.stringify({
+          unicode: supportsUnicode(),
+          success: theme.symbols.success,
+          error: theme.symbols.error,
+          banner: renderBanner({ columns: 120 }),
+          box: renderBox('TITLE', ['body'], 'cyan'),
+        }));
+    """
+    completed = subprocess.run(
+        [node, '--input-type=module', '-e', script],
+        cwd=ROOT,
+        env={**os.environ, 'LC_ALL': 'C', 'LANG': 'C'},
+        text=True,
+        capture_output=True,
+        check=False,
+        timeout=30,
+    )
+    assert completed.returncode == 0, completed.stderr
+    rendered = json.loads(completed.stdout)
+
+    assert rendered['unicode'] is False
+    assert '[OK]' in rendered['success']
+    assert '[X]' in rendered['error']
+    assert rendered['banner'].strip().endswith('claude-anyteam')
+    assert rendered['box'].startswith('+')
+    assert '╭' not in rendered['box']
+    assert '│' not in rendered['box']
 
 
 def test_pyproject_version_matches_npm_version() -> None:

@@ -29,6 +29,39 @@ const borderPalette = {
 const headerGradient = gradient(['#22d3ee', '#60a5fa', '#a78bfa', '#f472b6']);
 const shortBanner = 'claude-anyteam';
 
+export function supportsUnicode(env = process.env, platform = process.platform) {
+  if (env.CLAUDE_ANYTEAM_ASCII === '1' || env.CLAUDE_ANYTEAM_FORCE_ASCII === '1') {
+    return false;
+  }
+  if (env.CLAUDE_ANYTEAM_UNICODE === '1' || env.CLAUDE_ANYTEAM_FORCE_UNICODE === '1') {
+    return true;
+  }
+  const locale = env.LC_ALL || env.LC_CTYPE || env.LANG || '';
+  if (/^(?:C|POSIX)$/i.test(locale)) {
+    return false;
+  }
+  if (/UTF-?8/i.test(locale)) {
+    return true;
+  }
+  if (platform === 'win32') {
+    return Boolean(env.WT_SESSION || env.TERM_PROGRAM || env.ConEmuANSI === 'ON' || env.ANSICON);
+  }
+  return Boolean(locale);
+}
+
+const unicodeSymbols = {
+  success: colors.green('✔'),
+  info: colors.cyan('●'),
+  warn: colors.yellow('▲'),
+  error: colors.red('✖'),
+};
+const asciiSymbols = {
+  success: colors.green('[OK]'),
+  info: colors.cyan('[i]'),
+  warn: colors.yellow('[!]'),
+  error: colors.red('[X]'),
+};
+
 export const theme = {
   colors,
   accent: (value) => colors.bold(colors.cyan(value)),
@@ -37,17 +70,12 @@ export const theme = {
   danger: (value) => colors.bold(colors.red(value)),
   muted: (value) => colors.gray(value),
   heading: (value) => colors.bold(colors.white(value)),
-  symbols: {
-    success: colors.green('✔'),
-    info: colors.cyan('●'),
-    warn: colors.yellow('▲'),
-    error: colors.red('✖'),
-  },
+  symbols: supportsUnicode() ? unicodeSymbols : asciiSymbols,
 };
 
 export function renderBanner(options = {}) {
   const columns = Number(options.columns ?? process.env.COLUMNS ?? process.stdout?.columns ?? 80);
-  if (Number.isFinite(columns) && columns > 0 && columns < 82) {
+  if (!supportsUnicode() || (Number.isFinite(columns) && columns > 0 && columns < 82)) {
     return headerGradient(shortBanner);
   }
   return headerGradient.multiline(banner);
@@ -112,6 +140,9 @@ export function renderBox(title, lines, color = 'cyan') {
   const paint = borderPalette[color] ?? ((value) => value);
   const termCols = Number(process.env.COLUMNS ?? process.stdout?.columns ?? 80);
   const budget = Math.max(BOX_MIN_WIDTH, Math.min(BOX_MAX_WIDTH, (Number.isFinite(termCols) ? termCols : 80) - 4));
+  const borders = supportsUnicode()
+    ? { tl: '╭', tr: '╮', ml: '├', mr: '┤', bl: '╰', br: '╯', h: '─', v: '│' }
+    : { tl: '+', tr: '+', ml: '+', mr: '+', bl: '+', br: '+', h: '-', v: '|' };
   const bodyRows = (Array.isArray(lines) ? lines : [lines])
     .flatMap((row) => String(row).split('\n'))
     .flatMap((row) => wrapAnsiLine(row, budget));
@@ -119,13 +150,13 @@ export function renderBox(title, lines, color = 'cyan') {
   const rows = [...titleRows, ...bodyRows];
   const width = Math.max(...rows.map((row) => stripAnsi(row).length), 0);
   const fill = (row) => `${row}${' '.repeat(width - stripAnsi(row).length)}`;
-  const headerLines = titleRows.map((row) => `${paint('│')} ${fill(row)} ${paint('│')}`);
-  const bodyLines = bodyRows.map((row) => `${paint('│')} ${fill(row)} ${paint('│')}`);
+  const headerLines = titleRows.map((row) => `${paint(borders.v)} ${fill(row)} ${paint(borders.v)}`);
+  const bodyLines = bodyRows.map((row) => `${paint(borders.v)} ${fill(row)} ${paint(borders.v)}`);
   return [
-    paint(`╭${'─'.repeat(width + 2)}╮`),
+    paint(`${borders.tl}${borders.h.repeat(width + 2)}${borders.tr}`),
     ...headerLines,
-    paint(`├${'─'.repeat(width + 2)}┤`),
+    paint(`${borders.ml}${borders.h.repeat(width + 2)}${borders.mr}`),
     ...bodyLines,
-    paint(`╰${'─'.repeat(width + 2)}╯`),
+    paint(`${borders.bl}${borders.h.repeat(width + 2)}${borders.br}`),
   ].join('\n');
 }
