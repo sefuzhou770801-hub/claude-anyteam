@@ -1,3 +1,5 @@
+import { arch, release } from 'node:os';
+
 const ISSUE_URL = 'https://github.com/JonathanRosado/claude-anyteam/issues/new';
 const PYTHON_DOWNLOADS_URL = 'https://www.python.org/downloads/';
 const CLAUDE_CODE_SETUP_URL = 'https://docs.claude.com/en/docs/claude-code/setup';
@@ -102,7 +104,7 @@ export const patterns = [
     match: (raw) => prereleaseBlocked(raw),
     render: () => ({
       title: 'Pre-release dependency blocked by uv',
-      explanation: 'We use a pre-release Python dependency, and uv refused to resolve it without explicit pre-release opt-in.',
+      explanation: 'claude-anyteam uses a beta Python package (a pre-release dependency), and uv refused to install beta packages until we explicitly allow them.',
       action: 'Re-run with `npx --yes claude-anyteam@latest`. If it still fails, run `uv tool install --prerelease=allow claude-anyteam`.',
       severity: HARD,
     }),
@@ -112,8 +114,8 @@ export const patterns = [
     match: (raw) => NO_SOLUTION.test(raw.text) && !prereleaseBlocked(raw),
     render: () => ({
       title: 'Python dependency conflict',
-      explanation: 'uv could not find a compatible set of Python dependencies. Most often, another installed tool pinned an incompatible dependency version.',
-      action: 'Run `uv tool install --reinstall claude-anyteam`, then re-run `npx --yes claude-anyteam@latest`.',
+      explanation: 'uv could not find Python packages that work together. Most often, another installed tool is asking for a different version of the same package.',
+      action: 'Run `uv tool install --reinstall --prerelease=allow claude-anyteam`, then re-run `npx --yes claude-anyteam@latest`.',
       severity: HARD,
     }),
   },
@@ -142,7 +144,7 @@ export const patterns = [
     match: (raw) => CORPORATE_PROXY.test(raw.text) && !NETWORK_TIMEOUT.test(raw.text),
     render: () => ({
       title: 'Corporate proxy blocked PyPI',
-      explanation: "uv couldn't reach PyPI through your corporate network.",
+      explanation: "uv couldn't reach PyPI (the website where Python packages are downloaded) through your corporate network.",
       action: 'Set the proxy explicitly: `HTTPS_PROXY=http://your.proxy:port HTTP_PROXY=$HTTPS_PROXY UV_HTTP_TIMEOUT=120 npx --yes claude-anyteam`. Confirm with `curl -I https://pypi.org`.',
       severity: HARD,
     }),
@@ -192,7 +194,7 @@ export const patterns = [
     match: (raw) => PYTHON_MISSING.test(raw.text),
     render: () => ({
       title: 'Python 3.12+ not found',
-      explanation: 'uv could not find a Python 3.12+ interpreter to install claude-anyteam. Kimi teammates additionally require Python 3.13 for the separate `kimi-cli` uv tool.',
+      explanation: 'uv could not find Python 3.12 or newer to install claude-anyteam. Kimi teammates additionally require Python 3.13 for the separate `kimi-cli` uv tool.',
       action: 'Install Python 3.12+ from https://www.python.org/downloads/ (Windows: tick “Add to PATH”) or run `uv python install 3.12`. For Kimi teammates, also run `uv python install 3.13`.',
       severity: HARD,
     }),
@@ -232,7 +234,7 @@ export const patterns = [
     match: (raw) => NETWORK.test(raw.text),
     render: () => ({
       title: 'Network problem reaching PyPI',
-      explanation: 'uv could not reach the Python package index (PyPI), likely because of a proxy, VPN, DNS, TLS, or temporary network issue.',
+      explanation: 'uv could not reach PyPI (the website where Python packages are downloaded), likely because of a proxy, VPN, DNS, TLS certificate, or temporary network issue.',
       action: 'Set `HTTPS_PROXY` and `HTTP_PROXY` if needed, then re-run `npx --yes claude-anyteam@latest`; if you are on a VPN, try disconnecting briefly.',
       severity: HARD,
     }),
@@ -308,7 +310,7 @@ export const patterns = [
     match: (raw) => raw.kind === 'claude-not-found' || CLAUDE_NOT_FOUND.test(raw.text),
     render: () => ({
       title: 'Claude Code CLI not detected',
-      explanation: 'The installer skipped Claude Code plugin registration because `claude` was not available on PATH; the core spawn shim install can still be used.',
+      explanation: 'The installer skipped Claude Code plugin registration because the `claude` command was not available on PATH (the list of folders your terminal searches for commands). The core spawn shim install can still be used.',
       action: 'Install Claude Code from https://docs.claude.com/en/docs/claude-code/setup and re-run, or proceed without the plugin by symlinking the spawn shim from your editor.',
       severity: SOFT,
     }),
@@ -347,11 +349,109 @@ export function translate(rawError, context = {}) {
     action: rendered.action,
     severity: rendered.severity,
     raw: raw.text,
+    issueUrl: buildIssueUrl({ title: rendered.title, rawError: raw.text }),
   };
 }
 
 export const translateInstallError = translate;
 export default translate;
+
+export function buildIssueUrl({
+  title = 'Installer error',
+  installerVersion = 'unknown',
+  os = `${process.platform} ${release()} ${arch()}`,
+  pythonVersion = 'not checked',
+  uvVersion = 'not checked',
+  nodeVersion = process.version,
+  rawError = '',
+  whatDoing = 'I was running `npx --yes claude-anyteam`.',
+} = {}) {
+  const body = [
+    '## What I was doing',
+    whatDoing,
+    '',
+    '## Installer details',
+    `- Installer version: ${installerVersion}`,
+    `- OS: ${os}`,
+    `- Python version: ${pythonVersion || 'not checked'}`,
+    `- uv version: ${uvVersion || 'not checked'}`,
+    `- Node version: ${nodeVersion || process.version}`,
+    '',
+    '## Raw error text',
+    '```text',
+    String(rawError || 'No raw error captured.'),
+    '```',
+  ].join('\n');
+  const params = new URLSearchParams({
+    title: `[installer] ${String(title).slice(0, 120)}`,
+    body,
+  });
+  return `${ISSUE_URL}?${params.toString()}`;
+}
+
+function normalizeSteps(nextStepsPerOs = [], platform = process.platform) {
+  if (Array.isArray(nextStepsPerOs)) {
+    return nextStepsPerOs;
+  }
+  if (typeof nextStepsPerOs === 'string') {
+    return nextStepsPerOs.split(/\r?\n/).filter(Boolean);
+  }
+  if (nextStepsPerOs && typeof nextStepsPerOs === 'object') {
+    if (platform === 'win32' && nextStepsPerOs.win32) {
+      return normalizeSteps(nextStepsPerOs.win32, platform);
+    }
+    if (platform === 'darwin' && nextStepsPerOs.darwin) {
+      return normalizeSteps(nextStepsPerOs.darwin, platform);
+    }
+    if (!['win32', 'darwin'].includes(platform) && nextStepsPerOs.linux) {
+      return normalizeSteps(nextStepsPerOs.linux, platform);
+    }
+    return normalizeSteps(nextStepsPerOs.default || [], platform);
+  }
+  return [];
+}
+
+export function formatInstallerDiagnostic({
+  summary = 'The installer hit a problem.',
+  rawError = '',
+  nextStepsPerOs = [],
+  title = 'Installer error',
+  installerVersion = 'unknown',
+  os = `${process.platform} ${release()} ${arch()}`,
+  platform = process.platform,
+  pythonVersion = 'not checked',
+  uvVersion = 'not checked',
+  nodeVersion = process.version,
+  whatDoing = 'I was running `npx --yes claude-anyteam`.',
+  includeWhatHappened = true,
+} = {}) {
+  const steps = normalizeSteps(nextStepsPerOs, platform);
+  const safeSteps = steps.length
+    ? steps
+    : [
+        'Read the message above.',
+        'Fix the problem it describes.',
+        'Run `npx --yes claude-anyteam` again.',
+      ];
+  const lines = [];
+  if (includeWhatHappened) {
+    lines.push(`What happened: ${summary}`);
+  }
+  lines.push('Try this next:');
+  lines.push(...safeSteps.map((step, index) => `  ${index + 1}. ${step}`));
+  lines.push('Still stuck? Report it:');
+  lines.push(`  ${buildIssueUrl({
+    title,
+    installerVersion,
+    os,
+    pythonVersion,
+    uvVersion,
+    nodeVersion,
+    rawError,
+    whatDoing,
+  })}`);
+  return lines;
+}
 
 export const urls = {
   issues: ISSUE_URL,

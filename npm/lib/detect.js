@@ -114,6 +114,7 @@ export function manualInstallLines({ includePython = false } = {}) {
   if (process.platform === 'win32') {
     if (includePython) {
       lines.push('PowerShell: winget install Python.Python.3.12');
+      lines.push('If winget is not available, download Python 3.12+ from https://www.python.org/downloads/ and tick “Add python.exe to PATH”.');
     }
     lines.push('PowerShell (preferred): winget install Astral-sh.uv');
     // winget ships on Windows 10 1709+ but corporate-locked images often
@@ -133,6 +134,28 @@ export function manualInstallLines({ includePython = false } = {}) {
   lines.push(`  UV_INSTALL_DIR=${UV_INSTALL_DIR} UV_NO_MODIFY_PATH=1 sh /tmp/uv-install.sh`);
   lines.push('Then rerun: npx --yes --package claude-anyteam claude-anyteam-setup');
   return lines;
+}
+
+export function nodeInstallLines() {
+  if (process.platform === 'win32') {
+    return [
+      'Install Node.js LTS from https://nodejs.org/ (it includes npm).',
+      'Then close and reopen PowerShell and rerun: npx --yes claude-anyteam',
+    ];
+  }
+  if (process.platform === 'darwin') {
+    return [
+      'macOS/Homebrew: brew install node',
+      'Or download Node.js LTS from https://nodejs.org/',
+      'Then rerun: npx --yes claude-anyteam',
+    ];
+  }
+  return [
+    'Debian/Ubuntu: sudo apt-get update && sudo apt-get install -y nodejs npm',
+    'Fedora/RHEL:   sudo dnf install nodejs npm',
+    'Arch:          sudo pacman -S nodejs npm',
+    'Then rerun: npx --yes claude-anyteam',
+  ];
 }
 
 export function providerPrereqLines() {
@@ -298,7 +321,54 @@ export async function detectUv() {
 
 export async function installUv() {
   if (process.platform === 'win32') {
-    throw new Error('Automatic uv installation uses the official shell installer on macOS/Linux. On Windows, install uv from PowerShell with: `winget install Astral-sh.uv` (preferred) — or, if winget is unavailable on your image, `irm https://astral.sh/uv/install.ps1 | iex` (no admin or winget required).');
+    const attempts = [
+      { command: 'winget', args: ['install', '--id', 'Astral-sh.uv', '-e', '--accept-package-agreements', '--accept-source-agreements'] },
+      { command: 'scoop', args: ['install', 'uv'] },
+      { command: 'choco', args: ['install', 'uv', '-y'] },
+    ];
+    const failures = [];
+    for (const attempt of attempts) {
+      if (!(await which(attempt.command))) {
+        failures.push(`${attempt.command}: not found`);
+        continue;
+      }
+      const result = await runCommand(attempt.command, attempt.args, { env: process.env });
+      if (result.code === 0) {
+        const installed = await detectUv();
+        if (installed) {
+          return installed;
+        }
+        failures.push(`${attempt.command}: completed, but uv was not found on PATH yet`);
+      } else {
+        failures.push(`${attempt.command}: ${(result.stderr || result.stdout).trim() || `exit ${result.code}`}`);
+      }
+    }
+
+    const shell = await which('pwsh') || await which('powershell.exe') || await which('powershell');
+    if (shell) {
+      const result = await runCommand(shell, [
+        '-NoProfile',
+        '-ExecutionPolicy',
+        'Bypass',
+        '-Command',
+        'irm https://astral.sh/uv/install.ps1 | iex',
+      ], { env: { ...process.env, UV_INSTALL_DIR } });
+      if (result.code === 0) {
+        const installed = await detectUv();
+        if (installed) {
+          return installed;
+        }
+        failures.push('official PowerShell installer: completed, but uv was not found on PATH yet');
+      } else {
+        failures.push(`official PowerShell installer: ${(result.stderr || result.stdout).trim() || `exit ${result.code}`}`);
+      }
+    } else {
+      failures.push('PowerShell: not found');
+    }
+
+    const error = new Error('Automatic uv installation did not finish on Windows.');
+    error.details = failures.join('\n');
+    throw error;
   }
   const workingDir = await fs.mkdtemp(path.join(tmpdir(), 'claude-anyteam-uv-'));
   const scriptPath = path.join(workingDir, 'install-uv.sh');
@@ -330,6 +400,52 @@ export async function installUv() {
   } finally {
     await fs.rm(workingDir, { recursive: true, force: true });
   }
+}
+
+export async function installPython() {
+  const attempts = [];
+  if (process.platform === 'win32') {
+    attempts.push(
+      { command: 'winget', args: ['install', '--id', 'Python.Python.3.12', '-e', '--accept-package-agreements', '--accept-source-agreements'] },
+      { command: 'scoop', args: ['install', 'python'] },
+      { command: 'choco', args: ['install', 'python', '-y'] },
+    );
+  } else if (process.platform === 'darwin') {
+    attempts.push({ command: 'brew', args: ['install', 'python'] });
+  } else {
+    attempts.push(
+      { command: 'apt-get', args: ['update'] },
+      { command: 'apt-get', args: ['install', '-y', 'python3', 'python3-venv', 'curl'] },
+      { command: 'dnf', args: ['install', '-y', 'python3', 'curl'] },
+      { command: 'pacman', args: ['-S', '--noconfirm', 'python', 'curl'] },
+    );
+  }
+
+  const failures = [];
+  for (const attempt of attempts) {
+    if (!(await which(attempt.command))) {
+      failures.push(`${attempt.command}: not found`);
+      continue;
+    }
+    const command = process.platform === 'win32' || process.platform === 'darwin'
+      ? attempt.command
+      : (process.getuid?.() === 0 ? attempt.command : (await which('sudo') ? 'sudo' : attempt.command));
+    const args = command === attempt.command ? attempt.args : [attempt.command, ...attempt.args];
+    const result = await runCommand(command, args, { env: process.env });
+    if (result.code !== 0) {
+      failures.push(`${command} ${args.join(' ')}: ${(result.stderr || result.stdout).trim() || `exit ${result.code}`}`);
+      continue;
+    }
+    const detected = await detectPython();
+    if (detected) {
+      return detected;
+    }
+    failures.push(`${command} ${args.join(' ')}: completed, but Python was not found on PATH yet`);
+  }
+
+  const error = new Error('Automatic Python installation did not finish.');
+  error.details = failures.join('\n');
+  throw error;
 }
 
 function toolExecutablePath(binDir, name) {

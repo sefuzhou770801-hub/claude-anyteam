@@ -27,6 +27,7 @@ const borderPalette = {
   blue: colors.blue,
 };
 const headerGradient = gradient(['#22d3ee', '#60a5fa', '#a78bfa', '#f472b6']);
+const shortBanner = 'claude-anyteam';
 
 export const theme = {
   colors,
@@ -44,7 +45,11 @@ export const theme = {
   },
 };
 
-export function renderBanner() {
+export function renderBanner(options = {}) {
+  const columns = Number(options.columns ?? process.env.COLUMNS ?? process.stdout?.columns ?? 80);
+  if (Number.isFinite(columns) && columns > 0 && columns < 82) {
+    return headerGradient(shortBanner);
+  }
   return headerGradient.multiline(banner);
 }
 

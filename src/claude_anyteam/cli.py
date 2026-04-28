@@ -8,12 +8,19 @@ persistent settings file.
 from __future__ import annotations
 
 import argparse
+import importlib.metadata
+import os
+import platform
+import shutil
+import subprocess
 import sys
 from pathlib import Path
 from typing import TextIO
+from urllib.parse import urlencode
 
 from . import logger
 from .config import from_env
+from claude_anyteam import installer as installer_mod
 from claude_anyteam.installer import (
     INSTALL_ERROR_EXIT_NO_PROVIDER,
     InstallError,
@@ -23,6 +30,8 @@ from claude_anyteam.installer import (
     uninstall as uninstall_settings,
 )
 from .loop import run
+
+ISSUE_NEW_URL = "https://github.com/JonathanRosado/claude-anyteam/issues/new"
 
 
 def _bold(text: str) -> str:
@@ -52,12 +61,61 @@ def _render_box(title: str, lines: list[str]) -> str:
     )
 
 
+def _installer_version() -> str:
+    env_version = os.environ.get("CLAUDE_ANYTEAM_NPM_VERSION")
+    if env_version:
+        return env_version
+    try:
+        return importlib.metadata.version("claude-anyteam")
+    except importlib.metadata.PackageNotFoundError:
+        pyproject = Path(__file__).resolve().parents[2] / "pyproject.toml"
+        try:
+            for line in pyproject.read_text(encoding="utf-8").splitlines():
+                if line.startswith("version = "):
+                    return line.split("=", 1)[1].strip().strip('"')
+        except OSError:
+            pass
+    return "unknown"
+
+
+def _version_banner() -> str:
+    return f"claude-anyteam installer v{_installer_version()}"
+
+
+def _command_version(command: str) -> str:
+    path = shutil.which(command)
+    if not path:
+        return "not found"
+    try:
+        completed = subprocess.run(
+            [path, "--version"],
+            capture_output=True,
+            text=True,
+            timeout=3,
+            check=False,
+        )
+    except (OSError, subprocess.SubprocessError) as exc:
+        return f"found at {path}, but version check failed: {exc}"
+    return (completed.stdout or completed.stderr or "").strip() or f"found at {path}"
+
+
+def _issue_url(*, title: str, raw_error: str) -> str:
+    return installer_mod.build_issue_url(title=title, raw_error=raw_error)
+
+
 def _format_install_error(exc: InstallError) -> str:
     lines: list[str] = [_bold(exc.title)]
     lines.extend(exc.explanation.splitlines() or [""])
-    for idx, line in enumerate(exc.action.splitlines() or [""]):
-        prefix = "Next step: " if idx == 0 else "           "
-        lines.append(f"{prefix}{line}")
+    raw_error = exc.as_plain_text(include_details=True, include_report=False)
+    lines.extend(
+        installer_mod.format_installer_diagnostic(
+            summary=exc.explanation,
+            raw_error=raw_error,
+            next_steps_per_os=exc.action,
+            title=exc.title,
+            include_what_happened=False,
+        )
+    )
     lines.append(f"Severity: {exc.severity}")
     if exc.details:
         lines.append("Raw details (for debugging):")
@@ -254,6 +312,126 @@ def _interactive_prompt(current_value: str) -> bool:
     return answer.strip().lower() in {"y", "yes"}
 
 
+def _yes_default_prompt(question: str) -> bool | None:
+    if not (sys.stdin.isatty() and sys.stdout.isatty()):
+        return None
+    try:
+        answer = input(f"{question} [Y/n] ")
+    except EOFError:
+        return None
+    return answer.strip().lower() not in {"n", "no"}
+
+
+def _run_install_command(args: list[str], *, timeout_s: int = 300) -> tuple[bool, str]:
+    try:
+        completed = subprocess.run(
+            args,
+            capture_output=True,
+            text=True,
+            timeout=timeout_s,
+            check=False,
+        )
+    except (OSError, subprocess.SubprocessError) as exc:
+        return False, f"{type(exc).__name__}: {exc}"
+    output = "\n".join(
+        part for part in ((completed.stdout or "").strip(), (completed.stderr or "").strip()) if part
+    )
+    return completed.returncode == 0, output or f"exit code {completed.returncode}"
+
+
+def _provider_install_command(provider_key: str) -> tuple[str, list[str]] | None:
+    if provider_key == "codex":
+        npm = shutil.which("npm")
+        if npm:
+            return installer_mod.CODEX_CLI_INSTALL_COMMAND, [npm, "install", "-g", "@openai/codex"]
+        return None
+    if provider_key == "gemini":
+        npm = shutil.which("npm")
+        if npm:
+            return installer_mod.GEMINI_CLI_INSTALL_COMMAND, [npm, "install", "-g", "@google/gemini-cli"]
+        return None
+    if provider_key == "kimi":
+        uv = shutil.which("uv")
+        if uv:
+            return installer_mod.KIMI_CLI_INSTALL_COMMAND, [uv, "tool", "install", "--python", "3.13", "kimi-cli"]
+        if sys.platform != "win32" and shutil.which("sh") and shutil.which("curl"):
+            return installer_mod.KIMI_CLI_CURL_INSTALL_COMMAND, ["sh", "-lc", installer_mod.KIMI_CLI_CURL_INSTALL_COMMAND]
+    return None
+
+
+def _manual_provider_steps(provider_key: str) -> list[str]:
+    if provider_key == "codex":
+        return [
+            f"Install Node.js/npm if needed: https://nodejs.org/",
+            f"Install Codex: {installer_mod.CODEX_CLI_INSTALL_COMMAND}",
+            f"Sign in: {installer_mod.CODEX_CLI_BINARY} login",
+            f"Guide: {installer_mod.CODEX_CLI_DOCS_URL}",
+        ]
+    if provider_key == "gemini":
+        return [
+            f"Install Node.js/npm if needed: https://nodejs.org/",
+            f"Install Gemini: {installer_mod.GEMINI_CLI_INSTALL_COMMAND}",
+            f"Sign in: {installer_mod.GEMINI_CLI_BINARY} login (or set GEMINI_API_KEY/Vertex)",
+            f"Guide: {installer_mod.GEMINI_CLI_DOCS_URL}",
+        ]
+    return [
+        f"Install Kimi: {installer_mod.KIMI_CLI_CURL_INSTALL_COMMAND}",
+        f"Or with uv: {installer_mod.KIMI_CLI_INSTALL_COMMAND}",
+        f"Sign in: {installer_mod.KIMI_CLI_BINARY} login",
+        f"Guide: {installer_mod.KIMI_CLI_DOCS_URL}",
+    ]
+
+
+def _offer_provider_dependency_installs(*, no_input: bool, stream: TextIO) -> None:
+    checks = [
+        ("codex", "Codex CLI", installer_mod._check_codex_cli()),
+        ("gemini", "Gemini CLI", installer_mod._check_gemini_cli()),
+        ("kimi", "Kimi CLI", installer_mod._check_kimi_cli()),
+    ]
+    missing = [(key, label) for key, label, check in checks if not check.found]
+    if not missing:
+        return
+
+    if no_input or not (sys.stdin.isatty() and sys.stdout.isatty()):
+        print(
+            "Skipping interactive dependency install because this terminal cannot answer questions; manual steps are shown below.",
+            file=stream,
+        )
+        return
+
+    for key, label in missing:
+        answer = _yes_default_prompt(
+            f"We need {label} for {key}-* teammates. Want me to try installing it for you?"
+        )
+        if answer is None:
+            print(f"Skipping {label} auto-install; manual steps will be shown below.", file=stream)
+            continue
+        if not answer:
+            print(f"Okay — I will not install {label}. Manual steps will be shown below.", file=stream)
+            continue
+        command = _provider_install_command(key)
+        if command is None:
+            print(f"I could not find the installer tool for {label}. Try this next:", file=stream)
+            for idx, step in enumerate(_manual_provider_steps(key), start=1):
+                print(f"  {idx}. {step}", file=stream)
+            continue
+        display, argv = command
+        print(f"Trying: {display}", file=stream)
+        ok, output = _run_install_command(argv)
+        if ok:
+            print(f"Installed {label}. You may still need to sign in before teammates can use it.", file=stream)
+        else:
+            print(f"I tried to install {label}, but it failed.", file=stream)
+            print("Raw installer output:", file=stream)
+            for line in output.splitlines() or ["No output captured."]:
+                print(f"  {line}", file=stream)
+            print("Try this next:", file=stream)
+            for idx, step in enumerate(_manual_provider_steps(key), start=1):
+                print(f"  {idx}. {step}", file=stream)
+            print("Still stuck? Report it:", file=stream)
+            print(f"  {_issue_url(title=f'{label} auto-install failed', raw_error=output)}", file=stream)
+
+
 def _install_command(
     *,
     settings_path: Path | str | None = None,
@@ -268,6 +446,8 @@ def _install_command(
     out: TextIO | None = None,
 ) -> int:
     stream = out or sys.stdout
+    if os.environ.get("CLAUDE_ANYTEAM_NPM_PARENT") != "1":
+        print(_version_banner(), file=stream)
     if assume_yes:
         prompt_fn = lambda _current: True
     elif no_input or self_heal:
@@ -277,6 +457,11 @@ def _install_command(
         prompt_fn = lambda _current: False
     else:
         prompt_fn = _interactive_prompt
+
+    _offer_provider_dependency_installs(
+        no_input=no_input or self_heal,
+        stream=stream,
+    )
 
     provider_status_rendered = False
 
