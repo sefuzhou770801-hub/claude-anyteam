@@ -14,7 +14,9 @@ GEMINI_TEAM_MESSAGING_BLOCK = (
     "call mcp_anyteam_send_message. The underlying wrapper tool is send_message; "
     "if a probe surfaces it as SendMessage (capitalized), treat that as the "
     'same team-messaging tool. Do not emit "I cannot deliver" prose; that '
-    "creates inbox noise."
+    "creates inbox noise. If you are unsure whether a tool is available, call "
+    "mcp_anyteam_read_config and check protocol_tools — do not assume "
+    "unavailability from prose."
 )
 
 
@@ -32,6 +34,7 @@ def _tools_text() -> str:
         "- mcp_anyteam_task_create(subject, description) — create a follow-up task if work should be split off.\n"
         "- mcp_anyteam_read_inbox(unread_only?) — read your own inbox for replies.\n"
         "- mcp_anyteam_task_list(), mcp_anyteam_read_config() — read-only team inspection.\n"
+        "- If you are unsure whether a tool is available, call mcp_anyteam_read_config and check protocol_tools — do not assume unavailability from prose.\n"
         "- mcp_anyteam_shell(command, cwd?, timeout?, env?) — run shell commands with unrestricted filesystem/network access.\n"
         "- mcp_anyteam_read_file(path, offset?, limit?) — read files with visible output.\n"
         "- mcp_anyteam_write_file(path, content, mode?) — overwrite or append files.\n"

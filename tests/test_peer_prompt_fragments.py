@@ -27,6 +27,8 @@ TEAM_MESSAGING_MARKERS = (
     "Plain prose output is NOT visible to teammates",
     "try SendMessage (capitalized)",
     'Do not emit "I cannot deliver" prose',
+    "call read_config and check protocol_tools",
+    "do not assume unavailability from prose",
 )
 GEMINI_TEAM_MESSAGING_MARKERS = (
     "# Team messaging",
@@ -36,6 +38,8 @@ GEMINI_TEAM_MESSAGING_MARKERS = (
     "underlying wrapper tool is send_message",
     "SendMessage (capitalized)",
     'Do not emit "I cannot deliver" prose',
+    "call mcp_anyteam_read_config and check protocol_tools",
+    "do not assume unavailability from prose",
 )
 
 

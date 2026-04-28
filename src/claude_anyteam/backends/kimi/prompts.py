@@ -23,6 +23,7 @@ def _tools_text() -> str:
         "- task_create(subject, description) — create a follow-up task if work should be split off.\n"
         "- read_inbox(unread_only?) — read your own inbox for replies.\n"
         "- task_list(), read_config() — read-only team inspection.\n"
+        "- If you are unsure whether a tool is available, call read_config and check protocol_tools — do not assume unavailability from prose.\n"
     )
 
 

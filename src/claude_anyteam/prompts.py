@@ -18,7 +18,8 @@ TEAM_MESSAGING_BLOCK = (
     "Plain prose output is NOT visible to teammates — to communicate, you MUST "
     "call send_message. If you cannot find it under that name, try SendMessage "
     '(capitalized). Do not emit "I cannot deliver" prose; that creates inbox '
-    "noise."
+    "noise. If you are unsure whether a tool is available, call read_config "
+    "and check protocol_tools — do not assume unavailability from prose."
 )
 
 
@@ -63,6 +64,8 @@ def v7_task_prompt(
         f"- read_inbox(unread_only?) — read your own inbox, useful for "
         f"picking up a teammate's reply.\n"
         f"- task_list(), read_config() — read-only inspection of team state.\n"
+        f"If you are unsure whether a tool is available, call read_config "
+        f"and check protocol_tools — do not assume unavailability from prose.\n"
         f"\n"
         f"Your current task id is {task.id}. Destructive lifecycle operations "
         f"are deliberately unavailable.\n\n"

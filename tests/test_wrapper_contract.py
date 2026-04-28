@@ -149,6 +149,53 @@ def _seed_manifest_team(
     return team_dir, manifest
 
 
+def _seed_protocol_tools_team(
+    team_root,
+    *,
+    self_name: str,
+    model: str,
+    manifest_host_tool_surface: str | None = None,
+    manifest_transport: str | None = None,
+):
+    team_dir = team_root / "claude-anyteam"
+    team_dir.mkdir(parents=True, exist_ok=True)
+    (team_dir / "inboxes").mkdir(exist_ok=True)
+    config = {
+        "name": "claude-anyteam",
+        "createdAt": 0,
+        "leadAgentId": "team-lead@claude-anyteam",
+        "leadSessionId": "lead-session",
+        "members": [
+            _lead().model_dump(by_alias=True, exclude_none=True),
+            {
+                **_member(self_name, "magenta").model_dump(by_alias=True, exclude_none=True),
+                "model": model,
+                "backendType": "in-process",
+            },
+        ],
+    }
+    (team_dir / "config.json").write_text(json.dumps(config), encoding="utf-8")
+    (team_dir / "inboxes" / f"{self_name}.json").write_text("[]", encoding="utf-8")
+    if manifest_host_tool_surface or manifest_transport:
+        manifest_dir = team_dir / "manifests"
+        manifest_dir.mkdir(exist_ok=True)
+        (manifest_dir / f"{self_name}.json").write_text(
+            json.dumps(
+                {
+                    "schema_version": 1,
+                    "capability_version": "1",
+                    "agent_name": self_name,
+                    "model": model,
+                    "host_tool_surface": manifest_host_tool_surface,
+                    "transport": manifest_transport,
+                    "capabilities": {},
+                }
+            ),
+            encoding="utf-8",
+        )
+    return team_dir
+
+
 def _seeded_wrapper(
     identity,
     monkeypatch,
@@ -318,6 +365,61 @@ def test_exposed_tools_covers_cs50victor_safe_subset():
     assert "mcp_anyteam_edit_file" in EXPOSED_TOOLS
     assert "mcp_anyteam_search" in EXPOSED_TOOLS
     assert "mcp_anyteam_web_fetch" in EXPOSED_TOOLS
+
+
+def test_read_config_protocol_tools_codex_uses_raw_wrapper_names(identity, monkeypatch):
+    self_name = "codex-a"
+    monkeypatch.setenv("CLAUDE_ANYTEAM_NAME", self_name)
+    _seed_protocol_tools_team(
+        identity,
+        self_name=self_name,
+        model="codex-cli",
+        manifest_host_tool_surface="codex-native",
+        manifest_transport="codex-app-server",
+    )
+    monkeypatch.setattr("claude_anyteam.wrapper_server._cs_teams.TEAMS_DIR", identity)
+
+    result = _call_tool("read_config", {})
+
+    protocol_tools = result["protocol_tools"]
+    assert protocol_tools["backend"] == "codex"
+    assert protocol_tools["naming"] == "raw"
+    assert protocol_tools["source"] == "claude_anyteam.wrapper_server.EXPOSED_TOOLS"
+    assert protocol_tools["tools"] == list(EXPOSED_TOOLS)
+    assert protocol_tools["send_message"] == "send_message"
+    assert protocol_tools["read_config"] == "read_config"
+    assert "send_message" in protocol_tools["tools"]
+    assert "mcp_anyteam_send_message" not in protocol_tools["tools"]
+
+
+def test_read_config_protocol_tools_gemini_uses_anyteam_prefixed_names(identity, monkeypatch):
+    self_name = "gemini-a"
+    monkeypatch.setenv("CLAUDE_ANYTEAM_NAME", self_name)
+    _seed_protocol_tools_team(
+        identity,
+        self_name=self_name,
+        model="gemini-cli",
+        manifest_host_tool_surface="mcp_anyteam",
+        manifest_transport="gemini-acp",
+    )
+    monkeypatch.setattr("claude_anyteam.wrapper_server._cs_teams.TEAMS_DIR", identity)
+
+    result = _call_tool("read_config", {})
+
+    protocol_tools = result["protocol_tools"]
+    expected = [
+        name if name.startswith("mcp_anyteam_") else f"mcp_anyteam_{name}"
+        for name in EXPOSED_TOOLS
+    ]
+    assert protocol_tools["backend"] == "gemini"
+    assert protocol_tools["naming"] == "mcp_anyteam_prefixed"
+    assert protocol_tools["tools"] == expected
+    assert protocol_tools["send_message"] == "mcp_anyteam_send_message"
+    assert protocol_tools["read_config"] == "mcp_anyteam_read_config"
+    assert "mcp_anyteam_send_message" in protocol_tools["team_tools"]
+    assert "send_message" not in protocol_tools["tools"]
+    assert "mcp_anyteam_shell" in protocol_tools["tools"]
+    assert "mcp_anyteam_mcp_anyteam_shell" not in protocol_tools["tools"]
 
 
 def test_capability_manifest_tool_returns_cached_entry(identity, monkeypatch, tmp_path):

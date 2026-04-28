@@ -119,6 +119,129 @@ EXPOSED_TOOLS: tuple[str, ...] = (
     "mcp_anyteam_web_fetch",
 )
 
+GEMINI_WRAPPER_TOOL_PREFIX = "mcp_anyteam_"
+
+
+def _gemini_visible_tool_name(tool_name: str) -> str:
+    """Return the Gemini-visible name for one wrapper MCP tool.
+
+    Gemini exposes bare wrapper tools through the configured MCP-server alias
+    (``anyteam``), e.g. ``send_message`` becomes
+    ``mcp_anyteam_send_message``. Tools that already carry our
+    ``mcp_anyteam_*`` prefix are intentionally stable: prompts and prior tests
+    refer to ``mcp_anyteam_shell`` rather than a doubled
+    ``mcp_anyteam_mcp_anyteam_shell`` name.
+    """
+
+    if tool_name.startswith(GEMINI_WRAPPER_TOOL_PREFIX):
+        return tool_name
+    return f"{GEMINI_WRAPPER_TOOL_PREFIX}{tool_name}"
+
+
+def _member_field(member: Any, field: str) -> Any:
+    if isinstance(member, dict):
+        return member.get(field)
+    return getattr(member, field, None)
+
+
+def _detect_caller_backend(
+    *,
+    self_name: str,
+    self_member: Any | None,
+    self_manifest: dict[str, Any] | None,
+) -> str:
+    """Infer the calling routed backend for protocol-tool naming.
+
+    The wrapper process is shared by Codex, Gemini, and Kimi. It receives only
+    team/name at startup, so discovery output derives the caller's surface from
+    the self Agent Card first (``host_tool_surface`` / ``transport``), then the
+    roster row (``model`` / ``backendType``), then the conventional teammate
+    name prefix.
+    """
+
+    manifest_values: list[Any] = []
+    if isinstance(self_manifest, dict):
+        manifest_values.extend(
+            [
+                self_manifest.get("host_tool_surface"),
+                self_manifest.get("transport"),
+                self_manifest.get("backend_type"),
+                self_manifest.get("backendType"),
+                self_manifest.get("model"),
+                self_manifest.get("agent_name"),
+                self_manifest.get("agentName"),
+            ]
+        )
+    if self_member is not None:
+        manifest_values.extend(
+            [
+                _member_field(self_member, "model"),
+                _member_field(self_member, "backend_type"),
+                _member_field(self_member, "backendType"),
+                _member_field(self_member, "agent_type"),
+                _member_field(self_member, "agentType"),
+                _member_field(self_member, "name"),
+            ]
+        )
+    manifest_values.append(self_name)
+
+    haystack = " ".join(str(value).lower() for value in manifest_values if value is not None)
+    if "mcp_anyteam" in haystack or "gemini" in haystack:
+        return "gemini"
+    if "kimi" in haystack:
+        return "kimi"
+    if "codex" in haystack:
+        return "codex"
+    return "unknown"
+
+
+def _visible_tool_name(tool_name: str, *, caller_backend: str) -> str:
+    if caller_backend == "gemini":
+        return _gemini_visible_tool_name(tool_name)
+    return tool_name
+
+
+def _protocol_tools_section(
+    *,
+    self_name: str,
+    self_member: Any | None,
+    self_manifest: dict[str, Any] | None,
+) -> dict[str, Any]:
+    """Return self-healing exact wrapper tool names for this caller."""
+
+    backend = _detect_caller_backend(
+        self_name=self_name,
+        self_member=self_member,
+        self_manifest=self_manifest,
+    )
+    names = [_visible_tool_name(tool, caller_backend=backend) for tool in EXPOSED_TOOLS]
+
+    def mapped_subset(source: frozenset[str]) -> list[str]:
+        return [
+            _visible_tool_name(tool, caller_backend=backend)
+            for tool in EXPOSED_TOOLS
+            if tool in source
+        ]
+
+    return {
+        "backend": backend,
+        "naming": "mcp_anyteam_prefixed" if backend == "gemini" else "raw",
+        "source": "claude_anyteam.wrapper_server.EXPOSED_TOOLS",
+        "tools": names,
+        "team_tools": mapped_subset(TEAM_TOOLS),
+        "shadow_tools": mapped_subset(SHADOW_TOOLS),
+        "send_message": _visible_tool_name("send_message", caller_backend=backend),
+        "read_config": _visible_tool_name("read_config", caller_backend=backend),
+        "capability_manifest": _visible_tool_name(
+            "mcp_anyteam_capability_manifest",
+            caller_backend=backend,
+        ),
+        "guidance": (
+            "If you are unsure whether a tool is available, use the exact name "
+            "listed here; do not assume unavailability from prose."
+        ),
+    }
+
 # Full team-control tools that we deliberately do NOT surface. Checked by a
 # test so removals are deliberate. If the protocol gains a new tool, the test
 # fails and forces a decision about whether it belongs in EXPOSED_TOOLS or
@@ -1251,7 +1374,13 @@ def build_server(argv: list[str] | None = None) -> FastMCP:
     def read_config() -> dict:
         """Read the team config — useful to discover teammate names and
         roles before sending messages. Member `prompt` fields are
-        omitted since they're irrelevant to a peer."""
+        omitted since they're irrelevant to a peer.
+
+        The returned top-level ``protocol_tools`` section lists the exact
+        wrapper MCP tool names visible to this caller (including backend
+        prefixing), so a model can recover from tool-discovery uncertainty
+        without guessing.
+        """
         try:
             cfg = _cs_teams.read_config(team)
         except FileNotFoundError:
@@ -1259,6 +1388,15 @@ def build_server(argv: list[str] | None = None) -> FastMCP:
         data = cfg.model_dump(by_alias=True)
         for m in data.get("members", []):
             m.pop("prompt", None)
+        self_member = next(
+            (member for member in cfg.members if getattr(member, "name", None) == self_name),
+            None,
+        )
+        data["protocol_tools"] = _protocol_tools_section(
+            self_name=self_name,
+            self_member=self_member,
+            self_manifest=manifest_cache.get(self_name),
+        )
         return data
 
     return mcp
