@@ -256,8 +256,8 @@ def test_exposed_and_blocked_do_not_overlap():
 
 
 def test_exposed_count_includes_protocol_shadow_and_manifest_tools(identity):
-    """Canary: sixteen tools is intentional: seven protocol tools, the R13 manifest tool, and eight shadow tools."""
-    assert len(_advertised_tool_names()) == 16
+    """Canary: seventeen tools is intentional: checkpointing plus protocol/shadow tools."""
+    assert len(_advertised_tool_names()) == 17
 
 
 def test_every_exposed_tool_has_visibility_category():
@@ -354,6 +354,7 @@ def test_exposed_tools_covers_cs50victor_safe_subset():
     # This is the positive assertion; the negative one is next.
     assert "send_message" in EXPOSED_TOOLS
     assert "task_update" in EXPOSED_TOOLS
+    assert "checkpoint_commit" in EXPOSED_TOOLS
     assert "task_create" in EXPOSED_TOOLS
     assert "task_batch_summary" in EXPOSED_TOOLS
     assert "read_inbox" in EXPOSED_TOOLS

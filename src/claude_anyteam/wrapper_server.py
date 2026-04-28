@@ -46,7 +46,15 @@ from typing import Any, Callable, Literal, TypeVar, cast
 
 from .capabilities import manifest_accepts_peer_steer
 from .capability_manifest import CapabilityManifestCache
-from .env import LEGACY_NAME_ENV, LEGACY_TEAM_ENV, NAME_ENV, TEAM_ENV, env_first
+from .env import (
+    CWD_ENV,
+    LEGACY_CWD_ENV,
+    LEGACY_NAME_ENV,
+    LEGACY_TEAM_ENV,
+    NAME_ENV,
+    TEAM_ENV,
+    env_first,
+)
 from .messages import (
     BatchSummaryChild,
     BatchSummaryPayload,
@@ -130,6 +138,7 @@ def _peer_steer_manifest_max_age_turns() -> int:
 EXPOSED_TOOLS: tuple[str, ...] = (
     "send_message",
     "task_update",
+    "checkpoint_commit",
     "task_create",
     "task_batch_summary",
     "read_inbox",
@@ -288,6 +297,7 @@ TEAM_TOOLS: frozenset[str] = frozenset(
     {
         "send_message",
         "task_update",
+        "checkpoint_commit",
         "task_create",
         "task_batch_summary",
         "read_inbox",
@@ -388,6 +398,33 @@ def _task_id_scope(argv: list[str] | None = None) -> str | None:
     return task_id or env_first(os.environ, TASK_ID_ENV, LEGACY_TASK_ID_ENV)
 
 
+def _cwd_scope(argv: list[str] | None = None) -> Path:
+    """Resolve the teammate working directory for filesystem/git tools.
+
+    App Server does not forward the adapter env to MCP subprocesses, so the
+    adapter passes ``--cwd`` alongside ``--team``/``--name``. Exec-mode callers
+    also set env for backward compatibility. If neither is present, fall back
+    to the wrapper process cwd so local tests and manual runs remain usable.
+    """
+
+    cwd: str | None = None
+    args = list(argv) if argv is not None else sys.argv[1:]
+    i = 0
+    while i < len(args):
+        tok = args[i]
+        if tok == "--cwd" and i + 1 < len(args):
+            cwd = args[i + 1]
+            i += 2
+        elif tok.startswith("--cwd="):
+            cwd = tok.split("=", 1)[1]
+            i += 1
+        else:
+            i += 1
+
+    raw = cwd or env_first(os.environ, CWD_ENV, LEGACY_CWD_ENV, default=os.getcwd())
+    return Path(str(raw)).expanduser().resolve()
+
+
 
 def _decode_bytes(data: bytes) -> tuple[str, str]:
     """Decode arbitrary file/HTTP bytes without raising on bad text."""
@@ -451,6 +488,42 @@ def _normalise_lifecycle_send_body(kind: str, body: str) -> str:
     return payload.model_dump_json(by_alias=True, exclude_none=True)
 
 
+def _run_git(
+    cwd: Path,
+    args: list[str],
+    *,
+    timeout: float = 30.0,
+) -> subprocess.CompletedProcess[str]:
+    return subprocess.run(
+        ["git", *args],
+        cwd=str(cwd),
+        capture_output=True,
+        text=True,
+        timeout=timeout,
+        check=False,
+    )
+
+
+def _git_failure(command: str, result: subprocess.CompletedProcess[str]) -> ToolError:
+    detail = (result.stderr or result.stdout or "").strip()
+    if detail:
+        return ToolError(
+            f"{command} failed with exit code {result.returncode}: {detail}"
+        )
+    return ToolError(f"{command} failed with exit code {result.returncode}")
+
+
+def _unmerged_paths(ls_files_u: str) -> list[str]:
+    paths: set[str] = set()
+    for line in ls_files_u.splitlines():
+        if "\t" not in line:
+            continue
+        _, path = line.split("\t", 1)
+        if path:
+            paths.add(path)
+    return sorted(paths)
+
+
 def _tool_target(tool_name: str, bound_args: dict[str, Any]) -> str | None:
     """Return a concise, non-secret-ish target label for visibility events."""
 
@@ -458,6 +531,8 @@ def _tool_target(tool_name: str, bound_args: dict[str, Any]) -> str | None:
         return f"to={bound_args.get('to')!r}"
     if tool_name == "task_update":
         return f"task_id={bound_args.get('task_id')!r}"
+    if tool_name == "checkpoint_commit":
+        return _preview(bound_args.get("message"), limit=160)
     if tool_name == "task_create":
         return _preview(bound_args.get("subject"), limit=160)
     if tool_name == "mcp_anyteam_capability_manifest":
@@ -563,6 +638,7 @@ def build_server(argv: list[str] | None = None) -> FastMCP:
     """Construct the FastMCP app with the narrowed tools."""
     team, self_name = _identity(argv)
     wrapper_task_id = _task_id_scope(argv)
+    wrapper_cwd = _cwd_scope(argv)
 
     mcp = FastMCP(
         name="claude-anyteam-wrapper",
@@ -571,9 +647,10 @@ def build_server(argv: list[str] | None = None) -> FastMCP:
             f"{team!r}; identity: {self_name!r}. Call these tools when it "
             "would be useful to your teammates — peer or lead updates via "
             "send_message, activeForm/owner/metadata changes via task_update, "
-            "subtask creation via task_create, delegated batch visibility via "
-            "task_batch_summary, inspection via read_inbox / task_list / "
-            "read_config. Destructive lifecycle operations "
+            "durable git checkpoints via checkpoint_commit, subtask creation "
+            "via task_create, delegated batch visibility via task_batch_summary, "
+            "inspection via read_inbox / task_list / read_config. Destructive "
+            "lifecycle operations "
             "(shutdown, spawn, kill) are not available here by design; the "
             "Python adapter owns those."
         ),
@@ -1186,6 +1263,75 @@ def build_server(argv: list[str] | None = None) -> FastMCP:
         if parent_task_id is not None:
             response["parentTaskId"] = parent_task_id
         return response
+
+    @mcp.tool
+    @instrumented_tool(category="team_tool")
+    def checkpoint_commit(message: str) -> dict:
+        """Commit incremental work in this teammate's git repository.
+
+        Use this liberally during multi-file work, especially after each
+        meaningful file edit, so progress survives an App Server turn timeout
+        or process reap. The wrapper runs ``git add -A`` and ``git commit -m``
+        inside the teammate's configured ``--cwd`` and returns the resulting
+        commit SHA. If there are no changes, unresolved merge conflicts, or
+        git refuses the commit, the tool fails without claiming success.
+
+        Args:
+            message: non-empty git commit message for the checkpoint.
+        """
+
+        commit_message = message.strip()
+        if not commit_message:
+            raise ToolError("message must not be empty")
+        if not wrapper_cwd.exists():
+            raise ToolError(f"configured cwd does not exist: {wrapper_cwd}")
+        if not wrapper_cwd.is_dir():
+            raise ToolError(f"configured cwd is not a directory: {wrapper_cwd}")
+
+        top = _run_git(wrapper_cwd, ["rev-parse", "--show-toplevel"])
+        if top.returncode != 0:
+            raise _git_failure("git rev-parse --show-toplevel", top)
+        repo_root = top.stdout.strip() or str(wrapper_cwd)
+
+        unmerged = _run_git(wrapper_cwd, ["ls-files", "-u"])
+        if unmerged.returncode != 0:
+            raise _git_failure("git ls-files -u", unmerged)
+        conflicted = _unmerged_paths(unmerged.stdout)
+        if conflicted:
+            preview = ", ".join(conflicted[:10])
+            suffix = (
+                "" if len(conflicted) <= 10 else f", +{len(conflicted) - 10} more"
+            )
+            raise ToolError(
+                "refusing checkpoint_commit with unresolved merge conflicts: "
+                f"{preview}{suffix}"
+            )
+
+        add = _run_git(wrapper_cwd, ["add", "-A"])
+        if add.returncode != 0:
+            raise _git_failure("git add -A", add)
+
+        diff = _run_git(wrapper_cwd, ["diff", "--cached", "--quiet"])
+        if diff.returncode == 0:
+            raise ToolError("no changes to commit")
+        if diff.returncode != 1:
+            raise _git_failure("git diff --cached --quiet", diff)
+
+        commit = _run_git(wrapper_cwd, ["commit", "-m", commit_message], timeout=60.0)
+        if commit.returncode != 0:
+            raise _git_failure("git commit", commit)
+
+        rev = _run_git(wrapper_cwd, ["rev-parse", "HEAD"])
+        if rev.returncode != 0:
+            raise _git_failure("git rev-parse HEAD", rev)
+        sha = rev.stdout.strip()
+        return {
+            "sha": sha,
+            "commit": sha,
+            "message": commit_message,
+            "repo": repo_root,
+            "cwd": str(wrapper_cwd),
+        }
 
     @mcp.tool
     @instrumented_tool(category="team_tool")

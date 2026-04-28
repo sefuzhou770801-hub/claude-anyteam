@@ -36,7 +36,9 @@ from typing import Any, Callable
 
 from . import logger
 from .env import (
+    CWD_ENV,
     DUMP_EVENTS_ENV,
+    LEGACY_CWD_ENV,
     LEGACY_DUMP_EVENTS_ENV,
     TEAM_ENV,
     LEGACY_TEAM_ENV,
@@ -106,6 +108,7 @@ _TOOL_CALL_TYPE_SUBSTRINGS = (
 _WRAPPER_TOOL_NAMES = frozenset({
     "send_message",
     "task_update",
+    "checkpoint_commit",
     "task_create",
     "read_inbox",
     "task_list",
@@ -226,6 +229,7 @@ def wrapper_mcp_config_args(
     *,
     server_name: str = "claude_anyteam_wrapper",
     wrapper_binary: str = "claude-anyteam-wrapper",
+    cwd: str | Path | None = None,
 ) -> list[str]:
     """Build the `-c mcp_servers.<name>.*` overrides that point Codex at our
     narrowed wrapper MCP server for a single `codex exec` invocation.
@@ -253,9 +257,12 @@ def wrapper_mcp_config_args(
     """
     resolved = shutil.which(wrapper_binary) or wrapper_binary
     prefix = f"mcp_servers.{server_name}"
+    wrapper_args: list[str] = []
+    if cwd is not None:
+        wrapper_args += ["--cwd", str(cwd)]
     return [
         "-c", f'{prefix}.command="{resolved}"',
-        "-c", f"{prefix}.args=[]",
+        "-c", f"{prefix}.args={json.dumps(wrapper_args)}",
     ]
 
 
@@ -485,6 +492,8 @@ def run(
     if wrapper_identity is not None:
         team_name, agent_name = wrapper_identity
         sub_env = identity_env(os.environ, team=team_name, name=agent_name)
+        sub_env[CWD_ENV] = str(cwd)
+        sub_env[LEGACY_CWD_ENV] = str(cwd)
         if task_id is not None:
             sub_env["CLAUDE_ANYTEAM_TASK_ID"] = str(task_id)
 
@@ -1254,7 +1263,14 @@ def app_server_invoke(
     # "connection closed: initialize response"). CLI args sidestep the
     # env-forwarding question entirely; the wrapper's `_identity()` resolves
     # CLI flags first, then env as fallback for backward compat.
-    wrapper_args = ["--team", settings_team, "--name", settings_agent]
+    wrapper_args = [
+        "--team",
+        settings_team,
+        "--name",
+        settings_agent,
+        "--cwd",
+        str(cwd),
+    ]
     if task_id is not None:
         wrapper_args += ["--task-id", str(task_id)]
 

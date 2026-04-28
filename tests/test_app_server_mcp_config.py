@@ -106,6 +106,17 @@ def test_mcp_config_wrapper_args_include_task_id_when_available():
     assert mcp["args"][task_idx + 1] == "58"
 
 
+def test_mcp_config_wrapper_args_include_cwd():
+    """checkpoint_commit needs the teammate's adapter --cwd, not the wrapper process cwd."""
+    config = _capture_thread_start_config(
+        settings_team="claude-anyteam", settings_agent="codex-alice"
+    )
+    mcp = config["mcp_servers"]["claude_anyteam_wrapper"]
+    assert "--cwd" in mcp["args"]
+    cwd_idx = mcp["args"].index("--cwd")
+    assert mcp["args"][cwd_idx + 1] == "/tmp"
+
+
 def test_mcp_config_wrapper_command_is_resolved_path():
     """Absolute path (via shutil.which) or the bare name; either way,
     there's a command field and it ends with `claude-anyteam-wrapper`."""

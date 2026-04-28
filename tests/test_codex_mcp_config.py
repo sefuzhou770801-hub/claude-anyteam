@@ -37,6 +37,13 @@ def test_wrapper_mcp_config_args_custom_server_name():
     assert "mcp_servers.my_custom.args=[]" in args[3]
 
 
+def test_wrapper_mcp_config_args_can_include_cwd():
+    args = codex_mod.wrapper_mcp_config_args(
+        "my-team", "codex-alice", cwd="/work/repo"
+    )
+    assert args[3] == 'mcp_servers.claude_anyteam_wrapper.args=["--cwd", "/work/repo"]'
+
+
 def test_wrapper_mcp_config_args_custom_binary_absolute_path():
     """Explicit absolute path is preserved (shutil.which returns it as-is)."""
     args = codex_mod.wrapper_mcp_config_args(

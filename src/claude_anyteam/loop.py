@@ -475,7 +475,11 @@ def _invoke_codex_prose(
                 cwd=s.cwd,
                 schema=None,
                 codex_binary=s.codex_binary,
-                extra_args=codex_mod.wrapper_mcp_config_args(s.team_name, s.agent_name),
+                extra_args=codex_mod.wrapper_mcp_config_args(
+                    s.team_name,
+                    s.agent_name,
+                    cwd=s.cwd,
+                ),
                 wrapper_identity=(s.team_name, s.agent_name),
                 model=s.model,
                 effort=s.effort,
@@ -901,7 +905,11 @@ def _generate_plan(state: LoopState, task, *, tighten: bool) -> dict[str, Any] |
             cwd=s.cwd,
             schema=codex_mod.PLAN_SCHEMA,
             codex_binary=s.codex_binary,
-            extra_args=codex_mod.wrapper_mcp_config_args(s.team_name, s.agent_name),
+            extra_args=codex_mod.wrapper_mcp_config_args(
+                s.team_name,
+                s.agent_name,
+                cwd=s.cwd,
+            ),
             wrapper_identity=(s.team_name, s.agent_name),
             model=s.model,
             effort=s.effort,
@@ -1149,7 +1157,9 @@ def _invoke_codex_for_task(state: LoopState, task):
                     schema=None,  # ignored on resume path; explicit for clarity
                     codex_binary=s.codex_binary,
                     extra_args=codex_mod.wrapper_mcp_config_args(
-                        s.team_name, s.agent_name
+                        s.team_name,
+                        s.agent_name,
+                        cwd=s.cwd,
                     ),
                     wrapper_identity=(s.team_name, s.agent_name),
                     resume_session_id=state.codex_session_id,
@@ -1222,7 +1232,11 @@ def _invoke_codex_for_task(state: LoopState, task):
             cwd=s.cwd,
             schema=codex_mod.TASK_COMPLETE_SCHEMA,
             codex_binary=s.codex_binary,
-            extra_args=codex_mod.wrapper_mcp_config_args(s.team_name, s.agent_name),
+            extra_args=codex_mod.wrapper_mcp_config_args(
+                s.team_name,
+                s.agent_name,
+                cwd=s.cwd,
+            ),
             wrapper_identity=(s.team_name, s.agent_name),
             model=s.model,
             effort=s.effort,
