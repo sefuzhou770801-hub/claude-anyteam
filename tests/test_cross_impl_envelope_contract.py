@@ -189,6 +189,107 @@ class _ContractAppServerClient:
         pass
 
 
+class _RecoveringAppServerClient:
+    instances: list["_RecoveringAppServerClient"] = []
+
+    def __init__(self, *args: Any, **kwargs: Any) -> None:
+        self.notifications = _NotificationQueue()
+        self.turn_start_kwargs: list[dict[str, Any]] = []
+        self.reconnects = 0
+        type(self).instances.append(self)
+
+    def start(self) -> None:
+        pass
+
+    def initialize(self) -> dict[str, Any]:
+        return {}
+
+    def thread_start(self, **kwargs: Any) -> str:
+        return "thread-recover"
+
+    def turn_start(self, **kwargs: Any) -> str:
+        self.turn_start_kwargs.append(kwargs)
+        if len(self.turn_start_kwargs) == 1:
+            self.notifications.reset(
+                [
+                    {
+                        "method": "item/completed",
+                        "params": {
+                            "item": {
+                                "type": "commandExecution",
+                                "command": "printf before-crash",
+                                "exitCode": 0,
+                            }
+                        },
+                    }
+                ]
+            )
+            return "turn-original"
+
+        self.notifications.reset(
+            [
+                {
+                    "method": "item/completed",
+                    "params": {
+                        "item": {
+                            "type": "agentMessage",
+                            "text": json.dumps(
+                                {
+                                    "files_changed": ["recovered.txt"],
+                                    "summary": "recovered task done",
+                                }
+                            ),
+                        }
+                    },
+                },
+                {"method": "turn/completed", "params": {"turn": {"status": "ok"}}},
+            ]
+        )
+        return "turn-recovery"
+
+    def is_transport_alive(self) -> bool:
+        # After the first turn's only notification is drained, simulate the
+        # App Server/WebSocket transport disappearing mid-turn. The reconnect
+        # path flips `reconnects`, after which the recovery turn is healthy.
+        first_turn_drained = (
+            len(self.turn_start_kwargs) == 1
+            and not self.notifications.items
+            and self.reconnects == 0
+        )
+        return not first_turn_drained
+
+    def transport_status(self) -> dict[str, Any]:
+        return {"fake": "down" if not self.is_transport_alive() else "up"}
+
+    def reconnect_and_resume(self, **kwargs: Any) -> dict[str, Any]:
+        assert kwargs["thread_id"] == "thread-recover"
+        self.reconnects += 1
+        self.notifications.reset([])
+        return {
+            "thread": {
+                "id": "thread-recover",
+                "turns": [
+                    {
+                        "id": "turn-original",
+                        "status": "inProgress",
+                        "items": [],
+                    }
+                ],
+            }
+        }
+
+    def close(self) -> None:
+        pass
+
+
+class _FailingRecoveryAppServerClient(_RecoveringAppServerClient):
+    instances: list["_FailingRecoveryAppServerClient"] = []
+
+    def reconnect_and_resume(self, **kwargs: Any) -> dict[str, Any]:
+        self.reconnects += 1
+        raise app_server_mod.AppServerError("simulated reconnect failure")
+
+
 def _patch_codex_backend(
     monkeypatch: pytest.MonkeyPatch,
     team: str,
@@ -608,6 +709,96 @@ def test_backend_emits_required_envelope_contract(
     ]
     assert runtime_events
     assert {event.backend for event in runtime_events} == {case.runtime_backend}
+
+
+def test_codex_app_server_transport_loss_reconnects_and_resumes(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    _RecoveringAppServerClient.instances = []
+    monkeypatch.setattr(app_server_mod, "AppServerClient", _RecoveringAppServerClient)
+    events: list[Any] = []
+
+    result = codex_loop.codex_mod.app_server_invoke(
+        task_prompt="finish the task",
+        cwd=tmp_path,
+        schema={"type": "object"},
+        settings_team="transport-contract",
+        settings_agent="codex-recovering",
+        codex_binary="codex",
+        overall_timeout_s=10.0,
+        non_progress_warn_s=60.0,
+        event_sink=events.append,
+    )
+
+    assert result.exit_code == 0, result.error
+    assert result.structured == {
+        "files_changed": ["recovered.txt"],
+        "summary": "recovered task done",
+    }
+    assert result.session_id == "thread-recover"
+    assert result.tool_call_events == 1
+
+    client = _RecoveringAppServerClient.instances[0]
+    assert client.reconnects == 1
+    assert len(client.turn_start_kwargs) == 2
+    assert "Transport recovery" in client.turn_start_kwargs[1]["text"]
+
+    kinds = [event.kind for event in events]
+    assert "turn_warning" in kinds
+    assert "turn_progress" in kinds
+    assert "turn_failed" not in kinds
+    assert kinds[-1] == "turn_completed"
+
+    warning = next(event for event in events if event.kind == "turn_warning")
+    assert warning.payload["surface"] == "codex_app_server_transport"
+    assert warning.payload["action"] == "reconnect_and_resume"
+
+    recovery_progress = [
+        event
+        for event in events
+        if event.kind == "turn_progress"
+        and event.payload.get("action") == "recovery_turn_started"
+    ]
+    assert recovery_progress
+
+
+def test_codex_app_server_reconnect_failure_stays_visible(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    _FailingRecoveryAppServerClient.instances = []
+    monkeypatch.setattr(app_server_mod, "AppServerClient", _FailingRecoveryAppServerClient)
+    events: list[Any] = []
+
+    result = codex_loop.codex_mod.app_server_invoke(
+        task_prompt="finish the task",
+        cwd=tmp_path,
+        schema={"type": "object"},
+        settings_team="transport-contract",
+        settings_agent="codex-failing-recovery",
+        codex_binary="codex",
+        overall_timeout_s=10.0,
+        non_progress_warn_s=60.0,
+        event_sink=events.append,
+    )
+
+    assert result.exit_code == 1
+    assert result.structured is None
+    assert result.error is not None
+    assert "reconnect/resume failed" in result.error
+
+    degraded = [
+        event
+        for event in events
+        if event.kind == "visibility_degraded"
+        and event.payload.get("surface") == "codex_app_server_transport"
+    ]
+    assert degraded
+    assert degraded[0].payload["reason"] == "reconnect_failed"
+    assert degraded[0].visibility.mailbox is True
+    assert degraded[0].visibility.task_state is True
+    assert any(event.kind == "turn_failed" for event in events)
 
 
 def test_contract_expected_kinds_are_canonical() -> None:
