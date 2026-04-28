@@ -71,7 +71,10 @@ def _backend_metadata(settings: GeminiSettings) -> BackendMetadata:
     capabilities = assert_known_capabilities(capabilities)
     manifest_kwargs = (
         {
-            "delivery_mode": "live",
+            # ACP session_prompt is a blocking request in the current adapter:
+            # steers are queued and injected at the next prompt boundary, not
+            # delivered into a running prompt mid-turn.
+            "delivery_mode": "next_turn",
             "expiry_semantics": "session_managed",
             "steer_authorization": "any_peer",
             "host_tool_surface": "mcp_anyteam",

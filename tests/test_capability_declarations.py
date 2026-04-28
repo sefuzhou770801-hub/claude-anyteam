@@ -42,6 +42,7 @@ def test_codex_app_server_backend_metadata_declares_expected_capabilities(tmp_pa
 
     assert metadata.capabilities == CODEX_APP_SERVER_CAPABILITIES
     assert "accepts_peer_steer" not in metadata.capabilities
+    assert "plan_mode" in metadata.capabilities
     assert "soft_non_progress_watchdog" in metadata.capabilities
     assert metadata.coupling_regime == "tight"
     assert metadata.capability_manifest["turn_steer"]["authorization"] == "lead_only"
@@ -51,11 +52,15 @@ def test_codex_app_server_backend_metadata_declares_expected_capabilities(tmp_pa
     assert watchdog["schema"]["properties"]["non_progress_warn_s"]["default"] == 300
 
 
-def test_codex_exec_backend_metadata_declares_structured_output_only(tmp_path: Path):
+def test_codex_exec_backend_metadata_declares_headless_capabilities(tmp_path: Path):
     metadata = codex_loop._backend_metadata(_codex_settings(tmp_path, app_server=False))
 
     assert metadata.capabilities == CODEX_EXEC_CAPABILITIES
     assert metadata.coupling_regime == "loose"
+    assert "headless_invocation" in metadata.capabilities
+    assert "session_resume" in metadata.capabilities
+    assert "structured_output" in metadata.capabilities
+    assert "plan_mode" in metadata.capabilities
     assert "soft_non_progress_watchdog" not in metadata.capabilities
 
 
@@ -75,10 +80,16 @@ def test_gemini_acp_backend_metadata_accepts_peer_steer(tmp_path: Path):
     assert metadata.capabilities == GEMINI_ACP_CAPABILITIES
     assert metadata.coupling_regime == "tight"
     assert "accepts_peer_steer" in metadata.capabilities
+    assert "structured_output" in metadata.capabilities
+    assert "session_resume" in metadata.capabilities
+    assert "plan_mode" in metadata.capabilities
+    assert "trust_modes" in metadata.capabilities
     assert "soft_non_progress_watchdog" not in metadata.capabilities
+    assert metadata.capability_manifest["turn_steer"]["delivery_mode"] == "next_turn"
+    assert metadata.capability_manifest["turn_steer"]["authorization"] == "any_peer"
 
 
-def test_gemini_headless_backend_metadata_declares_no_capabilities(tmp_path: Path):
+def test_gemini_headless_backend_metadata_declares_headless_capabilities(tmp_path: Path):
     settings = GeminiSettings(
         team_name="t",
         agent_name="gemini-a",
@@ -91,12 +102,18 @@ def test_gemini_headless_backend_metadata_declares_no_capabilities(tmp_path: Pat
 
     metadata = gemini_loop._backend_metadata(settings)
 
-    assert metadata.capabilities == GEMINI_HEADLESS_CAPABILITIES == []
+    assert metadata.capabilities == GEMINI_HEADLESS_CAPABILITIES
     assert metadata.coupling_regime == "loose"
+    assert metadata.capabilities == [
+        "headless_invocation",
+        "session_resume",
+        "structured_output",
+        "plan_mode",
+    ]
     assert "soft_non_progress_watchdog" not in metadata.capabilities
 
 
-def test_kimi_headless_backend_metadata_declares_large_context(tmp_path: Path):
+def test_kimi_headless_backend_metadata_declares_large_context_and_native_skills(tmp_path: Path):
     settings = KimiSettings(
         team_name="t",
         agent_name="kimi-a",
@@ -109,9 +126,34 @@ def test_kimi_headless_backend_metadata_declares_large_context(tmp_path: Path):
     metadata = kimi_loop._backend_metadata(settings)
 
     assert metadata.capabilities == KIMI_HEADLESS_CAPABILITIES
-    assert metadata.capabilities == ["large_context"]
+    assert metadata.capabilities == [
+        "headless_invocation",
+        "session_resume",
+        "structured_output",
+        "plan_mode",
+        "native_skills",
+        "large_context",
+    ]
     assert metadata.coupling_regime == "loose"
     assert "soft_non_progress_watchdog" not in metadata.capabilities
+
+
+def test_kimi_headless_backend_metadata_declares_native_skills(tmp_path: Path):
+    settings = KimiSettings(
+        team_name="t",
+        agent_name="kimi-a",
+        cwd=tmp_path,
+        poll_interval_s=1.0,
+        color="cyan",
+        plan_mode_required=False,
+    )
+
+    metadata = kimi_loop._backend_metadata(settings)
+
+    assert "native_skills" in metadata.capabilities
+    native = metadata.capability_manifest["native_skills"]
+    assert native["callable_from_peers"] is False
+    assert "Kimi-native" in native["description"]
 
 
 def test_capability_taxonomy_rejects_unknown_flags():

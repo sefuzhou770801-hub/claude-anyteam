@@ -21,6 +21,11 @@ CAPABILITY_NAMES = frozenset(
         "permission_bridge",
         "live_tool_events",
         "structured_output",
+        "headless_invocation",
+        "session_resume",
+        "plan_mode",
+        "trust_modes",
+        "native_skills",
         "large_context",
         "accepts_peer_steer",
         "soft_non_progress_watchdog",
@@ -33,12 +38,18 @@ CODEX_APP_SERVER_CAPABILITIES = [
     "thread_fork",
     "live_tool_events",
     "structured_output",
+    "plan_mode",
     "soft_non_progress_watchdog",
     # Q4 (per opus-arch-impl): Codex App Server is deliberately lead-only
     # for peer steer until the handler and runtime behavior are re-reviewed.
 ]
 
-CODEX_EXEC_CAPABILITIES = ["structured_output"]
+CODEX_EXEC_CAPABILITIES = [
+    "headless_invocation",
+    "session_resume",
+    "structured_output",
+    "plan_mode",
+]
 
 GEMINI_ACP_CAPABILITIES = [
     # ACP delivery is wired at the next turn boundary today, but R11 declares
@@ -47,12 +58,28 @@ GEMINI_ACP_CAPABILITIES = [
     "turn_steer",
     "permission_bridge",
     "live_tool_events",
+    "structured_output",
+    "session_resume",
+    "plan_mode",
+    "trust_modes",
     "accepts_peer_steer",
 ]
 
-GEMINI_HEADLESS_CAPABILITIES: list[str] = []
+GEMINI_HEADLESS_CAPABILITIES: list[str] = [
+    "headless_invocation",
+    "session_resume",
+    "structured_output",
+    "plan_mode",
+]
 
-KIMI_HEADLESS_CAPABILITIES = ["large_context"]
+KIMI_HEADLESS_CAPABILITIES = [
+    "headless_invocation",
+    "session_resume",
+    "structured_output",
+    "plan_mode",
+    "native_skills",
+    "large_context",
+]
 
 CAPABILITY_MANIFEST_SCHEMA_VERSION = 1
 CAPABILITY_MANIFEST_VERSION = "2"
@@ -63,6 +90,11 @@ _CAPABILITY_DISPLAY_NAMES = {
     "permission_bridge": "permission bridge (`permission_bridge`)",
     "live_tool_events": "live tool events (`live_tool_events`)",
     "structured_output": "structured output (`structured_output`)",
+    "headless_invocation": "headless invocation (`headless_invocation`)",
+    "session_resume": "session resume (`session_resume`)",
+    "plan_mode": "plan mode (`plan_mode`)",
+    "trust_modes": "trust modes (`trust_modes`)",
+    "native_skills": "native skills (`native_skills`)",
     "large_context": "large context (`large_context`)",
     "accepts_peer_steer": "peer steer acceptance (`accepts_peer_steer`)",
     "soft_non_progress_watchdog": "soft non-progress watchdog (`soft_non_progress_watchdog`)",
@@ -137,12 +169,83 @@ CAPABILITY_HOOKS: dict[str, CapabilityRuntimeHook] = {
         runtime_paths=(
             "claude_anyteam.schema_validation:parse_and_validate",
             "claude_anyteam.codex:TASK_COMPLETE_SCHEMA",
+            "claude_anyteam.backends.gemini.invoke:run",
+            "claude_anyteam.backends.gemini.acp:run",
+            "claude_anyteam.backends.kimi.invoke:run",
         ),
         test_paths=(
             "tests/test_schema_validation.py::test_valid_output_parses_and_returns_dict",
             "tests/test_packaged_schemas.py::test_wheel_install_ships_schemas_and_validates_task_complete",
+            "tests/test_gemini_invoke.py::test_run_parses_stream_json_and_validates_schema",
+            "tests/test_gemini_acp_prompt_flow.py::test_acp_run_structured_result_and_state",
+            "tests/test_kimi_invoke.py::test_run_exit_zero_success_captures_session_id_and_state",
         ),
         note="Task completion output is schema-constrained and Python-validated.",
+    ),
+    "headless_invocation": CapabilityRuntimeHook(
+        runtime_paths=(
+            "claude_anyteam.codex:run",
+            "claude_anyteam.backends.gemini.invoke:run",
+            "claude_anyteam.backends.kimi.invoke:run",
+        ),
+        test_paths=(
+            "tests/test_codex_invocation_shape.py::test_fresh_exec_still_includes_schema_and_cwd",
+            "tests/test_gemini_invoke.py::test_run_parses_stream_json_and_validates_schema",
+            "tests/test_kimi_invocation_shape.py::test_fresh_argv_uses_print_stream_json_model_and_prompt",
+        ),
+        note="Non-App-Server backends run noninteractive CLI turns with machine-readable output.",
+    ),
+    "session_resume": CapabilityRuntimeHook(
+        runtime_paths=(
+            "claude_anyteam.codex:run",
+            "claude_anyteam.backends.gemini.acp:_ensure_session",
+            "claude_anyteam.backends.gemini.invoke:run",
+            "claude_anyteam.backends.kimi.invoke:_known_session",
+            "claude_anyteam.backends.kimi.loop:_backend_run",
+        ),
+        test_paths=(
+            "tests/test_resume_dispatch.py::test_resume_path_validates_and_returns_structured",
+            "tests/test_gemini_acp_session_reload.py::test_acp_run_reloads_persisted_storage_session",
+            "tests/test_gemini_invoke.py::test_run_persists_headless_session_id_to_adapter_state",
+            "tests/test_kimi_invocation_shape.py::test_known_resume_session_adds_session_flag",
+        ),
+        note="Headless/ACP transports carry cross-task context through CLI or ACP session IDs.",
+    ),
+    "plan_mode": CapabilityRuntimeHook(
+        runtime_paths=(
+            "claude_anyteam.loop:_handle_plan_approval",
+            "claude_anyteam.backends.gemini.loop:_handle_plan_approval",
+            "claude_anyteam.backends.kimi.loop:_handle_plan_approval",
+        ),
+        test_paths=(
+            "tests/test_plan_approval.py::test_plan_success_path_sends_plan",
+            "tests/test_gemini_plan_approval.py::test_gemini_plan_send_crash_is_logged_not_raised",
+            "tests/test_kimi_plan_approval.py::test_plan_prompt_does_not_invoke_kimi_plan_flag_anywhere",
+        ),
+        note="All routed backends can participate in opt-in structured plan approval.",
+    ),
+    "trust_modes": CapabilityRuntimeHook(
+        runtime_paths=(
+            "claude_anyteam.backends.gemini.config:GeminiSettings",
+            "claude_anyteam.backends.gemini.acp:TRUST_TO_ACP_MODE",
+            "claude_anyteam.backends.gemini.acp_client:GeminiAcpClient.set_session_mode",
+        ),
+        test_paths=(
+            "tests/test_gemini_effort.py::test_gemini_trust_mode_from_env_and_overrides",
+            "tests/test_gemini_acp_prompt_flow.py::test_acp_run_trust_modes_map_to_acp_session_modes",
+        ),
+        note="Gemini ACP exposes trusted/default/plan modes and maps them onto ACP session modes.",
+    ),
+    "native_skills": CapabilityRuntimeHook(
+        runtime_paths=(
+            "claude_anyteam.backends.kimi.invoke:run",
+            "claude_anyteam.backends.kimi.config:KimiSettings",
+        ),
+        test_paths=(
+            "tests/test_kimi_invocation_shape.py::test_default_invocation_preserves_kimi_native_skill_discovery",
+            "tests/test_capability_declarations.py::test_kimi_headless_backend_metadata_declares_native_skills",
+        ),
+        note="Kimi v1 preserves Kimi-native skill discovery by not overriding --skills-dir.",
     ),
     "large_context": CapabilityRuntimeHook(
         runtime_paths=(
@@ -151,7 +254,7 @@ CAPABILITY_HOOKS: dict[str, CapabilityRuntimeHook] = {
         ),
         test_paths=(
             "tests/test_kimi_invocation_shape.py::test_fresh_argv_uses_print_stream_json_model_and_prompt",
-            "tests/test_capability_declarations.py::test_kimi_headless_backend_metadata_declares_large_context",
+            "tests/test_capability_declarations.py::test_kimi_headless_backend_metadata_declares_large_context_and_native_skills",
         ),
         note="Kimi is the routed large-context backend; the adapter invokes the Kimi CLI directly.",
     ),
@@ -278,6 +381,161 @@ _BASE_CAPABILITY_MANIFEST: dict[str, dict[str, Any]] = {
         "when_to_use": "Use for coding tasks where the lead needs machine-readable completion metadata.",
         "when_not_to": "Not directly callable by peers; it describes final-output fidelity.",
         "failure_modes": ["SCHEMA_VALIDATION_FAILED", "OUTPUT_SCHEMA_UNSUPPORTED", "RETRY_EXHAUSTED"],
+        "callable_from_peers": False,
+    },
+    "headless_invocation": {
+        "version": "1",
+        "schema": {
+            "type": "object",
+            "properties": {
+                "mode": {
+                    "type": "string",
+                    "enum": ["codex_exec", "gemini_headless", "kimi_headless"],
+                },
+                "machine_output": {"type": "boolean", "const": True},
+            },
+        },
+        "description": (
+            "Run a noninteractive CLI turn whose stdout/sidecar output can be "
+            "parsed by the adapter."
+        ),
+        "when_to_use": (
+            "Prefer this teammate for simple one-shot or batchable work where "
+            "mid-turn steering is not needed and process isolation is useful."
+        ),
+        "when_not_to": (
+            "Do not choose headless invocation when live mid-turn steering or "
+            "Codex App Server thread/fork is required."
+        ),
+        "failure_modes": [
+            "CLI_BINARY_MISSING",
+            "HEADLESS_FLAG_UNSUPPORTED",
+            "MACHINE_OUTPUT_PARSE_FAILED",
+            "TURN_TIMEOUT",
+        ],
+        "callable_from_peers": False,
+    },
+    "session_resume": {
+        "version": "1",
+        "schema": {
+            "type": "object",
+            "properties": {
+                "session_id": {"type": "string"},
+                "transport": {
+                    "type": "string",
+                    "enum": ["codex_exec", "gemini_acp", "gemini_headless", "kimi_headless"],
+                },
+            },
+        },
+        "description": (
+            "Carry context across turns or tasks by resuming a backend-native "
+            "session identifier."
+        ),
+        "when_to_use": (
+            "Ask for continuity when a follow-up depends on prior conversation "
+            "or repository findings and the backend is not using Codex "
+            "App Server thread/fork."
+        ),
+        "when_not_to": (
+            "Do not rely on resume after a failed or intentionally isolated "
+            "ephemeral prose/plan turn."
+        ),
+        "failure_modes": [
+            "SESSION_ID_MISSING",
+            "SESSION_NOT_FOUND",
+            "RESUME_UNSUPPORTED_FLAG_COMBINATION",
+            "RESUMED_OUTPUT_SCHEMA_UNAVAILABLE",
+        ],
+        "callable_from_peers": False,
+    },
+    "plan_mode": {
+        "version": "1",
+        "schema": {
+            "type": "object",
+            "required": ["request_id"],
+            "properties": {
+                "request_id": {"type": "string"},
+                "task_id": {"type": ["string", "null"]},
+            },
+        },
+        "description": "Draft a structured plan for lead approval without completing the task.",
+        "when_to_use": (
+            "Use when a teammate was launched with planModeRequired and the "
+            "lead requests an explicit plan before execution."
+        ),
+        "when_not_to": (
+            "Do not send plan requests to teammates that were not configured "
+            "for plan approval; they will ignore unexpected requests."
+        ),
+        "failure_modes": [
+            "PLAN_MODE_NOT_REQUIRED",
+            "PLAN_TARGET_MISSING",
+            "PLAN_SCHEMA_VALIDATION_FAILED",
+            "PLAN_SEND_FAILED",
+        ],
+        "callable_from_peers": False,
+    },
+    "trust_modes": {
+        "version": "1",
+        "schema": {
+            "type": "object",
+            "properties": {
+                "mode": {
+                    "type": "string",
+                    "enum": ["trusted", "default", "plan"],
+                }
+            },
+        },
+        "description": (
+            "Gemini ACP can run in trusted, default, or plan trust modes and "
+            "maps them to ACP session modes."
+        ),
+        "when_to_use": (
+            "Choose default or plan when sensitive Gemini host-tool use should "
+            "bridge to team-lead approval instead of auto-approving."
+        ),
+        "when_not_to": (
+            "Do not expect this capability on Codex, Gemini headless, or Kimi; "
+            "their approval/sandbox controls have different shapes."
+        ),
+        "failure_modes": [
+            "INVALID_TRUST_MODE",
+            "SET_SESSION_MODE_FAILED",
+            "APPROVAL_TIMEOUT",
+            "DENIED_BY_TEAM_LEAD",
+        ],
+        "callable_from_peers": False,
+    },
+    "native_skills": {
+        "version": "1",
+        "schema": {
+            "type": "object",
+            "properties": {
+                "discovery": {
+                    "type": "string",
+                    "enum": ["kimi_default"],
+                },
+                "overrides_skills_dir": {"type": "boolean", "const": False},
+            },
+        },
+        "description": (
+            "Preserve Kimi-native project/user/built-in skill discovery inside "
+            "the Kimi teammate."
+        ),
+        "when_to_use": (
+            "Route large-context or workflow-rich tasks to Kimi when its native "
+            "skills may help and you do not need to enumerate/invoke those "
+            "skills through anyteam."
+        ),
+        "when_not_to": (
+            "Do not assume peers can list or call Kimi skills directly in v1; "
+            "the root Kimi session owns discovery and selection."
+        ),
+        "failure_modes": [
+            "SKILL_DISCOVERY_CHANGED_UPSTREAM",
+            "SKILLS_DIR_OVERRIDE_HIDES_DEFAULTS",
+            "SKILL_NOT_AVAILABLE_TO_ROOT_AGENT",
+        ],
         "callable_from_peers": False,
     },
     "large_context": {

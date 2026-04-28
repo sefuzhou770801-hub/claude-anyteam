@@ -104,12 +104,17 @@
       "propertyNames": {
         "enum": [
           "accepts_peer_steer",
+          "headless_invocation",
           "large_context",
           "live_tool_events",
+          "native_skills",
           "permission_bridge",
+          "plan_mode",
+          "session_resume",
           "soft_non_progress_watchdog",
           "structured_output",
           "thread_fork",
+          "trust_modes",
           "turn_steer"
         ]
       },

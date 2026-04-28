@@ -46,6 +46,8 @@ North-star lens from `CLAUDE.md` §1: each backend's unique harness primitives m
 
 **Proposal:** keep the existing App Server declarations, but add an informational capability for session/transport recovery only if peers need to route based on it. For this task's fix, the more urgent gaps are cross-backend structured output / session-resume / plan/trust/Kimi-native declarations.
 
+Implementation note for the follow-up fix: `plan_mode` is declared for Codex App Server teammates too. Although ordinary task turns use App Server when enabled, the current plan-approval handler is a transport-independent teammate primitive and generates the structured plan through the Codex CLI path.
+
 ### Codex exec
 
 **Actual code:**
@@ -111,7 +113,8 @@ North-star lens from `CLAUDE.md` §1: each backend's unique harness primitives m
    - `trust_modes`
    - `native_skills`
 2. Add them to backend declarations:
-   - `codex-exec`: `headless_invocation`, `session_resume` in addition to `structured_output`.
+   - `codex-app-server`: add `plan_mode` in addition to the existing App Server flags.
+   - `codex-exec`: `headless_invocation`, `session_resume`, `plan_mode` in addition to `structured_output`.
    - `gemini-acp`: `structured_output`, `plan_mode`, `session_resume`, `trust_modes` in addition to existing ACP flags.
    - `gemini-headless`: `headless_invocation`, `session_resume`, `structured_output`, `plan_mode`.
    - `kimi-headless`: `headless_invocation`, `session_resume`, `structured_output`, `plan_mode`, `native_skills`, `large_context`.
