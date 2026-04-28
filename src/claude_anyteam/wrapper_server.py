@@ -47,7 +47,12 @@ from typing import Any, Callable, Literal, TypeVar, cast
 from .capabilities import manifest_accepts_peer_steer
 from .capability_manifest import CapabilityManifestCache
 from .env import LEGACY_NAME_ENV, LEGACY_TEAM_ENV, NAME_ENV, TEAM_ENV, env_first
-from .messages import VisibilityEvent, parse_protocol_text
+from .messages import (
+    BatchSummaryChild,
+    BatchSummaryPayload,
+    VisibilityEvent,
+    parse_protocol_text,
+)
 from . import protocol_io
 from claude_teams import messaging as _cs_messaging  # type: ignore[import-untyped]
 from claude_teams import tasks as _cs_tasks  # type: ignore[import-untyped]
@@ -126,6 +131,7 @@ EXPOSED_TOOLS: tuple[str, ...] = (
     "send_message",
     "task_update",
     "task_create",
+    "task_batch_summary",
     "read_inbox",
     "task_list",
     "read_config",
@@ -283,6 +289,7 @@ TEAM_TOOLS: frozenset[str] = frozenset(
         "send_message",
         "task_update",
         "task_create",
+        "task_batch_summary",
         "read_inbox",
         "task_list",
         "read_config",
@@ -564,8 +571,9 @@ def build_server(argv: list[str] | None = None) -> FastMCP:
             f"{team!r}; identity: {self_name!r}. Call these tools when it "
             "would be useful to your teammates — peer or lead updates via "
             "send_message, activeForm/owner/metadata changes via task_update, "
-            "subtask creation via task_create, inspection via read_inbox / "
-            "task_list / read_config. Destructive lifecycle operations "
+            "subtask creation via task_create, delegated batch visibility via "
+            "task_batch_summary, inspection via read_inbox / task_list / "
+            "read_config. Destructive lifecycle operations "
             "(shutdown, spawn, kill) are not available here by design; the "
             "Python adapter owns those."
         ),
@@ -618,6 +626,7 @@ def build_server(argv: list[str] | None = None) -> FastMCP:
         severity: str,
         summary: str,
         payload: dict[str, Any],
+        task_id: str | None = None,
         mailbox: bool = False,
     ) -> VisibilityEvent:
         nonlocal visibility_seq
@@ -629,6 +638,7 @@ def build_server(argv: list[str] | None = None) -> FastMCP:
                 "team": team,
                 "agent": self_name,
                 "backend": "wrapper_mcp",
+                "task_id": task_id,
                 "turn_id": wrapper_turn_id,
                 "seq": visibility_seq,
                 "severity": severity,
@@ -1126,6 +1136,7 @@ def build_server(argv: list[str] | None = None) -> FastMCP:
         status: Literal["pending", "in_progress", "completed"] | None = None,
         owner: str | None = None,
         metadata: dict[str, Any] | None = None,
+        parent_task_id: str | None = None,
     ) -> dict:
         """Update your own in-flight task. Use `active_form` to tell
         teammates what you're currently doing ('writing tests',
@@ -1140,6 +1151,7 @@ def build_server(argv: list[str] | None = None) -> FastMCP:
             status: one of 'pending', 'in_progress', 'completed'.
             owner: optional owner override to forward to TaskUpdate.
             metadata: optional metadata patch to forward to TaskUpdate.
+            parent_task_id: optional delegated parent task link.
         """
         if status is not None and status not in ("pending", "in_progress", "completed"):
             raise ToolError(f"invalid status {status!r}")
@@ -1159,20 +1171,30 @@ def build_server(argv: list[str] | None = None) -> FastMCP:
                 owner=owner,
                 active_form=active_form,
                 metadata=metadata,
+                parent_task_id=parent_task_id,
             )
         except ValueError as e:
             raise ToolError(str(e))
-        return {
+        response = {
             "id": result.id,
             "status": result.status,
             "active_form": result.active_form,
             "owner": result.owner,
             "metadata": result.metadata,
         }
+        parent_task_id = getattr(result, "parent_task_id", None)
+        if parent_task_id is not None:
+            response["parentTaskId"] = parent_task_id
+        return response
 
     @mcp.tool
     @instrumented_tool(category="team_tool")
-    def task_create(subject: str, description: str, coupling: dict | str | None = None) -> dict:
+    def task_create(
+        subject: str,
+        description: str,
+        coupling: dict | str | None = None,
+        parent_task_id: str | None = None,
+    ) -> dict:
         """Create a new task in your team. Use when work you discovered
         during a task should be split off rather than bundled into the
         current one. The new task starts unowned and pending; the lead
@@ -1183,16 +1205,142 @@ def build_server(argv: list[str] | None = None) -> FastMCP:
             description: full task context and scope.
             coupling: optional per-task coordination override in canonical
                 shape {intent: tight_peer_loop|loose_parallel|batched_async}.
+            parent_task_id: optional delegated parent task link.
         """
         if not subject.strip():
             raise ToolError("subject must not be empty")
         if not description.strip():
             raise ToolError("description must not be empty")
         try:
-            t = _cs_tasks.create_task(team, subject, description, coupling=coupling)
+            t = _cs_tasks.create_task(
+                team,
+                subject,
+                description,
+                coupling=coupling,
+                parent_task_id=parent_task_id,
+            )
         except ValueError as e:
             raise ToolError(str(e))
-        return {"id": t.id, "status": t.status, "subject": t.subject, "coupling": t.coupling}
+        response = {
+            "id": t.id,
+            "status": t.status,
+            "subject": t.subject,
+            "coupling": t.coupling,
+        }
+        if t.parent_task_id is not None:
+            response["parentTaskId"] = t.parent_task_id
+        return response
+
+    def _batch_child_value(
+        child: dict[str, Any],
+        snake_key: str,
+        camel_key: str,
+    ) -> Any:
+        return child[snake_key] if snake_key in child else child.get(camel_key)
+
+    def _normalise_batch_summary_child(
+        parent_task_id: str,
+        child: dict[str, Any],
+    ) -> BatchSummaryChild:
+        if not isinstance(child, dict):
+            raise ToolError("Each child task entry must be an object")
+
+        raw_task_id = _batch_child_value(child, "task_id", "taskId")
+        task_id = str(raw_task_id).strip() if raw_task_id is not None else ""
+        if not task_id:
+            raise ToolError("Each child task entry must include task_id")
+        if task_id == parent_task_id:
+            raise ToolError("Parent task cannot be included as a child task")
+
+        try:
+            task = _cs_tasks.get_task(team, task_id)
+        except FileNotFoundError:
+            raise ToolError(f"Child task {task_id!r} not found in team {team!r}")
+
+        if task.parent_task_id is None:
+            try:
+                task = _cs_tasks.update_task(
+                    team,
+                    task_id,
+                    parent_task_id=parent_task_id,
+                )
+            except ValueError as e:
+                raise ToolError(str(e))
+        elif task.parent_task_id != parent_task_id:
+            raise ToolError(
+                f"Child task {task_id!r} is already linked to parent task "
+                f"{task.parent_task_id!r}"
+            )
+
+        raw_status = child.get("status") or task.status
+        status = str(raw_status).strip()
+        if not status:
+            raise ToolError(f"Child task {task_id!r} must include a non-empty status")
+
+        payload: dict[str, Any] = {"taskId": task_id, "status": status}
+        for snake_key, camel_key in (
+            ("session_id", "sessionId"),
+            ("stop_reason", "stopReason"),
+            ("summary", "summary"),
+        ):
+            value = _batch_child_value(child, snake_key, camel_key)
+            if value is not None:
+                payload[camel_key] = str(value)
+        return BatchSummaryChild.model_validate(payload)
+
+    @mcp.tool
+    @instrumented_tool(category="team_tool")
+    def task_batch_summary(
+        parent_task_id: str,
+        child_tasks: list[dict[str, Any]],
+        summary: str,
+    ) -> dict:
+        """Emit a structured batch summary for delegated sub-tasks.
+
+        Use this after completing or collecting multiple delegated child
+        tasks. Each child entry must include task_id/taskId and may include
+        status, session_id/sessionId, stop_reason/stopReason, and summary.
+        Missing child parentTaskId links are wired to parent_task_id before
+        the batch_summary visibility event is sent to the lead.
+        """
+        parent_task_id = parent_task_id.strip()
+        if not parent_task_id:
+            raise ToolError("parent_task_id must not be empty")
+        summary_text = summary.strip()
+        if not summary_text:
+            raise ToolError("summary must not be empty")
+        if not child_tasks:
+            raise ToolError("child_tasks must not be empty")
+        try:
+            _cs_tasks.get_task(team, parent_task_id)
+        except FileNotFoundError:
+            raise ToolError(f"Parent task {parent_task_id!r} not found in team {team!r}")
+
+        children: list[BatchSummaryChild] = []
+        seen_child_ids: set[str] = set()
+        for child in child_tasks:
+            child_payload = _normalise_batch_summary_child(parent_task_id, child)
+            if child_payload.task_id in seen_child_ids:
+                raise ToolError(f"Duplicate child task {child_payload.task_id!r}")
+            seen_child_ids.add(child_payload.task_id)
+            children.append(child_payload)
+
+        payload = BatchSummaryPayload(
+            parent_task_id=parent_task_id,
+            child_task_ids=[child.task_id for child in children],
+            child_tasks=children,
+            summary=summary_text,
+        )
+        event = _make_event(
+            kind="batch_summary",
+            severity="info",
+            summary=summary_text,
+            task_id=parent_task_id,
+            mailbox=True,
+            payload=payload.model_dump(by_alias=True, exclude_none=True),
+        )
+        _fanout_visibility_event(event, mailbox=True)
+        return event.model_dump(by_alias=True, exclude_none=True)
 
     @mcp.tool
     @instrumented_tool(category="team_tool")

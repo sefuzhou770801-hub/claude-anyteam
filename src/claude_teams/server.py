@@ -26,6 +26,8 @@ from claude_teams.spawner import (
     use_tmux_windows,
 )
 from claude_teams.tmux_introspection import peek_pane, resolve_pane_target
+from claude_anyteam import protocol_io
+from claude_anyteam.messages import BatchSummaryChild, BatchSummaryPayload, VisibilityEvent
 
 logger = logging.getLogger(__name__)
 
@@ -550,10 +552,12 @@ def task_create(
     active_form: str = "",
     metadata: dict | None = None,
     coupling: dict | str | None = None,
+    parent_task_id: str | None = None,
 ) -> dict:
     """Create a new task for the team. Tasks are auto-assigned incrementing IDs.
     Optional metadata dict is stored alongside the task. Optional coupling is
-    the per-task coordination override."""
+    the per-task coordination override. Optional parent_task_id links the new
+    task as a delegated child of an existing parent task."""
     try:
         task = tasks.create_task(
             team_name,
@@ -562,10 +566,14 @@ def task_create(
             active_form,
             metadata,
             coupling,
+            parent_task_id=parent_task_id,
         )
     except ValueError as e:
         raise ToolError(str(e))
-    return {"id": task.id, "status": task.status, "coupling": task.coupling}
+    result = {"id": task.id, "status": task.status, "coupling": task.coupling}
+    if task.parent_task_id is not None:
+        result["parentTaskId"] = task.parent_task_id
+    return result
 
 
 @mcp.tool
@@ -581,10 +589,13 @@ def task_update(
     add_blocked_by: list[str] | None = None,
     metadata: dict | None = None,
     coupling: dict | str | None = None,
+    parent_task_id: str | None = None,
 ) -> dict:
     """Update a task's fields. Setting owner auto-notifies the assignee via
     inbox. Setting status to 'deleted' removes the task file from disk.
-    Metadata keys are merged into existing metadata (set a key to null to delete it)."""
+    Metadata keys are merged into existing metadata (set a key to null to delete it).
+    Optional parent_task_id links the task as a delegated child of an existing
+    parent task."""
     if owner is not None:
         try:
             config = teams.read_config(team_name)
@@ -606,6 +617,7 @@ def task_update(
             add_blocked_by=add_blocked_by,
             metadata=metadata,
             coupling=coupling,
+            parent_task_id=parent_task_id,
         )
     except FileNotFoundError:
         raise ToolError(f"Task {task_id!r} not found in team {team_name!r}")
@@ -613,7 +625,154 @@ def task_update(
         raise ToolError(str(e))
     if owner is not None and task.owner is not None and task.status != "deleted":
         messaging.send_task_assignment(team_name, task, assigned_by="team-lead")
-    return {"id": task.id, "status": task.status, "coupling": task.coupling}
+    result = {"id": task.id, "status": task.status, "coupling": task.coupling}
+    if task.parent_task_id is not None:
+        result["parentTaskId"] = task.parent_task_id
+    return result
+
+
+def _raw_child_value(
+    child: dict[str, Any],
+    snake_key: str,
+    camel_key: str,
+) -> Any:
+    return child[snake_key] if snake_key in child else child.get(camel_key)
+
+
+def _normalise_batch_summary_child(
+    team_name: str,
+    parent_task_id: str,
+    child: dict[str, Any],
+) -> BatchSummaryChild:
+    if not isinstance(child, dict):
+        raise ToolError("Each child task entry must be an object")
+
+    raw_task_id = _raw_child_value(child, "task_id", "taskId")
+    task_id = str(raw_task_id).strip() if raw_task_id is not None else ""
+    if not task_id:
+        raise ToolError("Each child task entry must include task_id")
+    if task_id == parent_task_id:
+        raise ToolError("Parent task cannot be included as a child task")
+
+    try:
+        task = tasks.get_task(team_name, task_id)
+    except FileNotFoundError:
+        raise ToolError(f"Child task {task_id!r} not found in team {team_name!r}")
+
+    if task.parent_task_id is None:
+        try:
+            task = tasks.update_task(
+                team_name,
+                task_id,
+                parent_task_id=parent_task_id,
+            )
+        except ValueError as e:
+            raise ToolError(str(e))
+    elif task.parent_task_id != parent_task_id:
+        raise ToolError(
+            f"Child task {task_id!r} is already linked to parent task "
+            f"{task.parent_task_id!r}"
+        )
+
+    raw_status = child.get("status") or task.status
+    status = str(raw_status).strip()
+    if not status:
+        raise ToolError(f"Child task {task_id!r} must include a non-empty status")
+
+    payload: dict[str, Any] = {"taskId": task_id, "status": status}
+    for snake_key, camel_key in (
+        ("session_id", "sessionId"),
+        ("stop_reason", "stopReason"),
+        ("summary", "summary"),
+    ):
+        value = _raw_child_value(child, snake_key, camel_key)
+        if value is not None:
+            payload[camel_key] = str(value)
+    return BatchSummaryChild.model_validate(payload)
+
+
+@mcp.tool
+def task_batch_summary(
+    team_name: str,
+    parent_task_id: str,
+    child_tasks: list[dict[str, Any]],
+    summary: str,
+    sender: str = "team-lead",
+) -> dict:
+    """Emit a structured batch_summary visibility event for delegated work.
+
+    Each child task entry must include task_id/taskId and may include status,
+    session_id/sessionId, stop_reason/stopReason, and summary. Missing child
+    parentTaskId links are wired to parent_task_id before the event is emitted.
+    """
+    try:
+        config = teams.read_config(team_name)
+    except FileNotFoundError:
+        raise ToolError(f"Team {team_name!r} not found")
+
+    member_names = {m.name for m in config.members}
+    if sender not in member_names:
+        raise ToolError(f"Sender {sender!r} is not a member of team {team_name!r}")
+
+    parent_task_id = parent_task_id.strip()
+    if not parent_task_id:
+        raise ToolError("parent_task_id must not be empty")
+    summary_text = summary.strip()
+    if not summary_text:
+        raise ToolError("summary must not be empty")
+    if not child_tasks:
+        raise ToolError("child_tasks must not be empty")
+
+    try:
+        tasks.get_task(team_name, parent_task_id)
+    except FileNotFoundError:
+        raise ToolError(f"Parent task {parent_task_id!r} not found in team {team_name!r}")
+
+    children: list[BatchSummaryChild] = []
+    seen_child_ids: set[str] = set()
+    for child in child_tasks:
+        child_payload = _normalise_batch_summary_child(
+            team_name,
+            parent_task_id,
+            child,
+        )
+        if child_payload.task_id in seen_child_ids:
+            raise ToolError(f"Duplicate child task {child_payload.task_id!r}")
+        seen_child_ids.add(child_payload.task_id)
+        children.append(child_payload)
+
+    payload = BatchSummaryPayload(
+        parent_task_id=parent_task_id,
+        child_task_ids=[child.task_id for child in children],
+        child_tasks=children,
+        summary=summary_text,
+    )
+    event = VisibilityEvent(
+        kind="batch_summary",
+        event_id=f"{sender}:batch-summary:{parent_task_id}:{uuid.uuid4().hex[:12]}",
+        team=team_name,
+        agent=sender,
+        backend="claude_teams_server",
+        task_id=parent_task_id,
+        seq=0,
+        severity="info",
+        summary=summary_text[:300],
+        visibility={
+            "mailbox": True,
+            "task_state": False,
+            "event_log": True,
+            "stderr": False,
+        },
+        payload=payload.model_dump(by_alias=True, exclude_none=True),
+    )
+    protocol_io.append_event(team_name, sender, event)
+    protocol_io.send_visibility_event_to_lead(
+        team_name,
+        sender,
+        event,
+        summary=f"batch_summary:{parent_task_id}",
+    )
+    return event.model_dump(by_alias=True, exclude_none=True)
 
 
 @mcp.tool

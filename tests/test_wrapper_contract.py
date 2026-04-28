@@ -14,6 +14,7 @@ from types import SimpleNamespace
 from unittest.mock import patch
 
 import pytest
+from claude_teams import tasks as cs_tasks
 from claude_teams.models import LeadMember, TeammateMember
 
 from claude_anyteam import protocol_io as pio
@@ -255,8 +256,8 @@ def test_exposed_and_blocked_do_not_overlap():
 
 
 def test_exposed_count_includes_protocol_shadow_and_manifest_tools(identity):
-    """Canary: fifteen tools is intentional: six protocol tools, the R13 manifest tool, and eight shadow tools."""
-    assert len(_advertised_tool_names()) == 15
+    """Canary: sixteen tools is intentional: seven protocol tools, the R13 manifest tool, and eight shadow tools."""
+    assert len(_advertised_tool_names()) == 16
 
 
 def test_every_exposed_tool_has_visibility_category():
@@ -354,6 +355,7 @@ def test_exposed_tools_covers_cs50victor_safe_subset():
     assert "send_message" in EXPOSED_TOOLS
     assert "task_update" in EXPOSED_TOOLS
     assert "task_create" in EXPOSED_TOOLS
+    assert "task_batch_summary" in EXPOSED_TOOLS
     assert "read_inbox" in EXPOSED_TOOLS
     assert "task_list" in EXPOSED_TOOLS
     assert "read_config" in EXPOSED_TOOLS
@@ -645,7 +647,7 @@ def test_all_cs50victor_tools_are_categorised():
     fail this test, forcing an explicit decision on whether to surface
     it to Codex.
     """
-    # We hard-code cs50victor's current 13-tool surface. If upstream grows
+    # We hard-code cs50victor's current 14-tool surface. If upstream grows
     # the tool surface, this list will diverge from live — that's the point.
     cs50victor_current_tools = frozenset({
         "team_create",
@@ -654,6 +656,7 @@ def test_all_cs50victor_tools_are_categorised():
         "send_message",
         "task_create",
         "task_update",
+        "task_batch_summary",
         "task_list",
         "task_get",
         "read_inbox",
@@ -709,6 +712,45 @@ def test_task_update_rejects_when_owned_by_other_teammate(identity):
     ):
         with pytest.raises(Exception, match="owned by 'someone-else', not 'contract-test'"):
             _call_tool("task_update", {"task_id": "7", "owner": "team-lead"})
+
+
+def test_task_batch_summary_wrapper_emits_visibility_event(identity, monkeypatch, tmp_path):
+    team_root = identity
+    _seed_manifest_team(team_root)
+    tasks_root = tmp_path / "tasks"
+    monkeypatch.setattr("claude_anyteam.wrapper_server._cs_teams.TEAMS_DIR", team_root)
+    monkeypatch.setattr("claude_anyteam.wrapper_server._cs_tasks.TASKS_DIR", tasks_root)
+    (tasks_root / "claude-anyteam").mkdir(parents=True)
+    (tasks_root / "claude-anyteam" / ".lock").touch()
+    parent = cs_tasks.create_task("claude-anyteam", "Parent", "delegation root")
+    child = cs_tasks.create_task("claude-anyteam", "Child", "delegated")
+
+    result = _call_tool(
+        "task_batch_summary",
+        {
+            "parent_task_id": parent.id,
+            "child_tasks": [
+                {
+                    "task_id": child.id,
+                    "status": "completed",
+                    "session_id": "session-child",
+                    "stop_reason": "task_complete",
+                }
+            ],
+            "summary": "delegated child complete",
+        },
+    )
+
+    assert result["kind"] == "batch_summary"
+    assert result["task_id"] == parent.id
+    assert result["payload"]["childTaskIds"] == [child.id]
+    assert cs_tasks.get_task("claude-anyteam", child.id).parent_task_id == parent.id
+    events = pio.read_visibility_events("claude-anyteam", "contract-test")
+    batch_events = [event for event in events if event.kind == "batch_summary"]
+    assert len(batch_events) == 1
+    assert batch_events[0].payload == result["payload"]
+    inbox = json.loads((team_root / "claude-anyteam" / "inboxes" / "team-lead.json").read_text())
+    assert inbox[-1]["messageKind"] == "batch_summary"
 
 
 def test_send_message_accepts_broadcast_star(identity, monkeypatch, tmp_path):

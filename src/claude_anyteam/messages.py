@@ -285,6 +285,30 @@ LIFECYCLE_MESSAGE_KINDS = frozenset(
 )
 
 
+class BatchSummaryChild(_Base):
+    """One delegated child task result included in a batch summary event."""
+
+    task_id: str = Field(alias="taskId")
+    status: str
+    session_id: str | None = Field(default=None, alias="sessionId")
+    stop_reason: str | None = Field(default=None, alias="stopReason")
+    summary: str | None = None
+
+
+class BatchSummaryPayload(_Base):
+    """Payload for the ``batch_summary`` visibility event.
+
+    The task model remains per-task, so this payload is the structured
+    visibility link that ties multiple delegated child task IDs to one parent
+    task and preserves per-child session status/stop-reason details.
+    """
+
+    parent_task_id: str = Field(alias="parentTaskId")
+    child_task_ids: list[str] = Field(alias="childTaskIds")
+    child_tasks: list[BatchSummaryChild] = Field(alias="childTasks")
+    summary: str
+
+
 VisibilityEventKind = Literal[
     "agent_registered",
     "turn_started",
@@ -298,6 +322,7 @@ VisibilityEventKind = Literal[
     "steer_ack",
     "capability_changed",
     "capability_manifest_updated",
+    "batch_summary",
 ]
 
 VisibilitySeverity = Literal["debug", "info", "warn", "error"]
@@ -405,6 +430,7 @@ def parse_protocol_text(text: str) -> _Base | None:
         "steer_ack",
         "capability_changed",
         "capability_manifest_updated",
+        "batch_summary",
     }:
         return _safe_load(VisibilityEvent, raw)
     return None

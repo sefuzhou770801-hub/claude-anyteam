@@ -9,6 +9,8 @@ from __future__ import annotations
 import json
 
 from claude_anyteam.messages import (
+    BatchSummaryChild,
+    BatchSummaryPayload,
     IdleNotificationOut,
     PermissionRequestOut,
     PlanBlockedOut,
@@ -21,6 +23,7 @@ from claude_anyteam.messages import (
     TaskBlockedOut,
     TaskAssignmentIn,
     TaskCompleteOut,
+    VisibilityEvent,
     parse_protocol_text,
 )
 
@@ -168,6 +171,74 @@ def test_task_complete_serializes_with_kind():
     assert as_dict["task_id"] == "7"
     assert as_dict["files_changed"] == ["src/foo.py"]
     assert as_dict["codex_exit_code"] == 0
+
+
+def test_batch_summary_payload_serializes_delegated_child_links():
+    payload = BatchSummaryPayload(
+        parent_task_id="40",
+        child_task_ids=["41", "42"],
+        child_tasks=[
+            BatchSummaryChild(
+                task_id="41",
+                status="completed",
+                session_id="session-41",
+                stop_reason="task_complete",
+                summary="child one done",
+            ),
+            BatchSummaryChild(
+                task_id="42",
+                status="blocked",
+                stop_reason="needs review",
+            ),
+        ],
+        summary="batch finished",
+    )
+
+    as_dict = payload.model_dump(by_alias=True, exclude_none=True)
+    assert as_dict == {
+        "parentTaskId": "40",
+        "childTaskIds": ["41", "42"],
+        "childTasks": [
+            {
+                "taskId": "41",
+                "status": "completed",
+                "sessionId": "session-41",
+                "stopReason": "task_complete",
+                "summary": "child one done",
+            },
+            {
+                "taskId": "42",
+                "status": "blocked",
+                "stopReason": "needs review",
+            },
+        ],
+        "summary": "batch finished",
+    }
+
+
+def test_parse_batch_summary_visibility_event():
+    event = VisibilityEvent(
+        kind="batch_summary",
+        event_id="worker:batch-summary:40:abc123",
+        team="team-x",
+        agent="worker",
+        backend="claude_teams_server",
+        task_id="40",
+        seq=0,
+        summary="batch finished",
+        payload={
+            "parentTaskId": "40",
+            "childTaskIds": ["41"],
+            "childTasks": [{"taskId": "41", "status": "completed"}],
+            "summary": "batch finished",
+        },
+    )
+
+    parsed = parse_protocol_text(event.model_dump_json(by_alias=True, exclude_none=True))
+
+    assert isinstance(parsed, VisibilityEvent)
+    assert parsed.kind == "batch_summary"
+    assert parsed.payload["parentTaskId"] == "40"
 
 
 def test_parse_typed_lifecycle_payload_variants():
