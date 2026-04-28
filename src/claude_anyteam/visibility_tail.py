@@ -1,9 +1,9 @@
 """Live pretty-printer for the VisibilityEvent JSONL stream.
 
 ``claude-anyteam visibility-tail`` is intentionally a small filesystem-tail
-projector over the existing visibility substrate.  It does not replace tmux
-panes or introduce a socket server; it gives leads one optional structured
-feed that can be attached mid-run.
+projector over the existing visibility substrate.  The optional WebSocket
+projection still tails the same per-team aggregate JSONL file; it gives leads
+one optional structured feed that can be attached mid-run.
 """
 
 from __future__ import annotations
@@ -18,7 +18,7 @@ import time
 from dataclasses import dataclass
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
-from typing import Any, Iterable, TextIO
+from typing import Any, AsyncIterator, Iterable, TextIO
 
 from pydantic import ValidationError
 
@@ -30,6 +30,35 @@ from . import protocol_io as pio
 class _ServeAddress:
     host: str
     port: int
+
+
+@dataclass(frozen=True)
+class _Subscription:
+    agent: str | None = None
+    filter_kinds: frozenset[str] | None = None
+    since: datetime | None = None
+
+    def matches(self, event: VisibilityEvent) -> bool:
+        return _event_matches(
+            event,
+            agent=self.agent,
+            filter_kinds=set(self.filter_kinds) if self.filter_kinds is not None else None,
+            since=self.since,
+        )
+
+    def as_wire_filter(self) -> dict[str, Any]:
+        payload: dict[str, Any] = {}
+        if self.agent is not None:
+            payload["agent"] = self.agent
+        if self.filter_kinds is not None:
+            payload["kind"] = sorted(self.filter_kinds)
+        if self.since is not None:
+            payload["since"] = _format_wire_timestamp(self.since)
+        return payload
+
+
+class _SubscriptionError(ValueError):
+    pass
 
 
 _ANSI_RESET = "\033[0m"
@@ -202,6 +231,10 @@ def _parse_timestamp(value: str) -> datetime | None:
     return parsed.astimezone(timezone.utc)
 
 
+def _format_wire_timestamp(value: datetime) -> str:
+    return value.astimezone(timezone.utc).isoformat().replace("+00:00", "Z")
+
+
 def _parse_since_arg(value: str) -> datetime:
     parsed = _parse_timestamp(value)
     if parsed is not None:
@@ -250,6 +283,104 @@ def _split_filter_kinds(values: Iterable[str]) -> set[str] | None:
         if item.strip()
     }
     return kinds or None
+
+
+def _coerce_wire_kinds(value: Any) -> frozenset[str] | None:
+    if value is None:
+        return None
+    if isinstance(value, str):
+        return frozenset(
+            item.strip()
+            for item in value.split(",")
+            if item.strip()
+        ) or None
+    if isinstance(value, list):
+        kinds: set[str] = set()
+        for item in value:
+            if not isinstance(item, str):
+                raise _SubscriptionError("kind entries must be strings")
+            kinds.update(part.strip() for part in item.split(",") if part.strip())
+        return frozenset(kinds) or None
+    raise _SubscriptionError("kind must be a string or list of strings")
+
+
+def _base_subscription(
+    *,
+    agent: str | None,
+    filter_kinds: set[str] | None,
+    since: datetime | None,
+) -> _Subscription:
+    return _Subscription(
+        agent=agent,
+        filter_kinds=frozenset(filter_kinds) if filter_kinds is not None else None,
+        since=since,
+    )
+
+
+def _subscription_from_wire(
+    message: str | bytes,
+    *,
+    base: _Subscription,
+) -> _Subscription:
+    if isinstance(message, bytes):
+        try:
+            message = message.decode("utf-8")
+        except UnicodeDecodeError as exc:
+            raise _SubscriptionError("subscription message must be UTF-8 JSON") from exc
+    try:
+        raw = json.loads(message)
+    except json.JSONDecodeError as exc:
+        raise _SubscriptionError("subscription message must be JSON") from exc
+    if not isinstance(raw, dict):
+        raise _SubscriptionError("subscription message must be a JSON object")
+    message_type = raw.get("type", "subscribe")
+    if message_type != "subscribe":
+        raise _SubscriptionError(f"unsupported message type {message_type!r}")
+
+    filter_payload = raw.get("filter")
+    if filter_payload is None:
+        filter_payload = raw
+    if not isinstance(filter_payload, dict):
+        raise _SubscriptionError("filter must be a JSON object")
+
+    agent = base.agent
+    if "agent" in filter_payload:
+        value = filter_payload["agent"]
+        if value is None or value == "":
+            agent = None
+        elif isinstance(value, str):
+            try:
+                agent = _validate_name(value)
+            except argparse.ArgumentTypeError as exc:
+                raise _SubscriptionError(str(exc)) from exc
+        else:
+            raise _SubscriptionError("agent must be a string")
+
+    kind_value = None
+    kind_seen = False
+    for key in ("kind", "kinds", "filter_kind", "filterKinds"):
+        if key in filter_payload:
+            kind_value = filter_payload[key]
+            kind_seen = True
+            break
+    filter_kinds = base.filter_kinds
+    if kind_seen:
+        filter_kinds = _coerce_wire_kinds(kind_value)
+
+    since = base.since
+    if "since" in filter_payload:
+        value = filter_payload["since"]
+        if value is None or value == "":
+            since = None
+        elif isinstance(value, str):
+            try:
+                since = _parse_since_arg(value)
+            except argparse.ArgumentTypeError as exc:
+                raise _SubscriptionError(str(exc)) from exc
+        else:
+            raise _SubscriptionError("since must be a string")
+
+    return _Subscription(agent=agent, filter_kinds=filter_kinds, since=since)
 
 
 def _truncate(text: str, *, limit: int = _CARD_INLINE_VALUE_LIMIT) -> str:
@@ -672,7 +803,7 @@ async def _tail_aggregate_events_async(
     from_start: bool = False,
     poll_s: float = 0.2,
     stderr: TextIO | None = None,
-) -> Any:
+) -> AsyncIterator[VisibilityEvent]:
     """Yield events from the per-team aggregate visibility stream."""
 
     err = stderr if stderr is not None else sys.stderr
@@ -698,27 +829,139 @@ async def _tail_aggregate_events_async(
         await asyncio.sleep(max(0.01, poll_s))
 
 
+class _VisibilityClient:
+    def __init__(self, *, subscription: _Subscription) -> None:
+        self.subscription = subscription
+        self.queue: asyncio.Queue[str | None] = asyncio.Queue()
+
+    def enqueue_event(self, event: VisibilityEvent) -> None:
+        if self.subscription.matches(event):
+            self.queue.put_nowait(event.model_dump_json(by_alias=True, exclude_none=True))
+
+    def enqueue_control(self, payload: dict[str, Any]) -> None:
+        self.queue.put_nowait(json.dumps(payload, sort_keys=True, separators=(",", ":")))
+
+    def close(self) -> None:
+        self.queue.put_nowait(None)
+
+
+class _VisibilityFanoutHub:
+    def __init__(
+        self,
+        *,
+        team: str,
+        from_start: bool,
+        poll_s: float,
+        stderr: TextIO,
+    ) -> None:
+        self.team = team
+        self.from_start = from_start
+        self.poll_s = poll_s
+        self.stderr = stderr
+        self._clients: set[_VisibilityClient] = set()
+        self._task: asyncio.Task[None] | None = None
+
+    async def start(self) -> None:
+        if self._task is None:
+            self._task = asyncio.create_task(self._run(), name="visibility-tail-fanout")
+
+    async def stop(self) -> None:
+        if self._task is None:
+            return
+        self._task.cancel()
+        try:
+            await self._task
+        except asyncio.CancelledError:
+            pass
+        self._task = None
+
+    def add(self, client: _VisibilityClient) -> None:
+        self._clients.add(client)
+
+    def remove(self, client: _VisibilityClient) -> None:
+        self._clients.discard(client)
+        client.close()
+
+    async def _run(self) -> None:
+        async for event in _tail_aggregate_events_async(
+            team=self.team,
+            from_start=self.from_start,
+            poll_s=self.poll_s,
+            stderr=self.stderr,
+        ):
+            for client in tuple(self._clients):
+                client.enqueue_event(event)
+
+
 async def _visibility_ws_handler(
     websocket: Any,
     *,
-    team: str,
-    agent: str | None,
-    filter_kinds: set[str] | None,
-    since: datetime | None,
-    from_start: bool,
-    poll_s: float,
-    stderr: TextIO,
+    hub: _VisibilityFanoutHub,
+    subscription: _Subscription,
+    allow_remote: bool,
 ) -> None:
-    async for event in _tail_aggregate_events_async(
-        team=team,
-        agent=agent,
-        filter_kinds=filter_kinds,
-        since=since,
-        from_start=from_start,
-        poll_s=poll_s,
-        stderr=stderr,
-    ):
-        await websocket.send(event.model_dump_json(by_alias=True, exclude_none=True))
+    from websockets.exceptions import ConnectionClosed
+
+    remote_address = getattr(websocket, "remote_address", None)
+    if not allow_remote and remote_address:
+        remote_host = remote_address[0] if isinstance(remote_address, tuple) else None
+        if remote_host is not None and not _is_loopback_host(remote_host):
+            await websocket.close(code=1008, reason="visibility-tail is localhost-only")
+            return
+
+    client = _VisibilityClient(subscription=subscription)
+    hub.add(client)
+
+    async def sender() -> None:
+        try:
+            while True:
+                payload = await client.queue.get()
+                if payload is None:
+                    return
+                await websocket.send(payload)
+        except ConnectionClosed:
+            return
+
+    async def receiver() -> None:
+        try:
+            async for message in websocket:
+                try:
+                    client.subscription = _subscription_from_wire(
+                        message,
+                        base=client.subscription,
+                    )
+                except _SubscriptionError as exc:
+                    client.enqueue_control({"type": "error", "error": str(exc)})
+                    continue
+                client.enqueue_control(
+                    {
+                        "type": "subscribed",
+                        "filter": client.subscription.as_wire_filter(),
+                    }
+                )
+        except ConnectionClosed:
+            return
+
+    sender_task = asyncio.create_task(sender())
+    receiver_task = asyncio.create_task(receiver())
+    try:
+        done, pending = await asyncio.wait(
+            {sender_task, receiver_task},
+            return_when=asyncio.FIRST_COMPLETED,
+        )
+        for task in done:
+            task.result()
+        for task in pending:
+            task.cancel()
+    finally:
+        hub.remove(client)
+        for task in (sender_task, receiver_task):
+            if not task.done():
+                task.cancel()
+            try:
+                await task
+            except asyncio.CancelledError:
+                pass
 
 
 async def _serve_visibility_tail(
@@ -753,21 +996,31 @@ async def _serve_visibility_tail(
     async def handler(websocket: Any) -> None:
         await _visibility_ws_handler(
             websocket,
-            team=team,
-            agent=agent,
-            filter_kinds=filter_kinds,
-            since=since,
-            from_start=from_start,
-            poll_s=poll_s,
-            stderr=stderr,
+            hub=hub,
+            subscription=_base_subscription(
+                agent=agent,
+                filter_kinds=filter_kinds,
+                since=since,
+            ),
+            allow_remote=allow_remote,
         )
 
-    async with serve(handler, bind.host, bind.port):
-        stdout.write(
-            f"visibility-tail websocket listening on ws://{bind.host}:{bind.port}\n"
-        )
-        stdout.flush()
-        await asyncio.Future()
+    hub = _VisibilityFanoutHub(
+        team=team,
+        from_start=from_start,
+        poll_s=poll_s,
+        stderr=stderr,
+    )
+    await hub.start()
+    try:
+        async with serve(handler, bind.host, bind.port):
+            stdout.write(
+                f"visibility-tail websocket listening on ws://{bind.host}:{bind.port}\n"
+            )
+            stdout.flush()
+            await asyncio.Future()
+    finally:
+        await hub.stop()
     return 0
 
 
