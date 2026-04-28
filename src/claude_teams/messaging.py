@@ -1,14 +1,19 @@
 from __future__ import annotations
 
+import hashlib
 import json
+import os
+import re
 import time
 from datetime import datetime, timezone
 from pathlib import Path
+from uuid import uuid4
 
 from pydantic import BaseModel
 
 from claude_teams._filelock import file_lock
 from claude_teams.models import (
+    InboxAttachment,
     InboxMessage,
     ShutdownRequest,
     TaskAssignment,
@@ -16,6 +21,11 @@ from claude_teams.models import (
 )
 
 TEAMS_DIR = Path.home() / ".claude" / "teams"
+DEFAULT_ATTACHMENT_SPILL_CHARS = 4096
+ATTACHMENT_SPILL_ENV_VARS = (
+    "CLAUDE_ANYTEAM_INBOX_SPILL_CHARS",
+    "CLAUDE_TEAMS_INBOX_SPILL_CHARS",
+)
 
 
 def _teams_dir(base_dir: Path | None = None) -> Path:
@@ -29,6 +39,109 @@ def now_iso() -> str:
 
 def inbox_path(team_name: str, agent_name: str, base_dir: Path | None = None) -> Path:
     return _teams_dir(base_dir) / team_name / "inboxes" / f"{agent_name}.json"
+
+
+def team_root(team_name: str, base_dir: Path | None = None) -> Path:
+    return _teams_dir(base_dir) / team_name
+
+
+def inbox_artifacts_dir(team_name: str, base_dir: Path | None = None) -> Path:
+    return team_root(team_name, base_dir) / "artifacts" / "inbox"
+
+
+def attachment_spill_chars() -> int:
+    """Return the configured inbox body spill threshold.
+
+    A non-positive value disables spilling. Invalid values fall back to the
+    protocol default so one bad environment variable does not break mailbox
+    delivery.
+    """
+
+    for name in ATTACHMENT_SPILL_ENV_VARS:
+        raw = os.environ.get(name)
+        if raw in (None, ""):
+            continue
+        try:
+            return int(raw)
+        except ValueError:
+            return DEFAULT_ATTACHMENT_SPILL_CHARS
+    return DEFAULT_ATTACHMENT_SPILL_CHARS
+
+
+def _safe_filename_part(value: str) -> str:
+    cleaned = re.sub(r"[^A-Za-z0-9_.-]+", "-", value).strip("-._")
+    return cleaned[:64] or "unknown"
+
+
+def _artifact_filename(message: InboxMessage, agent_name: str) -> str:
+    ts = datetime.now(timezone.utc).strftime("%Y%m%dT%H%M%S%fZ")
+    sender = _safe_filename_part(message.from_)
+    recipient = _safe_filename_part(agent_name)
+    return f"{ts}-{sender}-to-{recipient}-{uuid4().hex}.txt"
+
+
+def _attachment_path(
+    team_name: str,
+    relative_path: str | None,
+    path: str,
+    base_dir: Path | None = None,
+) -> Path:
+    root = team_root(team_name, base_dir).resolve()
+    candidate = Path(relative_path) if relative_path else Path(path)
+    if not candidate.is_absolute():
+        candidate = root / candidate
+    resolved = candidate.resolve()
+    if not resolved.is_relative_to(root):
+        raise ValueError(f"attachment path escapes team root: {candidate}")
+    return resolved
+
+
+def read_attachment_text(
+    team_name: str,
+    attachment: InboxAttachment,
+    base_dir: Path | None = None,
+) -> str:
+    """Read the full text body referenced by an inbox attachment."""
+
+    path = _attachment_path(
+        team_name,
+        attachment.relative_path,
+        attachment.path,
+        base_dir=base_dir,
+    )
+    return path.read_text(encoding="utf-8")
+
+
+def _spill_message_if_needed(
+    team_name: str,
+    agent_name: str,
+    message: InboxMessage,
+    base_dir: Path | None = None,
+) -> InboxMessage:
+    threshold = attachment_spill_chars()
+    if threshold <= 0 or message.attachment is not None or len(message.text) <= threshold:
+        return message
+
+    artifacts_dir = inbox_artifacts_dir(team_name, base_dir)
+    artifacts_dir.mkdir(parents=True, exist_ok=True)
+    path = artifacts_dir / _artifact_filename(message, agent_name)
+    full_text = message.text
+    path.write_text(full_text, encoding="utf-8")
+    root = team_root(team_name, base_dir).resolve()
+    relative_path = path.resolve().relative_to(root).as_posix()
+    preview_body = full_text[:threshold].rstrip()
+    preview = (
+        f"{preview_body}\n\n"
+        f"... [Full message ({len(full_text)} chars): {path}]"
+    )
+    attachment = InboxAttachment(
+        path=str(path),
+        relative_path=relative_path,
+        char_count=len(full_text),
+        preview_char_count=len(preview_body),
+        sha256=hashlib.sha256(full_text.encode("utf-8")).hexdigest(),
+    )
+    return message.model_copy(update={"text": preview, "attachment": attachment})
 
 
 def ensure_inbox(team_name: str, agent_name: str, base_dir: Path | None = None) -> Path:
@@ -150,14 +263,21 @@ def append_message(
     agent_name: str,
     message: InboxMessage,
     base_dir: Path | None = None,
-) -> None:
+) -> InboxMessage:
     path = ensure_inbox(team_name, agent_name, base_dir)
     lock_path = path.parent / ".lock"
 
     with file_lock(lock_path):
+        stored_message = _spill_message_if_needed(
+            team_name,
+            agent_name,
+            message,
+            base_dir=base_dir,
+        )
         raw_list = json.loads(path.read_text())
-        raw_list.append(message.model_dump(by_alias=True, exclude_none=True))
+        raw_list.append(stored_message.model_dump(by_alias=True, exclude_none=True))
         path.write_text(json.dumps(raw_list))
+        return stored_message
 
 
 def send_plain_message(
@@ -168,6 +288,7 @@ def send_plain_message(
     summary: str,
     color: str | None = None,
     base_dir: Path | None = None,
+    message_kind: str | None = None,
 ) -> None:
     msg = InboxMessage(
         from_=from_name,
@@ -176,6 +297,7 @@ def send_plain_message(
         read=False,
         summary=summary,
         color=color,
+        message_kind=message_kind or "peer_dm",
     )
     append_message(team_name, to_name, msg, base_dir)
 
