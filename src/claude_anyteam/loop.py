@@ -48,6 +48,7 @@ from .messages import (
     parse_protocol_text,
 )
 from .registration import BackendMetadata, deregister, register
+from .watch_inbox import WatchInbox, adaptive_wait_s
 
 
 APP_SERVER_TASK_STATE_SAMPLE_EVERY = 5
@@ -222,56 +223,65 @@ def _main_loop(state: LoopState) -> None:
     )
 
     idle_last_sent_at: float | None = None
+    inbox_watch = WatchInbox.for_team(
+        s.team_name,
+        s.agent_name,
+        fallback_timeout_s=s.poll_interval_s,
+    )
 
-    while not state.approved_shutdown:
-        # 1. Drain inbox. Use read_own_inbox so the "self-only" invariant is
-        # asserted at call time — the protocol mark-as-read path rewrites the
-        # file, and touching another teammate's inbox would corrupt its schema.
-        #
-        # Prose-batch dispatch (#18): consecutive prose messages collapse into
-        # a single Codex invocation via _handle_prose_batch. Protocol messages
-        # (shutdown_request, plan_approval_request, capability_manifest_*)
-        # always flow through their own one-per-dispatch path so each gets
-        # individual handling and idempotency checks.
-        messages = pio.read_own_inbox(s.team_name, s.agent_name, s.agent_name)
-        for kind, group in _partition_inbox(messages):
-            if kind == "prose":
-                _handle_prose_batch(state, group)
-            else:
-                for m in group:
-                    _handle_message(state, m)
-            if state.approved_shutdown:
+    try:
+        while not state.approved_shutdown:
+            # 1. Drain inbox. Use read_own_inbox so the "self-only" invariant is
+            # asserted at call time — the protocol mark-as-read path rewrites the
+            # file, and touching another teammate's inbox would corrupt its schema.
+            #
+            # Prose-batch dispatch (#18): consecutive prose messages collapse into
+            # a single Codex invocation via _handle_prose_batch. Protocol messages
+            # (shutdown_request, plan_approval_request, capability_manifest_*)
+            # always flow through their own one-per-dispatch path so each gets
+            # individual handling and idempotency checks.
+            messages = pio.read_own_inbox(s.team_name, s.agent_name, s.agent_name)
+            saw_messages = bool(messages)
+            for kind, group in _partition_inbox(messages):
+                if kind == "prose":
+                    _handle_prose_batch(state, group)
+                else:
+                    for m in group:
+                        _handle_message(state, m)
+                if state.approved_shutdown:
+                    return
+
+            # 2. Claim-and-execute.
+            if not state.shutdown_requested:
+                claimed = _find_and_claim(state)
+                if claimed is not None:
+                    _execute_task(state, claimed)
+                    idle_last_sent_at = None
+                    continue  # loop again to drain inbox before idling
+
+            # 3. Idle notification (rate-limited to once per 60s while idle).
+            if not _has_claimable(state):
+                now = time.monotonic()
+                if idle_last_sent_at is None or (now - idle_last_sent_at) > 60.0:
+                    try:
+                        pio.send_idle_notification(s.team_name, s.agent_name)
+                        idle_last_sent_at = now
+                        logger.info("idle.sent")
+                    except Exception as e:
+                        logger.warn("idle.send_fail", error=str(e))
+
+            # 4. Wait for inbox change or adaptive timeout.
+            inbox_watch.wait_for_change(adaptive_wait_s(saw_messages=saw_messages))
+
+            # 5. Honour SIGINT/SIGTERM if we haven't already agreed to shut down.
+            if state.shutdown_requested and state.in_flight_task is None:
+                logger.info("loop.signal_exit")
+                state.codex_session_id = None
+                state.app_server_last_thread_id = None
+                state.approved_shutdown = True
                 return
-
-        # 2. Claim-and-execute.
-        if not state.shutdown_requested:
-            claimed = _find_and_claim(state)
-            if claimed is not None:
-                _execute_task(state, claimed)
-                idle_last_sent_at = None
-                continue  # loop again to drain inbox before idling
-
-        # 3. Idle notification (rate-limited to once per 60s while idle).
-        if not _has_claimable(state):
-            now = time.monotonic()
-            if idle_last_sent_at is None or (now - idle_last_sent_at) > 60.0:
-                try:
-                    pio.send_idle_notification(s.team_name, s.agent_name)
-                    idle_last_sent_at = now
-                    logger.info("idle.sent")
-                except Exception as e:
-                    logger.warn("idle.send_fail", error=str(e))
-
-        # 4. Sleep.
-        time.sleep(s.poll_interval_s)
-
-        # 5. Honour SIGINT/SIGTERM if we haven't already agreed to shut down.
-        if state.shutdown_requested and state.in_flight_task is None:
-            logger.info("loop.signal_exit")
-            state.codex_session_id = None
-            state.app_server_last_thread_id = None
-            state.approved_shutdown = True
-            return
+    finally:
+        inbox_watch.close()
 
 
 def _handle_message(state: LoopState, msg: Any) -> None:

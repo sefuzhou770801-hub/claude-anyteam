@@ -20,6 +20,7 @@ from claude_anyteam.capabilities import KIMI_HEADLESS_CAPABILITIES, assert_known
 from claude_anyteam.messages import CapabilityManifestUpdatedIn, PlanApprovalRequestIn, ShutdownRequestIn, SteerIn, parse_protocol_text
 from claude_anyteam.registration import BackendMetadata, deregister, register
 from claude_anyteam.schema_validation import inline_schema_prompt_fragment, load_schema
+from claude_anyteam.watch_inbox import WatchInbox, adaptive_wait_s
 
 from . import invoke as headless_invoke, prompts
 from .config import KimiSettings
@@ -243,38 +244,47 @@ def _main_loop(state: KimiLoopState) -> None:
     s = state.settings
     logger.info("kimi.loop.start", team=s.team_name, name=s.agent_name, poll_s=s.poll_interval_s)
     idle_last_sent_at: float | None = None
-    while not state.approved_shutdown:
-        messages = pio.read_own_inbox(s.team_name, s.agent_name, s.agent_name)
-        for kind, group in _partition_inbox(messages):
-            if kind == "prose":
-                _handle_prose_batch(state, group)
-            else:
-                for m in group:
-                    _handle_message(state, m)
-            if state.approved_shutdown:
+    inbox_watch = WatchInbox.for_team(
+        s.team_name,
+        s.agent_name,
+        fallback_timeout_s=s.poll_interval_s,
+    )
+    try:
+        while not state.approved_shutdown:
+            messages = pio.read_own_inbox(s.team_name, s.agent_name, s.agent_name)
+            saw_messages = bool(messages)
+            for kind, group in _partition_inbox(messages):
+                if kind == "prose":
+                    _handle_prose_batch(state, group)
+                else:
+                    for m in group:
+                        _handle_message(state, m)
+                if state.approved_shutdown:
+                    return
+
+            if not state.shutdown_requested:
+                claimed = _find_and_claim(state)
+                if claimed is not None:
+                    _execute_task(state, claimed)
+                    idle_last_sent_at = None
+                    continue
+
+            if not _has_claimable(state):
+                now = time.monotonic()
+                if idle_last_sent_at is None or (now - idle_last_sent_at) > 60:
+                    try:
+                        pio.send_idle_notification(s.team_name, s.agent_name)
+                        idle_last_sent_at = now
+                        logger.info("kimi.idle.sent")
+                    except Exception as e:
+                        logger.warn("kimi.idle.send_fail", error=str(e))
+            inbox_watch.wait_for_change(adaptive_wait_s(saw_messages=saw_messages))
+            if state.shutdown_requested and state.in_flight_task is None:
+                state.kimi_session_id = None
+                state.approved_shutdown = True
                 return
-
-        if not state.shutdown_requested:
-            claimed = _find_and_claim(state)
-            if claimed is not None:
-                _execute_task(state, claimed)
-                idle_last_sent_at = None
-                continue
-
-        if not _has_claimable(state):
-            now = time.monotonic()
-            if idle_last_sent_at is None or (now - idle_last_sent_at) > 60:
-                try:
-                    pio.send_idle_notification(s.team_name, s.agent_name)
-                    idle_last_sent_at = now
-                    logger.info("kimi.idle.sent")
-                except Exception as e:
-                    logger.warn("kimi.idle.send_fail", error=str(e))
-        time.sleep(s.poll_interval_s)
-        if state.shutdown_requested and state.in_flight_task is None:
-            state.kimi_session_id = None
-            state.approved_shutdown = True
-            return
+    finally:
+        inbox_watch.close()
 
 
 def _handle_message(state: KimiLoopState, msg: Any) -> None:

@@ -22,6 +22,9 @@ dependencies = [
     # Python because `codex exec resume` on codex-cli 0.122.0 does not
     # accept `--output-schema`.
     "jsonschema>=4.20",
+    # Event-driven teammate inbox wakeups: mirrors aproto-codex-bridge's
+    # fs.watch-on-inbox-dir pattern with basename filtering.
+    "watchfiles>=1.0",
 ]
 
 [dependency-groups]

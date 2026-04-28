@@ -520,7 +520,7 @@ def _install_shutdown_after_first_idle_sleep(
 ) -> None:
     sent_shutdown = False
 
-    def fake_sleep(_seconds: float) -> None:
+    def trigger_shutdown(label: str) -> None:
         nonlocal sent_shutdown
         if not sent_shutdown:
             sent_shutdown = True
@@ -531,10 +531,30 @@ def _install_shutdown_after_first_idle_sleep(
             )
             return
         raise AssertionError(
-            f"{case.case_id} adapter slept again after shutdown was queued"
+            f"{case.case_id} adapter idled again ({label}) after shutdown was queued"
         )
 
+    def fake_sleep(_seconds: float) -> None:
+        trigger_shutdown("time.sleep")
+
     monkeypatch.setattr(case.loop_module.time, "sleep", fake_sleep)
+
+    # Phase4 #28 (event-driven inbox watcher): adapter loops now wait via
+    # WatchInbox.wait_for_change instead of time.sleep, so the legacy fake_sleep
+    # hook above never fires. Mirror the same shutdown-on-first-idle injection
+    # at the new wait point so the contract still ships shutdown after the
+    # adapter completes its first turn.
+    from claude_anyteam import watch_inbox as _watch_inbox
+
+    real_wait_for_change = _watch_inbox.WatchInbox.wait_for_change
+
+    def fake_wait_for_change(self: _watch_inbox.WatchInbox, timeout_s: float) -> bool:
+        trigger_shutdown("WatchInbox.wait_for_change")
+        return False
+
+    monkeypatch.setattr(
+        _watch_inbox.WatchInbox, "wait_for_change", fake_wait_for_change
+    )
 
 
 @pytest.mark.parametrize("case", BACKENDS, ids=[case.case_id for case in BACKENDS])
