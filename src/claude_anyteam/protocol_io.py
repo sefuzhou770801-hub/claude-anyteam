@@ -160,7 +160,8 @@ def read_inbox(team: str, name: str, *, mark_as_read: bool = True) -> list[_Inbo
     invariant that we only mutate our own file.
     """
     try:
-        return _m.read_inbox(team, name, unread_only=True, mark_as_read=mark_as_read)
+        messages = _m.read_inbox(team, name, unread_only=True, mark_as_read=mark_as_read)
+        return materialize_attached_protocol_messages(team, messages)
     except json.JSONDecodeError as e:
         logger.warn("inbox.parse_race", error=str(e))
         return []
@@ -185,6 +186,62 @@ def read_own_inbox(team: str, self_name: str, agent_name: str) -> list[_InboxMes
         f"Use read_inbox(..., mark_as_read=False) for read-only access."
     )
     return read_inbox(team, agent_name, mark_as_read=True)
+
+
+PLAIN_PREVIEW_MESSAGE_KINDS = frozenset({"peer_dm", "informational", "handoff"})
+
+
+def should_materialize_attachment_for_protocol(message: _InboxMessage) -> bool:
+    """Return True when the adapter should read an attached full body now.
+
+    Plain peer DMs intentionally stay as previews to avoid model-context bloat;
+    protocol/control messages need their original JSON or steer body so routing
+    decisions do not accidentally treat a preview marker as prose.
+    """
+
+    if message.attachment is None:
+        return False
+    kind = (getattr(message, "message_kind", None) or "peer_dm").lower()
+    return kind not in PLAIN_PREVIEW_MESSAGE_KINDS
+
+
+def resolve_attachment_text(team: str, message: _InboxMessage) -> str:
+    """Return the full attached body for ``message``.
+
+    Raises ``ValueError`` if the message has no attachment. This helper is for
+    code paths that explicitly need the full body; normal inbox reads should
+    preserve previews unless ``should_materialize_attachment_for_protocol``
+    says the body is required for control-flow parsing.
+    """
+
+    if message.attachment is None:
+        raise ValueError("inbox message has no attachment")
+    return _m.read_attachment_text(team, message.attachment)
+
+
+def materialize_attached_protocol_message(
+    team: str,
+    message: _InboxMessage,
+) -> _InboxMessage:
+    if not should_materialize_attachment_for_protocol(message):
+        return message
+    try:
+        return message.model_copy(update={"text": resolve_attachment_text(team, message)})
+    except (OSError, ValueError) as e:
+        logger.warn(
+            "inbox.attachment_read_failed",
+            sender=message.from_,
+            message_kind=message.message_kind,
+            error=str(e),
+        )
+        return message
+
+
+def materialize_attached_protocol_messages(
+    team: str,
+    messages: list[_InboxMessage],
+) -> list[_InboxMessage]:
+    return [materialize_attached_protocol_message(team, m) for m in messages]
 
 
 def list_tasks(team: str) -> list[_TaskFile]:
@@ -321,20 +378,18 @@ def _send_plain_message_compat(
             kwargs["message_kind"] = message_kind
             _m.send_plain_message(team, sender, to, body, **kwargs)
             return
-        path = _m.ensure_inbox(team, to)
-        with _file_lock(path.parent / ".lock"):
-            raw_list = json.loads(path.read_text())
-            raw_list.append(
-                {
-                    "from": sender,
-                    "text": body,
-                    "timestamp": now_iso(),
-                    "read": False,
-                    "summary": summary,
-                    "messageKind": message_kind,
-                }
-            )
-            path.write_text(json.dumps(raw_list))
+        _m.append_message(
+            team,
+            to,
+            _InboxMessage(
+                from_=sender,
+                text=body,
+                timestamp=now_iso(),
+                read=False,
+                summary=summary,
+                message_kind=message_kind,
+            ),
+        )
         return
     _m.send_plain_message(team, sender, to, body, **kwargs)
 
