@@ -10,6 +10,7 @@ from __future__ import annotations
 import argparse
 import importlib.metadata
 import os
+import re
 import platform
 import shutil
 import subprocess
@@ -362,18 +363,43 @@ def _yes_default_prompt(question: str) -> bool | None:
     return answer.strip().lower() not in {"n", "no"}
 
 
+_ANSI_ESCAPE_RE = re.compile(r"\x1b\[[0-?]*[ -/]*[@-~]")
+
+
+def _strip_ansi(value: str) -> str:
+    return _ANSI_ESCAPE_RE.sub("", value or "")
+
+
+def _no_color_subprocess_env() -> dict:
+    """Force uv (and any other ANSI-aware subprocess) to NOT emit color codes.
+
+    We set FORCE_COLOR=1 in the npm wrapper for the Python theme — but that
+    same env var also makes uv color its `tool dir` output, which corrupts
+    our parsing. This helper builds a child env that explicitly disables
+    color, used for subprocess calls whose stdout we parse.
+    """
+    env = dict(os.environ)
+    env.pop("FORCE_COLOR", None)
+    env.pop("CLAUDE_ANYTEAM_FORCE_COLOR", None)
+    env["NO_COLOR"] = "1"
+    return env
+
+
 def _uv_tool_bin_dirs() -> list[str]:
     """Return ALL uv tool bin candidates so post-install checks can find a
     freshly-installed binary even when the calling shell's PATH is stale.
 
     Belt-and-suspenders: query both `uv tool dir --bin` (current uv API) and
     walk `uv tool dir`/<tool>/Scripts (where the venv-local binary lives on
-    Windows, since uv only writes the shim to the bin dir lazily).
+    Windows, since uv only writes the shim to the bin dir lazily). Strips
+    ANSI escapes from uv stdout because uv colors its output when FORCE_COLOR
+    is set in the env (which the npm wrapper does for our own theming).
     """
     uv = shutil.which("uv")
     _dlog_which("uv", uv)
     if not uv:
         return []
+    no_color_env = _no_color_subprocess_env()
     candidates: list[str] = []
     try:
         completed = subprocess.run(
@@ -382,13 +408,16 @@ def _uv_tool_bin_dirs() -> list[str]:
             text=True,
             timeout=10,
             check=False,
+            env=no_color_env,
         )
         _dlog_sub([uv, "tool", "dir", "--bin"], completed, label="uv-tool-dir-bin")
         if completed.returncode == 0 and completed.stdout:
             for line in completed.stdout.splitlines():
-                line = line.strip()
+                line = _strip_ansi(line).strip()
                 if line and os.path.isdir(line):
                     candidates.append(line)
+                elif line:
+                    _dlog(f"  uv-tool-dir-bin line {line!r} is not a directory")
     except (OSError, subprocess.SubprocessError) as exc:
         _dlog(f"uv tool dir --bin failed: {type(exc).__name__}: {exc}")
     try:
@@ -398,11 +427,12 @@ def _uv_tool_bin_dirs() -> list[str]:
             text=True,
             timeout=10,
             check=False,
+            env=no_color_env,
         )
         _dlog_sub([uv, "tool", "dir"], completed, label="uv-tool-dir")
         if completed.returncode == 0 and completed.stdout:
             for line in completed.stdout.splitlines():
-                root = line.strip()
+                root = _strip_ansi(line).strip()
                 if not root or not os.path.isdir(root):
                     continue
                 # Scan tools/<name>/Scripts (Windows) and tools/<name>/bin (POSIX).
@@ -558,6 +588,22 @@ def _wait_for_binary(
     return _resolve_binary(names, uv_tool_name=uv_tool_name, update_path=True)
 
 
+_UV_PATH_HINT_RE = re.compile(r"`([A-Za-z]:\\[^`]+|/[^`]+)`\s+is not on your PATH", re.IGNORECASE)
+
+
+def _extract_path_hints_from_uv_output(output: str) -> list[str]:
+    """uv prints `<path> is not on your PATH` after `uv tool install`. Parse
+    that out so we can prepend the dir to os.environ['PATH'] even if our
+    `uv tool dir --bin` query fails or returns something else.
+    """
+    hits: list[str] = []
+    for match in _UV_PATH_HINT_RE.finditer(output or ""):
+        path = match.group(1).strip()
+        if path and os.path.isdir(path) and path not in hits:
+            hits.append(path)
+    return hits
+
+
 def _run_install_command(args: list[str], *, timeout_s: int = 300) -> tuple[bool, str]:
     _dlog(f"install command starting: {args!r}")
     try:
@@ -572,14 +618,23 @@ def _run_install_command(args: list[str], *, timeout_s: int = 300) -> tuple[bool
     except (OSError, subprocess.SubprocessError) as exc:
         _dlog(f"install command exception: {type(exc).__name__}: {exc}")
         return False, f"{type(exc).__name__}: {exc}"
-    output = "\n".join(
-        part for part in ((completed.stdout or "").strip(), (completed.stderr or "").strip()) if part
-    )
+    raw_stdout = _strip_ansi(completed.stdout or "").strip()
+    raw_stderr = _strip_ansi(completed.stderr or "").strip()
+    output = "\n".join(part for part in (raw_stdout, raw_stderr) if part)
     ok = completed.returncode == 0
     if ok and len(args) >= 3 and "tool" in args and "install" in args:
         # uv tool install — refresh PATH so subsequent shutil.which() finds the
         # freshly-installed binary in the same Python process.
         _refresh_path_for_uv_tools()
+        # Also parse uv's "is not on your PATH" warning and add that dir too.
+        # When uv installs to a bin dir not on PATH, it tells the user — we
+        # can use the same hint to fix our own process's PATH.
+        for hint in _extract_path_hints_from_uv_output(raw_stdout + "\n" + raw_stderr):
+            current = os.environ.get("PATH", "")
+            parts = current.split(os.pathsep) if current else []
+            if hint not in parts:
+                _dlog(f"prepending uv-hint dir to PATH: {hint}")
+                os.environ["PATH"] = hint + os.pathsep + current
     return ok, output or f"exit code {completed.returncode}"
 
 
@@ -635,9 +690,11 @@ def _multiplexer_install_command() -> tuple[str, list[str]] | None:
     _dlog(f"_multiplexer_install_command for sys.platform={sys.platform!r}")
     if sys.platform == "win32":
         # Windows multiplexer story: psmux from winget (preferred), scoop, or choco.
-        # Falls back to manual instructions if no package manager is present.
+        # winget search by name (not --id) — the exact ID changes between
+        # publishers and `winget install psmux` matches the canonical Microsoft
+        # docs. Falls back to scoop / choco / manual instructions.
         for pm, args in (
-            ("winget", ["winget", "install", "--id", "psmux.psmux", "-e", "--accept-package-agreements", "--accept-source-agreements"]),
+            ("winget", ["winget", "install", "psmux", "--accept-package-agreements", "--accept-source-agreements", "--silent"]),
             ("scoop", ["scoop", "install", "psmux"]),
             ("choco", ["choco", "install", "psmux", "-y"]),
         ):
