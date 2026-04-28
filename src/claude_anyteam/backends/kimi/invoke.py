@@ -313,6 +313,14 @@ def credential_preflight(
         sub_env["CLAUDE_ANYTEAM_REAL_HOME"] = real_home
     sub_env = identity_env(sub_env, team=team, name=agent_name)
 
+    # Kimi headless emits "Unknown error: [Errno 2] No such file or directory"
+    # for cwd if the work-dir doesn't exist yet. Stress harnesses create the
+    # sandbox lazily, so ensure the dir exists before invoking kimi.
+    try:
+        cwd.mkdir(parents=True, exist_ok=True)
+    except OSError:
+        pass
+
     logger.info(
         "kimi.auth_preflight.start",
         cwd=str(cwd),
