@@ -61,6 +61,22 @@ def test_create_task_with_coupling_alias_canonicalizes(tmp_claude_dir, team_task
     assert raw["coupling"]["intent"] == "tight_peer_loop"
 
 
+def test_create_task_with_parent_task_id(tmp_claude_dir, team_tasks_dir):
+    parent = create_task("test-team", "Parent", "delegation root", base_dir=tmp_claude_dir)
+    child = create_task(
+        "test-team",
+        "Child",
+        "delegated work",
+        parent_task_id=parent.id,
+        base_dir=tmp_claude_dir,
+    )
+
+    assert child.parent_task_id == parent.id
+    raw = json.loads((team_tasks_dir / f"{child.id}.json").read_text())
+    assert raw["parentTaskId"] == parent.id
+    assert get_task("test-team", child.id, base_dir=tmp_claude_dir).parent_task_id == parent.id
+
+
 def test_update_task_changes_coupling(tmp_claude_dir, team_tasks_dir):
     task = create_task("test-team", "Sub", "desc", base_dir=tmp_claude_dir)
 
@@ -108,6 +124,22 @@ def test_update_task_sets_owner(tmp_claude_dir, team_tasks_dir):
     assert updated.owner == "worker-1"
     raw = json.loads((team_tasks_dir / f"{task.id}.json").read_text())
     assert raw["owner"] == "worker-1"
+
+
+def test_update_task_sets_parent_task_id(tmp_claude_dir, team_tasks_dir):
+    parent = create_task("test-team", "Parent", "delegation root", base_dir=tmp_claude_dir)
+    child = create_task("test-team", "Child", "delegated work", base_dir=tmp_claude_dir)
+
+    updated = update_task(
+        "test-team",
+        child.id,
+        parent_task_id=parent.id,
+        base_dir=tmp_claude_dir,
+    )
+
+    assert updated.parent_task_id == parent.id
+    on_disk = get_task("test-team", child.id, base_dir=tmp_claude_dir)
+    assert on_disk.parent_task_id == parent.id
 
 
 def test_update_task_delete_removes_file(tmp_claude_dir, team_tasks_dir):
@@ -260,6 +292,47 @@ def test_update_task_rejects_nonexistent_dep_in_blocked_by(tmp_claude_dir, team_
         update_task("test-team", task.id, add_blocked_by=["999"], base_dir=tmp_claude_dir)
 
 
+def test_create_task_rejects_missing_parent_task(tmp_claude_dir, team_tasks_dir):
+    with pytest.raises(ValueError, match="parent task '999' does not exist"):
+        create_task(
+            "test-team",
+            "Child",
+            "delegated work",
+            parent_task_id="999",
+            base_dir=tmp_claude_dir,
+        )
+
+
+def test_update_task_rejects_self_parent_task(tmp_claude_dir, team_tasks_dir):
+    task = create_task("test-team", "Sub", "desc", base_dir=tmp_claude_dir)
+    with pytest.raises(ValueError, match="cannot be its own parent"):
+        update_task(
+            "test-team",
+            task.id,
+            parent_task_id=task.id,
+            base_dir=tmp_claude_dir,
+        )
+
+
+def test_update_task_rejects_circular_parent_chain(tmp_claude_dir, team_tasks_dir):
+    parent = create_task("test-team", "Parent", "root", base_dir=tmp_claude_dir)
+    child = create_task(
+        "test-team",
+        "Child",
+        "delegated",
+        parent_task_id=parent.id,
+        base_dir=tmp_claude_dir,
+    )
+
+    with pytest.raises(ValueError, match="circular parent task chain"):
+        update_task(
+            "test-team",
+            parent.id,
+            parent_task_id=child.id,
+            base_dir=tmp_claude_dir,
+        )
+
+
 def test_update_task_rejects_backward_status_transition(tmp_claude_dir, team_tasks_dir):
     task = create_task("test-team", "Sub", "desc", base_dir=tmp_claude_dir)
     update_task("test-team", task.id, status="in_progress", base_dir=tmp_claude_dir)
@@ -370,6 +443,22 @@ def test_delete_task_cleans_up_stale_refs(tmp_claude_dir, team_tasks_dir):
     t2_after = get_task("test-team", t2.id, base_dir=tmp_claude_dir)
     assert t1.id not in t2_after.blocked_by
     assert t1.id not in t2_after.blocks
+
+
+def test_delete_parent_task_clears_child_parent_link(tmp_claude_dir, team_tasks_dir):
+    parent = create_task("test-team", "Parent", "root", base_dir=tmp_claude_dir)
+    child = create_task(
+        "test-team",
+        "Child",
+        "delegated",
+        parent_task_id=parent.id,
+        base_dir=tmp_claude_dir,
+    )
+
+    update_task("test-team", parent.id, status="deleted", base_dir=tmp_claude_dir)
+
+    child_after = get_task("test-team", child.id, base_dir=tmp_claude_dir)
+    assert child_after.parent_task_id is None
 
 
 def test_no_partial_write_when_status_validation_fails(tmp_claude_dir, team_tasks_dir):

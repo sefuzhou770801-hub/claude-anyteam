@@ -99,6 +99,15 @@ class TaskFile(BaseModel):
     description: str
     active_form: str = Field(alias="activeForm", default="")
     status: Literal["pending", "in_progress", "completed", "deleted"] = "pending"
+    parent_task_id: str | None = Field(
+        alias="parentTaskId",
+        default=None,
+        description=(
+            "Optional parent task for delegated sub-task batches. The link is "
+            "one-way from child to parent so existing per-task task files stay "
+            "cheap to read and append."
+        ),
+    )
     blocks: list[str] = Field(default_factory=list)
     blocked_by: list[str] = Field(alias="blockedBy", default_factory=list)
     owner: str | None = Field(default=None)

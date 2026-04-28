@@ -310,6 +310,7 @@ class TestTaskFile:
         data = task.model_dump(by_alias=True, exclude_none=True)
         assert "owner" not in data
         assert "metadata" not in data
+        assert "parentTaskId" not in data
         assert data["id"] == "1"
         assert data["status"] == "pending"
         assert data["blockedBy"] == []
@@ -318,6 +319,18 @@ class TestTaskFile:
         task = TaskFile(id="2", subject="s", description="d", owner="worker")
         data = task.model_dump(by_alias=True, exclude_none=True)
         assert data["owner"] == "worker"
+
+    def test_task_with_parent_id_uses_camel_alias(self):
+        task = TaskFile(
+            id="2",
+            subject="child",
+            description="delegated",
+            parent_task_id="1",
+        )
+        data = task.model_dump(by_alias=True, exclude_none=True)
+        assert data["parentTaskId"] == "1"
+        round_trip = TaskFile.model_validate(data)
+        assert round_trip.parent_task_id == "1"
 
     def test_id_is_string(self):
         task = TaskFile(id="1", subject="s", description="d")
