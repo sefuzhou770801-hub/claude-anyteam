@@ -492,10 +492,12 @@ export async function findInstalledTool({ uvPath }) {
   return null;
 }
 
-export async function installTool({ uvPath, pythonPath }) {
-  const existing = await findInstalledTool({ uvPath }).catch(() => null);
-  if (existing) {
-    return existing;
+export async function installTool({ uvPath, pythonPath, refresh = false }) {
+  if (!refresh) {
+    const existing = await findInstalledTool({ uvPath }).catch(() => null);
+    if (existing) {
+      return existing;
+    }
   }
 
   const { env, binDir } = await resolveToolBinDir({ uvPath });
@@ -534,7 +536,7 @@ export async function installTool({ uvPath, pythonPath }) {
     error.details = `uv reported bin directory ${binDir}, but neither the claude-anyteam nor legacy codex-teammate binaries were available.`;
     throw error;
   }
-  return { env, binDir, ...resolvedPaths, installMode: 'installed' };
+  return { env, binDir, ...resolvedPaths, installMode: refresh ? 'refreshed' : 'installed' };
 }
 
 export async function ensureWindowsLongPaths() {
