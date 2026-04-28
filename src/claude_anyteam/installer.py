@@ -2945,20 +2945,34 @@ def _format_no_provider_ready_message(
 
 def _format_soft_diagnostic(diagnostic: InstallError) -> str:
     raw_error = diagnostic.as_plain_text(include_details=True, include_report=False)
+    issue_url = build_issue_url(title=diagnostic.title, raw_error=raw_error)
+    diagnostic_lines = format_installer_diagnostic(
+        summary=diagnostic.explanation,
+        raw_error=raw_error,
+        next_steps_per_os=diagnostic.action,
+        title=diagnostic.title,
+        include_what_happened=False,
+    )
+    # Strip the inline "Still stuck? Report it: <giant-url>" tail — we'll
+    # print the URL on its own line AFTER the box so it doesn't word-wrap
+    # into 17 ugly lines and so terminal link parsers see the URL whole.
+    body_without_url: list[str] = []
+    skip_url_line = False
+    for line in diagnostic_lines:
+        if line.strip() == "Still stuck? Report it:":
+            skip_url_line = True
+            continue
+        if skip_url_line and line.strip().startswith("http"):
+            skip_url_line = False
+            continue
+        body_without_url.append(line)
+
     plain_lines = [
         f"Warning: {diagnostic.title}",
         diagnostic.explanation,
+        *body_without_url,
+        f"Severity: {diagnostic.severity}",
     ]
-    plain_lines.extend(
-        format_installer_diagnostic(
-            summary=diagnostic.explanation,
-            raw_error=raw_error,
-            next_steps_per_os=diagnostic.action,
-            title=diagnostic.title,
-            include_what_happened=False,
-        )
-    )
-    plain_lines.append(f"Severity: {diagnostic.severity}")
     if diagnostic.details:
         plain_lines.append("Raw details (for debugging):")
         plain_lines.extend(f"  {line}" for line in diagnostic.details.splitlines())
@@ -2968,9 +2982,14 @@ def _format_soft_diagnostic(diagnostic: InstallError) -> str:
         body = [theme.muted(line) if line.startswith(("Severity:", "Raw details")) or line.startswith("  ")
                 else theme.heading(line) if line == diagnostic.explanation
                 else line
-                for line in plain_lines[1:]]  # skip the title; it goes in the box header
-        return render_box(theme.warn(f"Warning: {diagnostic.title}"), body, "yellow", theme=theme)
-    return "\n".join(plain_lines)
+                for line in plain_lines[1:]]
+        boxed = render_box(theme.warn(f"Warning: {diagnostic.title}"), body, "yellow", theme=theme)
+        # URL on its own line — most terminals (Windows Terminal, iTerm2,
+        # gnome-terminal) make single-line URLs clickable. Inside a box, the
+        # word-wrap kills clickability AND visual weight.
+        report_line = f"\n{theme.symbols['info']} {theme.muted('Open in browser to report:')}\n  {theme.accent(issue_url)}"
+        return f"{boxed}{report_line}"
+    return "\n".join([*plain_lines, "", "Open in browser to report:", f"  {issue_url}"])
 
 
 def format_install_message(result: InstallResult, *, include_provider_status: bool = True) -> str:
