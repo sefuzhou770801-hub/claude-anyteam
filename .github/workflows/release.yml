@@ -1,9 +1,21 @@
 name: Release
 
+# Triggered by either a real `v*` tag push (a maintainer pushing a tag from
+# their machine) OR an explicit `workflow_dispatch` from auto-release.yml.
+# The dispatch path is what makes the auto-release flow work end-to-end:
+# tags created by GITHUB_TOKEN inside an Action do NOT trigger downstream
+# `push: tags:` workflows (security restriction), so auto-release.yml has
+# to call this workflow explicitly via `gh workflow run`.
 on:
   push:
     tags:
       - 'v*'
+  workflow_dispatch:
+    inputs:
+      tag:
+        description: 'Tag to publish (e.g. v0.7.3). Defaults to the workflow ref.'
+        required: false
+        type: string
 
 concurrency:
   group: release-${{ github.ref }}
@@ -15,6 +27,8 @@ jobs:
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v4
+        with:
+          ref: ${{ inputs.tag || github.ref }}
       - name: Install uv
         uses: astral-sh/setup-uv@v4
       - name: Set up Python
@@ -33,6 +47,8 @@ jobs:
       id-token: write  # required by --provenance
     steps:
       - uses: actions/checkout@v4
+        with:
+          ref: ${{ inputs.tag || github.ref }}
       - uses: actions/setup-node@v4
         with:
           node-version: '20'
@@ -51,6 +67,8 @@ jobs:
       contents: read
     steps:
       - uses: actions/checkout@v4
+        with:
+          ref: ${{ inputs.tag || github.ref }}
       - name: Install uv
         uses: astral-sh/setup-uv@v4
       - name: Build distributions
