@@ -261,6 +261,80 @@ def test_run_scenario_marks_sandbox_completed_after_return(
     )
 
 
+def test_mark_sandbox_marker_aborted_writes_aborted_state(tmp_path: Path) -> None:
+    sandbox = tmp_path / "stress-sandbox-aborted"
+    marker = run_scenario.write_sandbox_marker(
+        sandbox, scenario_id="S6", run_id="ABORTED"
+    )
+    assert json.loads(marker.read_text(encoding="utf-8"))["state"] == "active"
+
+    run_scenario.mark_sandbox_marker_aborted(sandbox, reason="SIGTERM")
+
+    payload = json.loads(marker.read_text(encoding="utf-8"))
+    assert payload["state"] == "aborted"
+    assert "aborted_at" in payload
+    assert payload["aborted_reason"] == "SIGTERM"
+    # An aborted marker is no longer "active"; cleanup may remove it.
+    assert not run_scenario.sandbox_marker_is_active(marker)
+
+
+def test_mark_completed_preserves_aborted_state(tmp_path: Path) -> None:
+    """Defense: the finally-driven completed call must NOT erase an aborted state.
+
+    Phase4 #20: the SIGTERM handler marks aborted, then control returns to the
+    finally block which calls mark_sandbox_marker_completed. Without this
+    defense, completed would silently overwrite the aborted state and the
+    operational verdict would be wrong.
+    """
+
+    sandbox = tmp_path / "stress-sandbox-aborted-then-completed"
+    marker = run_scenario.write_sandbox_marker(
+        sandbox, scenario_id="S6", run_id="DEFENSE"
+    )
+
+    run_scenario.mark_sandbox_marker_aborted(sandbox, reason="SIGTERM")
+    aborted_payload = json.loads(marker.read_text(encoding="utf-8"))
+    assert aborted_payload["state"] == "aborted"
+
+    run_scenario.mark_sandbox_marker_completed(sandbox)
+
+    payload_after = json.loads(marker.read_text(encoding="utf-8"))
+    assert payload_after["state"] == "aborted"
+    assert payload_after.get("aborted_reason") == "SIGTERM"
+    assert "completed_at" not in payload_after
+
+
+def test_install_abort_signal_handlers_marks_aborted_on_sigterm(
+    tmp_path: Path,
+) -> None:
+    """Sending SIGTERM after install must flip the marker to aborted.
+
+    The handler exits with SystemExit(143) (conventional SIGTERM exit code);
+    we let pytest catch it and assert on the marker side-effect.
+    """
+
+    import signal as _signal
+
+    sandbox = tmp_path / "stress-sandbox-sigterm"
+    marker = run_scenario.write_sandbox_marker(
+        sandbox, scenario_id="S6", run_id="SIGTERM-PATH"
+    )
+
+    prior_term = _signal.signal(_signal.SIGTERM, _signal.SIG_DFL)
+    prior_int = _signal.signal(_signal.SIGINT, _signal.SIG_DFL)
+    try:
+        run_scenario._install_abort_signal_handlers(sandbox)
+        with pytest.raises(SystemExit) as exc_info:
+            _signal.raise_signal(_signal.SIGTERM)
+        assert exc_info.value.code == 143
+        payload = json.loads(marker.read_text(encoding="utf-8"))
+        assert payload["state"] == "aborted"
+        assert payload["aborted_reason"] == "SIGTERM"
+    finally:
+        _signal.signal(_signal.SIGTERM, prior_term)
+        _signal.signal(_signal.SIGINT, prior_int)
+
+
 def test_cleanup_sandbox_marker_safety_preserves_unmarked_pattern_dirs(
     isolated_protocol_roots,
     fake_scorers,

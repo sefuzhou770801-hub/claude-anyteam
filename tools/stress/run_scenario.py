@@ -13,6 +13,7 @@ import copy
 import json
 import os
 import shutil
+import signal
 import subprocess
 import sys
 import time
@@ -408,11 +409,78 @@ def mark_sandbox_marker_completed(sandbox: Path) -> None:
     payload = _read_sandbox_marker(marker)
     if not payload or payload.get("kind") != STRESS_SANDBOX_MARKER_KIND:
         return
+    if payload.get("state") == "aborted":
+        # Signal handler already marked the run aborted; the finally-driven
+        # "completed" call must not erase that operationally meaningful state.
+        return
     payload["state"] = "completed"
     payload["completed_at"] = datetime.now(timezone.utc).isoformat(
         timespec="milliseconds"
     ).replace("+00:00", "Z")
     _write_json_atomic(marker, payload)
+
+
+def mark_sandbox_marker_aborted(sandbox: Path, *, reason: str | None = None) -> None:
+    """Flip an active marker to ``state=aborted``.
+
+    Phase4 #20 (2026-04-27): SIGTERM at the codex-CLI turn boundary bypasses
+    Python's ``finally`` clause, so the original D1 pid-aware marker stayed at
+    ``state=active`` with a dead PID after the runner was killed. ``aborted``
+    is a third terminal state alongside ``completed``: cleanup treats both as
+    deletable (``sandbox_marker_is_active`` already returns False for any
+    state other than ``active``+live-PID), but the operational verdict is
+    explicit instead of inferred from PID liveness.
+    """
+
+    marker = sandbox / STRESS_SANDBOX_MARKER
+    payload = _read_sandbox_marker(marker)
+    if not payload or payload.get("kind") != STRESS_SANDBOX_MARKER_KIND:
+        return
+    payload["state"] = "aborted"
+    payload["aborted_at"] = datetime.now(timezone.utc).isoformat(
+        timespec="milliseconds"
+    ).replace("+00:00", "Z")
+    if reason:
+        payload["aborted_reason"] = reason
+    _write_json_atomic(marker, payload)
+
+
+def _install_abort_signal_handlers(sandbox: Path) -> None:
+    """Install SIGTERM/SIGINT handlers that mark the marker aborted before exit.
+
+    The handlers raise ``SystemExit`` so Python's existing ``try/finally`` in
+    ``run_scenario`` still runs (terminates teammate subprocesses), but the
+    marker is flipped to ``aborted`` before that finally re-runs
+    ``mark_sandbox_marker_completed`` (which now preserves aborted state).
+
+    Only installed inside ``run_scenario``; tests can call ``mark_aborted``
+    directly without exercising the signal path.
+    """
+
+    def _handler(signum: int, _frame: Any) -> None:
+        try:
+            signame = signal.Signals(signum).name
+        except (ValueError, AttributeError):
+            signame = f"signal-{signum}"
+        try:
+            mark_sandbox_marker_aborted(sandbox, reason=signame)
+        except Exception:
+            # Never let marker write failure mask the original signal exit.
+            pass
+        # Conventional exit codes: 130 for SIGINT, 143 for SIGTERM.
+        code = 130 if signum == signal.SIGINT else 143
+        raise SystemExit(code)
+
+    try:
+        signal.signal(signal.SIGTERM, _handler)
+    except (ValueError, OSError):
+        # Off-main-thread or platform without SIGTERM (Windows for SIGTERM
+        # under some interpreters); skip silently rather than block the run.
+        pass
+    try:
+        signal.signal(signal.SIGINT, _handler)
+    except (ValueError, OSError):
+        pass
 
 
 def init_sandbox_repo(repo: Path) -> None:
@@ -1261,6 +1329,7 @@ def run_scenario(args: argparse.Namespace, *, stderr: TextIO | None = None) -> i
         if getattr(args, "cleanup_sandbox", True):
             cleanup_stress_sandboxes(sandbox)
         write_sandbox_marker(sandbox, scenario_id=scenario_id, run_id=run_id)
+        _install_abort_signal_handlers(sandbox)
         init_sandbox_repo(sandbox / "repo")
         verify_sandbox_repo_ready(sandbox / "repo")
         create_stress_team(team_name, scenario, sandbox)
