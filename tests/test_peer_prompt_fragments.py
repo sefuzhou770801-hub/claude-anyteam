@@ -21,6 +21,13 @@ TEAM = "t"
 SELF = "self"
 THREAD_FORK_MARKER = "When follow-up work depends on prior Codex context"
 PERMISSION_BRIDGE_MARKER = "When assigning tasks that touch production paths"
+TEAM_MESSAGING_MARKERS = (
+    "# Team messaging",
+    "send_message is exposed lowercase by the wrapper MCP in this session",
+    "Plain prose output is NOT visible to teammates",
+    "try SendMessage (capitalized)",
+    'Do not emit "I cannot deliver" prose',
+)
 
 
 def _task(task_id: str = "7"):
@@ -140,6 +147,11 @@ def _success_result() -> CodexResult:
     )
 
 
+def _assert_team_messaging_block(prompt: str) -> None:
+    for marker in TEAM_MESSAGING_MARKERS:
+        assert marker in prompt
+
+
 def test_empty_team_yields_empty_fragments():
     cache = CapabilityManifestCache(team=TEAM, self_name=SELF)
 
@@ -168,6 +180,16 @@ def test_codex_task_prompt_excludes_self():
     assert THREAD_FORK_MARKER in prompt
     assert "Requester already has structured output" not in prompt
     assert "Duplicate requester capability should be omitted" not in prompt
+
+
+def test_codex_routed_prompts_include_team_messaging_block():
+    task_prompt = codex_prompts.v7_task_prompt(_task(), SELF, TEAM)
+    prose_prompt = codex_prompts.v7_prose_reply_prompt(
+        "codex-peer", "please ack", SELF, TEAM
+    )
+
+    _assert_team_messaging_block(task_prompt)
+    _assert_team_messaging_block(prose_prompt)
 
 
 def test_r14_fragment_instructs_manifest_query():
@@ -280,6 +302,8 @@ def test_codex_loop_injects_cached_peer_prompt_fragments_into_prose_and_task_pro
     assert PERMISSION_BRIDGE_MARKER in prose_prompts[0]
     assert THREAD_FORK_MARKER in task_prompts[0]
     assert PERMISSION_BRIDGE_MARKER in task_prompts[0]
+    _assert_team_messaging_block(prose_prompts[0])
+    _assert_team_messaging_block(task_prompts[0])
 
 
 def test_gemini_and_kimi_task_loops_inject_cached_peer_prompt_fragments():

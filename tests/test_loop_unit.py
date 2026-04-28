@@ -734,6 +734,10 @@ def test_prose_batch_5_messages_one_invocation():
     assert len(invocations) == 1, (
         f"prose batch must collapse to 1 invocation; got {len(invocations)}"
     )
+    prompt = invocations[0]["task_prompt"]
+    assert "# Team messaging" in prompt
+    assert "Plain prose output is NOT visible to teammates" in prompt
+    assert "try SendMessage (capitalized)" in prompt
     # delivered_via_tool path: no fan-out send_prose calls (Codex addressed
     # each sender via the MCP tool itself).
     assert sent == []

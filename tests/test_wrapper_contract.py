@@ -227,6 +227,19 @@ def test_exposed_tool_handlers_are_instrumented(identity):
         )
 
 
+def test_send_message_description_contains_visibility_invariant(identity):
+    mcp = build_server()
+    tools = asyncio.run(mcp.list_tools())
+    send_message = next(tool for tool in tools if tool.name == "send_message")
+
+    assert (
+        "Your plain text output is NOT visible to other agents"
+        in send_message.description
+    )
+    assert "to communicate, you MUST call this tool" in send_message.description
+    assert "Refer to teammates by name, never UUID." in send_message.description
+
+
 def test_identity_required_at_build_time(monkeypatch):
     """With neither env nor argv providing identity, build_server raises."""
     _clear_identity_env(monkeypatch)

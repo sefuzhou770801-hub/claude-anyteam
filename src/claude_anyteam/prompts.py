@@ -12,6 +12,16 @@ validation time.
 from __future__ import annotations
 
 
+TEAM_MESSAGING_BLOCK = (
+    "# Team messaging\n"
+    "send_message is exposed lowercase by the wrapper MCP in this session. "
+    "Plain prose output is NOT visible to teammates — to communicate, you MUST "
+    "call send_message. If you cannot find it under that name, try SendMessage "
+    '(capitalized). Do not emit "I cannot deliver" prose; that creates inbox '
+    "noise."
+)
+
+
 def _peer_fragment_section(peer_prompt_fragments: str) -> str:
     text = peer_prompt_fragments.strip()
     if not text:
@@ -55,7 +65,8 @@ def v7_task_prompt(
         f"- task_list(), read_config() — read-only inspection of team state.\n"
         f"\n"
         f"Your current task id is {task.id}. Destructive lifecycle operations "
-        f"are deliberately unavailable."
+        f"are deliberately unavailable.\n\n"
+        f"{TEAM_MESSAGING_BLOCK}"
         f"{_peer_fragment_section(peer_prompt_fragments)}\n\n"
         f"# Required response\n"
         f"Produce a JSON object with fields `files_changed` (list of paths "
@@ -79,7 +90,10 @@ def v7_prose_reply_prompt(
     """
     peer_section = _peer_fragment_section(peer_prompt_fragments)
     peer_tail = f"{peer_section}\n\n" if peer_section else ""
-    final_instruction = "Do not produce a structured JSON object; plain prose is correct here."
+    final_instruction = (
+        "Do not produce a structured JSON object; address the sender via "
+        "send_message. Final assistant prose, if any, is informational only."
+    )
     return (
         f"You are {agent_name}, a Codex teammate on the {team_name} team. "
         f"A teammate named {sender!r} sent you a direct message:\n\n"
@@ -87,6 +101,7 @@ def v7_prose_reply_prompt(
         f"Reply briefly and helpfully. Do not execute any code unless explicitly "
         f"asked. Use the `send_message` MCP tool to deliver your reply to "
         f"{sender!r} — call `send_message(to={sender!r}, body=<your reply>)`. "
+        f"\n\n{TEAM_MESSAGING_BLOCK}\n\n"
         f"{peer_tail}{final_instruction}"
     )
 

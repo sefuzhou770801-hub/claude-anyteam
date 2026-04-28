@@ -47,6 +47,7 @@ from .env import (
 )
 from .headless_visibility import HeadlessTurnVisibility, coerce_stream_text
 from .messages import VisibilityEvent
+from .prompts import TEAM_MESSAGING_BLOCK
 
 # R1 (09 §3.1): schema files are versioned wire
 # assets, so resolve them as package resources instead of walking relative to
@@ -1142,7 +1143,8 @@ def app_server_invoke(
         "cwd": str(cwd),
         "base_instructions": (
             f"You are {settings_agent}, a Codex teammate on the "
-            f"{settings_team} team. Execute the task below."
+            f"{settings_team} team. Execute the task below.\n\n"
+            f"{TEAM_MESSAGING_BLOCK}"
         ),
         "developer_instructions": task_prompt,
         "sandbox": "danger-full-access",

@@ -806,11 +806,13 @@ def build_server(argv: list[str] | None = None) -> FastMCP:
         summary: str = "status update",
         kind: Literal["informational", "steer", "handoff"] = "informational",
     ) -> dict:
-        """Send a message to another teammate (team-lead or any peer). Use
-        for progress updates, clarifying questions, or handoffs. The sender
-        is always you; do not try to impersonate another teammate. Set
-        kind='steer' only when intentionally sending a mid-turn steer attempt;
-        informational and handoff messages are ordinary peer-DMs.
+        """Your plain text output is NOT visible to other agents — to communicate, you MUST call this tool. Refer to teammates by name, never UUID.
+
+        Send a message to another teammate (team-lead or any peer). Use for
+        progress updates, clarifying questions, or handoffs. The sender is
+        always you; do not try to impersonate another teammate. Set
+        kind='steer' only when intentionally sending a mid-turn steer
+        attempt; informational and handoff messages are ordinary peer-DMs.
 
         Args:
             to: recipient teammate name (e.g., 'team-lead' or a peer). Must
