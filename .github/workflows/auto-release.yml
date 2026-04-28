@@ -88,3 +88,17 @@ jobs:
             --title "$title" \
             --notes-file "${{ steps.notes.outputs.notes_path }}"
           echo "Released $tag (notes from ${{ steps.notes.outputs.source }})."
+
+      - name: Trigger publish pipeline
+        if: steps.check_tag.outputs.exists == 'false'
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        # Tags created by GITHUB_TOKEN do NOT fire `push: tags:` triggers
+        # (Action security restriction). Dispatch release.yml explicitly so
+        # publish-to-npm + publish-to-pypi actually run after auto-tag.
+        # workflow_dispatch IS allowed under GITHUB_TOKEN.
+        run: |
+          set -euo pipefail
+          tag="v${{ steps.ver.outputs.version }}"
+          gh workflow run release.yml --ref main -f tag="$tag"
+          echo "Dispatched release.yml for $tag."
