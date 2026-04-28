@@ -33,13 +33,16 @@ from .messages import (
     IdleNotificationOut,
     PermissionRequestOut,
     PermissionResponseIn,
+    PlanBlockedOut,
     PlanApprovalRequestOut,
     ShutdownApprovedOut,
     ShutdownRejectedOut,
     ShutdownResponseOut,
+    TaskBlockedOut,
     TaskCompleteOut,
     VisibilityEvent,
     now_iso,
+    parse_protocol_text,
 )
 
 
@@ -258,9 +261,25 @@ def update_task(
     )
 
 
+def _message_kind_from_protocol_text(text: str) -> str | None:
+    payload = parse_protocol_text(text)
+    if payload is None:
+        return None
+    raw = payload.model_dump(by_alias=True, exclude_none=True)
+    kind = raw.get("kind") or raw.get("type")
+    return kind if isinstance(kind, str) else None
+
+
 def send_prose(team: str, sender: str, to: str, text: str, summary: str) -> None:
     """Send a plain-text message to an arbitrary teammate."""
-    _m.send_plain_message(team, sender, to, text, summary=summary)
+    _send_plain_message_compat(
+        team,
+        sender,
+        to,
+        text,
+        summary=summary,
+        message_kind=_message_kind_from_protocol_text(text),
+    )
 
 
 def send_prose_to_lead(team: str, sender: str, text: str, summary: str) -> None:
@@ -743,7 +762,13 @@ def emit_auth_preflight_failure(
 
 def send_idle_notification(team: str, sender: str, reason: str = "available") -> None:
     payload = IdleNotificationOut(from_=sender, idle_reason=reason)  # type: ignore[call-arg]
-    send_json_to_lead(team, sender, payload, summary="idle")
+    send_json_to_lead(
+        team,
+        sender,
+        payload,
+        summary="idle",
+        message_kind="idle_notification",
+    )
 
 
 def emit_peer_steer_rejection(
@@ -1000,12 +1025,37 @@ def send_task_blocked(
     task the adapter claimed cannot proceed, without relying on prose
     parsing.
     """
-    payload = {
-        "kind": "task_blocked",
-        "task_id": task_id,
-        "reason": reason,
-    }
-    send_json_to_lead(team, sender, payload, summary=f"task_blocked:{task_id}")
+    payload = TaskBlockedOut(task_id=task_id, reason=reason)
+    send_json_to_lead(
+        team,
+        sender,
+        payload,
+        summary=f"task_blocked:{task_id}",
+        message_kind="task_blocked",
+    )
+
+
+def send_plan_blocked(
+    team: str,
+    sender: str,
+    *,
+    request_id: str,
+    reason: str,
+    task_id: str | None = None,
+) -> None:
+    """Send a typed plan-blocked lifecycle payload to the lead."""
+    payload = PlanBlockedOut(
+        request_id=request_id,
+        reason=reason,
+        task_id=task_id,
+    )
+    send_json_to_lead(
+        team,
+        sender,
+        payload,
+        summary=f"plan_blocked:{request_id}",
+        message_kind="plan_blocked",
+    )
 
 
 def send_task_complete(
@@ -1022,7 +1072,13 @@ def send_task_complete(
         summary=summary_text,
         codex_exit_code=codex_exit_code,
     )
-    send_json_to_lead(team, sender, payload, summary=f"task_complete:{task_id}")
+    send_json_to_lead(
+        team,
+        sender,
+        payload,
+        summary=f"task_complete:{task_id}",
+        message_kind="task_complete",
+    )
 
 
 def send_plan_approval_request(
@@ -1032,7 +1088,13 @@ def send_plan_approval_request(
     plan: dict[str, Any],
 ) -> None:
     payload = PlanApprovalRequestOut(request_id=request_id, plan=plan)
-    send_json_to_lead(team, sender, payload, summary=f"plan_approval:{request_id}")
+    send_json_to_lead(
+        team,
+        sender,
+        payload,
+        summary=f"plan_approval:{request_id}",
+        message_kind="plan_approval_request",
+    )
 
 
 def send_permission_request_to_lead(
@@ -1057,7 +1119,13 @@ def send_permission_request_to_lead(
         label=label,
         session_id=session_id,
     )
-    send_json_to_lead(team, sender, payload, summary=f"permission_request:{request_id}")
+    send_json_to_lead(
+        team,
+        sender,
+        payload,
+        summary=f"permission_request:{request_id}",
+        message_kind="permission_request",
+    )
 
 
 def _read_matching_permission_response_locked(

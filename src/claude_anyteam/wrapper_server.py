@@ -32,6 +32,7 @@ from __future__ import annotations
 import fnmatch
 import functools
 import inspect
+import json
 import logging
 import os
 import re
@@ -45,7 +46,7 @@ from typing import Any, Callable, Literal, TypeVar, cast
 
 from .capability_manifest import CapabilityManifestCache
 from .env import LEGACY_NAME_ENV, LEGACY_TEAM_ENV, NAME_ENV, TEAM_ENV, env_first
-from .messages import VisibilityEvent
+from .messages import VisibilityEvent, parse_protocol_text
 from . import protocol_io
 from claude_teams import messaging as _cs_messaging  # type: ignore[import-untyped]
 from claude_teams import tasks as _cs_tasks  # type: ignore[import-untyped]
@@ -59,7 +60,25 @@ logger = logging.getLogger("claude_anyteam.wrapper")
 
 TASK_ID_ENV = "CLAUDE_ANYTEAM_TASK_ID"
 LEGACY_TASK_ID_ENV = "CODEX_TEAMMATE_TASK_ID"
-SEND_MESSAGE_KINDS = ("informational", "steer", "handoff")
+SEND_MESSAGE_KINDS = (
+    "informational",
+    "steer",
+    "handoff",
+    "idle_notification",
+    "task_complete",
+    "task_blocked",
+    "plan_blocked",
+    "plan_approval_request",
+    "plan_approval_response",
+    "permission_request",
+    "shutdown_approved",
+    "shutdown_rejected",
+)
+LIFECYCLE_SEND_MESSAGE_KINDS = frozenset(SEND_MESSAGE_KINDS) - {
+    "informational",
+    "steer",
+    "handoff",
+}
 
 
 class PeerSteerManifestCheckError(ToolError):
@@ -394,6 +413,34 @@ def _preview(value: Any, *, limit: int = 600) -> str | None:
     if len(text) <= limit:
         return text
     return text[: limit - 1] + "…"
+
+
+def _normalise_lifecycle_send_body(kind: str, body: str) -> str:
+    """Validate and canonicalize a typed lifecycle body for send_message.
+
+    Ordinary peer DMs deliberately remain plain text. Lifecycle kinds are the
+    opposite: callers must provide a JSON object whose ``kind``/``type`` matches
+    the ``messageKind`` they are asking the wrapper to stamp, so downstream
+    readers can route by the explicit discriminator rather than summary/prose.
+    """
+
+    try:
+        raw = json.loads(body)
+    except (TypeError, ValueError) as exc:
+        raise ToolError(
+            f"kind={kind!r} requires a JSON protocol payload body"
+        ) from exc
+    if not isinstance(raw, dict):
+        raise ToolError(f"kind={kind!r} requires a JSON object payload")
+    actual = raw.get("kind") or raw.get("type")
+    if actual != kind:
+        raise ToolError(
+            f"kind={kind!r} must match payload kind/type; got {actual!r}"
+        )
+    payload = parse_protocol_text(body)
+    if payload is None:
+        raise ToolError(f"body is not a valid {kind!r} protocol payload")
+    return payload.model_dump_json(by_alias=True, exclude_none=True)
 
 
 def _tool_target(tool_name: str, bound_args: dict[str, Any]) -> str | None:
@@ -934,15 +981,30 @@ def build_server(argv: list[str] | None = None) -> FastMCP:
         to: str,
         body: str,
         summary: str = "status update",
-        kind: Literal["informational", "steer", "handoff"] = "informational",
+        kind: Literal[
+            "informational",
+            "steer",
+            "handoff",
+            "idle_notification",
+            "task_complete",
+            "task_blocked",
+            "plan_blocked",
+            "plan_approval_request",
+            "plan_approval_response",
+            "permission_request",
+            "shutdown_approved",
+            "shutdown_rejected",
+        ] = "informational",
     ) -> dict:
         """Your plain text output is NOT visible to other agents — to communicate, you MUST call this tool. Refer to teammates by name, never UUID.
 
         Send a message to another teammate (team-lead or any peer). Use for
-        progress updates, clarifying questions, or handoffs. The sender is
-        always you; do not try to impersonate another teammate. Set
-        kind='steer' only when intentionally sending a mid-turn steer
-        attempt; informational and handoff messages are ordinary peer-DMs.
+        progress updates, clarifying questions, handoffs, or typed lifecycle
+        payloads. The sender is always you; do not try to impersonate another
+        teammate. Set kind='steer' only when intentionally sending a mid-turn
+        steer attempt; informational and handoff messages are ordinary peer-DMs.
+        Lifecycle kinds require body to be a JSON protocol payload whose
+        kind/type matches the selected messageKind.
 
         Args:
             to: recipient teammate name (e.g., 'team-lead' or a peer). Must
@@ -950,8 +1012,9 @@ def build_server(argv: list[str] | None = None) -> FastMCP:
             body: message content. Plain prose or JSON-serialized protocol
                 payload both work.
             summary: optional short label shown in notifications (5-10 words).
-            kind: informational (default), steer, or handoff. Wrapper-side
-                manifest gating applies only to explicit steer attempts.
+            kind: informational (default), steer, handoff, or a typed
+                lifecycle kind. Wrapper-side manifest gating applies only to
+                explicit steer attempts.
         """
         if not to:
             raise ToolError("`to` must not be empty")
@@ -959,6 +1022,8 @@ def build_server(argv: list[str] | None = None) -> FastMCP:
             raise ToolError("`body` must not be empty")
         if kind not in SEND_MESSAGE_KINDS:
             raise ToolError(f"`kind` must be one of {SEND_MESSAGE_KINDS}; got {kind!r}")
+        if kind in LIFECYCLE_SEND_MESSAGE_KINDS:
+            body = _normalise_lifecycle_send_body(kind, body)
         if to == self_name:
             raise ToolError(f"refusing to send message to self ({self_name!r})")
         try:
