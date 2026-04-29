@@ -419,6 +419,13 @@ class _RosterRow:
     # members whose backing tmux pane is gone (host crash, tmux kill-server,
     # process panic). Empty for non-tmux backends like the team-lead row.
     tmux_pane_id: str = ""
+    # Read-only diagnostic enrichments. `capability_version` comes from the
+    # R12 rich manifest cache; `adapter_pid` is the newest PID observed in the
+    # wrapper MCP tool-discovery diagnostics (#44). Both are hints rather than
+    # hard liveness assertions, so absence is represented as None.
+    capability_version: str | None = None
+    adapter_pid: int | None = None
+    adapter_pid_source: str | None = None
 
 
 def _build_team_roster_parser() -> argparse.ArgumentParser:
@@ -488,6 +495,8 @@ def _roster_rows(cfg: dict[str, object], *, team: str | None = None, resolve: bo
                 except (TypeError, ValueError):
                     adapter_non_progress_interrupt_s = None
             config_source = source
+        capability_version = _manifest_version_for_agent(team, name) if resolve and team is not None else None
+        adapter_pid = _latest_wrapper_diag_pid(team, name) if resolve and team is not None else None
         raw_capabilities = m.get("capabilities", [])
         capabilities = (
             [str(capability) for capability in raw_capabilities]
@@ -510,6 +519,11 @@ def _roster_rows(cfg: dict[str, object], *, team: str | None = None, resolve: bo
                 config_source=config_source,
                 capabilities=capabilities,
                 tmux_pane_id=str(m.get("tmuxPaneId", "")),
+                capability_version=capability_version,
+                adapter_pid=adapter_pid,
+                adapter_pid_source=(
+                    "wrapper-mcp-tools.jsonl" if adapter_pid is not None else None
+                ),
             )
         )
     return rows
@@ -553,6 +567,39 @@ def _read_agent_config(team: str, agent: str) -> tuple[dict[str, Any], str | Non
     if not isinstance(raw, dict):
         return {}, str(path)
     return raw, str(path)
+
+
+def _manifest_version_for_agent(team: str, agent: str) -> str | None:
+    path = _teams_root() / team / "manifests" / f"{agent}.json"
+    try:
+        raw = json.loads(path.read_text(encoding="utf-8"))
+    except (FileNotFoundError, OSError, json.JSONDecodeError):
+        return None
+    if not isinstance(raw, dict):
+        return None
+    value = raw.get("capability_version", raw.get("capabilityVersion"))
+    return str(value) if value is not None else None
+
+
+def _latest_wrapper_diag_pid(team: str, agent: str) -> int | None:
+    path = _teams_root() / team / "diagnostics" / "wrapper-mcp-tools.jsonl"
+    try:
+        lines = path.read_text(encoding="utf-8").splitlines()
+    except (FileNotFoundError, OSError):
+        return None
+    for line in reversed(lines):
+        if not line.strip():
+            continue
+        try:
+            row = json.loads(line)
+        except json.JSONDecodeError:
+            continue
+        if not isinstance(row, dict) or row.get("agent") != agent:
+            continue
+        pid = row.get("pid")
+        if isinstance(pid, int):
+            return pid
+    return None
 
 
 def _format_capabilities(capabilities: list[str]) -> str:
@@ -646,10 +693,19 @@ def _team_roster_command(argv: list[str], *, stdout: TextIO | None = None, stder
                 )
             adapter_suffix = "  " + " ".join(parts)
         capabilities_suffix = f"  capabilities={_format_capabilities(r.capabilities)}"
-        out.write(
+        diagnostic_suffix = ""
+        if r.capability_version is not None or r.adapter_pid is not None:
+            parts = []
+            if r.capability_version is not None:
+                parts.append(f"capability_version={r.capability_version}")
+            if r.adapter_pid is not None:
+                parts.append(f"adapter_pid={r.adapter_pid}")
+            diagnostic_suffix = "  " + " ".join(parts)
+        line = (
             f"{marker}{r.name:<{name_w}}  type={r.agent_type:<{type_w}}  model={r.model:<{model_w}}  "
-            f"backend={r.backend_type}  color={r.color}{suffix}{adapter_suffix}{capabilities_suffix}\n"
+            f"backend={r.backend_type}  color={r.color}{suffix}{adapter_suffix}{capabilities_suffix}{diagnostic_suffix}\n"
         )
+        out.write(line)
     return 0
 
 
