@@ -193,3 +193,67 @@ These are post-ship telemetry / metric improvements; none block production-readi
 - Scorecard: `runs/S8-W7-20260428T2147Z-postfix-verify/scorecard.json`
 - Sandbox marker: `state=completed` (run completed cleanly within budget)
 - Full pytest at HEAD: `1015 passed, 2 deselected, 1 warning`
+
+## Final unflagged verification (post-telemetry-fix, run-id S8-W7-20260429T0040Z-postfix-verify-v2)
+
+After landing the telemetry fix at `29210d9 fix: stamp send_message recipient telemetry`, re-ran S8+W7 unflagged at integration HEAD `ea89618` to confirm M11a sample collection works.
+
+### Results
+
+```json
+{
+  "run_id": "S8-W7-20260429T0040Z-postfix-verify-v2",
+  "git_sha": "ea89618",
+  "n_completed": 15, "n_blocked": 0, "n_tasks": 15,
+  "wall_clock_seconds": 1248.6,
+  "M11a_p50": null, "M11a_max": null, "samples_used_for_M11a": 0,
+  "M11b_team_p95_turn_duration_seconds": 379.3,
+  "M5_team_failure_rate": 0.0,
+  "M13_total_collisions": 0,
+  "M12_team_average_coverage_ratio": 0.714,
+  "s1_flatten_violations": 0,
+  "harness_preservation_violations": 0,
+  "visibility_degraded_count": 1
+}
+```
+
+- **Wall clock**: 1248.6s (15.7% faster than the prior 1481s post-fix-v1 run)
+- **Completion**: 15/15 — strictly held (5/5 across recent unflagged runs)
+- **M5 / M13 / S1**: 0 / 0 / 0 — held
+- **Full pytest**: `1023 passed` at HEAD `6683396` (4 new diagnose-CLI tests + suite stability)
+- **stderr "missing recipient" warnings**: 0 in both `codex-pair.stderr.log` and `kimi-pair.stderr.log` (vs 19 in #62) — telemetry fix landed cleanly
+
+### M11a still null — root cause is structural, not telemetric
+
+Telemetry fix verified: every send_message tool_event now carries `recipient: "<peer>"` and `to: "<peer>"` fields (sample event in `events/codex-pair.jsonl:000006`). No "missing recipient" warnings.
+
+Yet `samples_used_for_M11a = 0`. Per-agent breakdown:
+
+| agent | M3_peer_dm_sent | M3_peer_dm_received | unmatched_send_count |
+| ----- | --------------- | ------------------- | -------------------- |
+| codex-pair | 60 | 0 | 60 |
+| kimi-pair | 0 | 60 | 0 |
+
+**The flow is one-way.** codex-pair sent 60 peer-DMs to kimi-pair; kimi-pair received them all and never replied via send_message. Without paired send→reply events, RTT cannot be computed.
+
+Additional notes from `collab/agents/kimi-pair.json`: `["no_send_message_calls", "no_steer_ack"]`. Kimi-pair completed its tasks via task_complete payloads but never used send_message to coordinate — consistent with kimi v1 headless behavior under this workload.
+
+This is a different failure mode from #62. In #62 the recipient field was absent, so the classifier could not pair *any* events. Here the recipient field is present, but one peer never sent peer-DMs at all.
+
+### Implications
+
+1. **Telemetry fix is a clean improvement** — recipient field stamping is now uniform; future symmetric workloads (S6 codex/codex pair) will exercise M11a properly.
+2. **M11a measurement requires symmetric peer-DM workload.** S8 (codex+kimi) is asymmetric on this workload by behavior, not by protocol. To quantify M11a p50/p95 deltas, use a homogeneous backend pair (e.g., S6 with two codex teammates) where both peers have empirical incentive to peer-DM.
+3. **Ship verdict unchanged**: Tier 2 default-ON. Substrate is net-positive on every measurable axis (15/15 completion, M5=0, M13=0, S1=0, faster wall clock). The unmeasurable metric (M11a) is now telemetrically capturable; only the workload-shape limitation prevents observation in this particular scenario.
+
+### Outstanding follow-up (post-ship)
+
+1. **Re-run #62 verification on S6** (homogeneous codex+codex) to actually quantify M11a p50 delta. The telemetry path is clean; data should land.
+2. **Investigate kimi-pair "no send_message" pattern** — is this a Kimi v1 prompt issue or a workload artifact? Surfaces as a structural visibility gap (§2 north star). Not blocking — qualitative completion is good.
+
+### Artifacts (final verification)
+
+- Scorecard: `runs/S8-W7-20260429T0040Z-postfix-verify-v2/scorecard.json`
+- Per-agent: `runs/S8-W7-20260429T0040Z-postfix-verify-v2/collab/agents/{codex,kimi}-pair.json`
+- Sample event w/ recipient field: `runs/S8-W7-20260429T0040Z-postfix-verify-v2/events/codex-pair.jsonl` (lines 1–4)
+- Full pytest at scoring HEAD `6683396`: `1023 passed, 2 deselected, 1 warning`
