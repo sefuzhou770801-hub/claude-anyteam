@@ -634,26 +634,35 @@ def _command_for_member(member: Mapping[str, Any], team_name: str, sandbox: Path
     cwd = str(sandbox / "repo")
     base = [sys.executable, "-m"]
     if agent_type == "claude":
+        # Native Claude Code's interactive Agent Teams flags require a TTY and
+        # do not emit the visibility JSONL needed by the stress scorecards when
+        # launched via setsid/nohup.  Use the native Claude CLI in headless
+        # --print mode behind a thin protocol bridge: Claude still performs the
+        # work with Claude Code's own tools, while the bridge owns detached
+        # inbox/task polling and VisibilityEvent emission.
         model = str(member.get("model") or "sonnet")
-        agent_type_arg = str(member.get("agent_type") or "claude")
         color = str(member.get("color") or "cyan")
-        return [
-            "claude",
-            "--agent-id",
-            f"{name}@{team_name}",
-            "--agent-name",
-            name,
-            "--team-name",
+        cmd = [
+            *base,
+            "claude_anyteam.backends.claude_native.cli",
+            "--team",
             team_name,
-            "--agent-color",
-            color,
-            "--parent-session-id",
-            f"stress-{team_name}",
-            "--agent-type",
-            agent_type_arg,
+            "--name",
+            name,
+            "--cwd",
+            cwd,
+            "--claude-binary",
+            _resolve_backend_binary("claude"),
             "--model",
             model,
+            "--color",
+            color,
         ]
+        if member.get("effort"):
+            cmd += ["--effort", str(member["effort"])]
+        if member.get("turn_timeout_s"):
+            cmd += ["--turn-timeout-s", str(member["turn_timeout_s"])]
+        return cmd
     if agent_type == "codex":
         cmd = [*base, "claude_anyteam.cli", "--team", team_name, "--name", name, "--cwd", cwd]
         if member.get("model"):

@@ -525,8 +525,10 @@ def test_workload_manifest_missing(isolated_protocol_roots, fake_scorers, tmp_pa
     assert "workload manifest missing" in capsys.readouterr().err
 
 
-def test_command_for_member_constructs_claude_invocation(tmp_path: Path) -> None:
+def test_command_for_member_constructs_claude_invocation(monkeypatch, tmp_path: Path) -> None:
     sandbox = tmp_path / "sandbox"
+    monkeypatch.setattr(run_scenario, "_resolve_backend_binary", lambda name: f"/usr/bin/{name}")
+
     cmd = run_scenario._command_for_member(
         {"name": "claude-tgt-a", "agent_type": "claude", "model": "sonnet"},
         "stress-S2-20260427T1530Z",
@@ -534,24 +536,24 @@ def test_command_for_member_constructs_claude_invocation(tmp_path: Path) -> None
     )
 
     assert cmd is not None
-    assert cmd[0] == "claude"
+    assert cmd[:3] == [sys.executable, "-m", "claude_anyteam.backends.claude_native.cli"]
     assert "--print" not in cmd
-    assert "--agent-id" in cmd
-    assert cmd[cmd.index("--agent-id") + 1] == "claude-tgt-a@stress-S2-20260427T1530Z"
-    assert "--agent-name" in cmd
-    assert cmd[cmd.index("--agent-name") + 1] == "claude-tgt-a"
-    assert "--team-name" in cmd
-    assert cmd[cmd.index("--team-name") + 1] == "stress-S2-20260427T1530Z"
-    assert "--parent-session-id" in cmd
-    assert cmd[cmd.index("--parent-session-id") + 1] == "stress-stress-S2-20260427T1530Z"
-    assert "--agent-type" in cmd
-    assert cmd[cmd.index("--agent-type") + 1] == "claude"
+    assert "--agent-id" not in cmd
+    assert "--agent-name" not in cmd
+    assert "--team-name" not in cmd
+    assert "--team" in cmd
+    assert cmd[cmd.index("--team") + 1] == "stress-S2-20260427T1530Z"
+    assert "--name" in cmd
+    assert cmd[cmd.index("--name") + 1] == "claude-tgt-a"
+    assert "--cwd" in cmd
+    assert cmd[cmd.index("--cwd") + 1] == str(sandbox / "repo")
+    assert "--claude-binary" in cmd
+    assert cmd[cmd.index("--claude-binary") + 1] == "/usr/bin/claude"
     assert "--model" in cmd
     assert cmd[cmd.index("--model") + 1] == "sonnet"
-    assert "claude_anyteam" not in cmd
 
 
-def test_spawn_teammates_uses_native_claude_agent_team_argv(
+def test_spawn_teammates_uses_native_claude_headless_bridge_argv(
     isolated_protocol_roots,
     monkeypatch: pytest.MonkeyPatch,
     tmp_path: Path,
@@ -578,6 +580,7 @@ def test_spawn_teammates_uses_native_claude_agent_team_argv(
             return 0
 
     monkeypatch.setattr(run_scenario.subprocess, "Popen", FakePopen)
+    monkeypatch.setattr(run_scenario, "_resolve_backend_binary", lambda name: f"/usr/bin/{name}")
 
     notes: list[str] = []
     procs = run_scenario.spawn_teammates(
@@ -591,17 +594,17 @@ def test_spawn_teammates_uses_native_claude_agent_team_argv(
     assert notes == []
     assert set(procs) == {"claude-tgt-a"}
     cmd = popen_calls[0]["cmd"]
-    assert cmd[0] == "claude"
-    assert "--team-name" in cmd
-    assert cmd[cmd.index("--team-name") + 1] == "stress-S2-test"
-    assert "--agent-name" in cmd
-    assert cmd[cmd.index("--agent-name") + 1] == "claude-tgt-a"
-    assert "--agent-type" in cmd
-    assert cmd[cmd.index("--agent-type") + 1] == "claude"
-    assert "--agent-color" in cmd
-    assert cmd[cmd.index("--agent-color") + 1] == "blue"
+    assert cmd[:3] == [sys.executable, "-m", "claude_anyteam.backends.claude_native.cli"]
+    assert "--team" in cmd
+    assert cmd[cmd.index("--team") + 1] == "stress-S2-test"
+    assert "--name" in cmd
+    assert cmd[cmd.index("--name") + 1] == "claude-tgt-a"
+    assert "--color" in cmd
+    assert cmd[cmd.index("--color") + 1] == "blue"
+    assert "--claude-binary" in cmd
+    assert cmd[cmd.index("--claude-binary") + 1] == "/usr/bin/claude"
+    assert "--agent-id" not in cmd
     assert "--print" not in cmd
-    assert "claude_anyteam" not in cmd
     assert popen_calls[0]["cwd"] == sandbox / "repo"
 
 
