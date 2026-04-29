@@ -1,6 +1,8 @@
 #!/usr/bin/env node
 
 import { spawn } from 'node:child_process';
+import { readFileSync } from 'node:fs';
+import { arch, release } from 'node:os';
 import readline from 'node:readline/promises';
 import process from 'node:process';
 import yoctoSpinner from 'yocto-spinner';
@@ -15,10 +17,12 @@ import {
   formatDisplayPath,
   formatCommand,
   installTool,
+  installPython,
   installUv,
   isCI,
   isInteractive,
   manualInstallLines,
+  nodeInstallLines,
   providerPrereqLines,
   runCommand,
   uvToolEnv,
@@ -26,7 +30,7 @@ import {
   which,
 } from '../lib/detect.js';
 import { renderBanner, renderBox, theme } from '../lib/art.js';
-import { isPythonVersionTooOld, translate } from '../lib/error-translator.js';
+import { formatInstallerDiagnostic, isPythonVersionTooOld, translate } from '../lib/error-translator.js';
 
 const CLAUDE_PLUGIN_MARKETPLACE_SOURCE = 'JonathanRosado/claude-anyteam';
 const CLAUDE_PLUGIN_MARKETPLACE_NAME = 'claude-anyteam';
@@ -41,9 +45,47 @@ const CLAUDE_PLUGIN_MANUAL_COMMANDS = [
 ];
 const CLAUDE_PLUGIN_MARKETPLACE_ALREADY_EXISTS = /\balready (?:on disk|exists)\b/i;
 const CLAUDE_PLUGIN_ALREADY_INSTALLED = /\balready installed\b/i;
+const PACKAGE_JSON = JSON.parse(readFileSync(new URL('../package.json', import.meta.url), 'utf8'));
+const INSTALLER_VERSION = PACKAGE_JSON.version || 'unknown';
+
+const DEBUG_ENABLED = ['1', 'true', 'yes', 'on'].includes(String(process.env.CLAUDE_ANYTEAM_DEBUG || '').toLowerCase());
+
+function debugLog(...parts) {
+  if (!DEBUG_ENABLED) return;
+  const ts = new Date().toISOString().slice(11, 19);
+  const prefix = process.stderr.isTTY ? '\x1b[35m[debug]\x1b[39m ' : '[debug] ';
+  console.error(prefix + ts + ' ' + parts.map((p) => (typeof p === 'string' ? p : JSON.stringify(p))).join(' '));
+}
+
+function debugEnvSnapshot(label) {
+  if (!DEBUG_ENABLED) return;
+  debugLog(`--- ${label} (selected env) ---`);
+  for (const k of [
+    'CLAUDE_ANYTEAM_DEBUG', 'CLAUDE_ANYTEAM_NPM_PARENT', 'CLAUDE_ANYTEAM_NPM_VERSION',
+    'CLAUDE_ANYTEAM_FORCE_COLOR', 'FORCE_COLOR', 'NO_COLOR',
+    'PATHEXT', 'PYTHONUTF8', 'PYTHONIOENCODING',
+    'WT_SESSION', 'TERM_PROGRAM', 'ConEmuANSI',
+    'LC_ALL', 'LANG', 'HOME', 'USERPROFILE', 'APPDATA', 'LOCALAPPDATA',
+  ]) {
+    const v = process.env[k];
+    if (v !== undefined) debugLog(`  ${k}=${v}`);
+  }
+  const path = process.env.PATH || '';
+  const sep = process.platform === 'win32' ? ';' : ':';
+  const parts = path ? path.split(sep) : [];
+  debugLog(`  PATH (${parts.length} entries; first 5):`);
+  for (const p of parts.slice(0, 5)) debugLog(`    ${p}`);
+  if (parts.length > 8) debugLog(`    ... (${parts.length - 8} more) ...`);
+  for (const p of parts.slice(-3)) debugLog(`    ${p}`);
+  debugLog(`  process.platform=${process.platform} arch=${process.arch} node=${process.version}`);
+  debugLog(`  stdin.isTTY=${!!process.stdin.isTTY} stdout.isTTY=${!!process.stdout.isTTY} stderr.isTTY=${!!process.stderr.isTTY}`);
+}
+
+let detectedPythonVersion = 'not checked';
+let detectedUvVersion = 'not checked';
 
 function parseArgs(argv) {
-  const args = { postinstall: false, settingsPath: undefined, help: false };
+  const args = { postinstall: false, settingsPath: undefined, help: false, debug: false };
   for (let index = 0; index < argv.length; index += 1) {
     const arg = argv[index];
     if (arg === '--postinstall') {
@@ -56,6 +98,8 @@ function parseArgs(argv) {
       index += 1;
     } else if (arg === '--help' || arg === '-h') {
       args.help = true;
+    } else if (arg === '--debug') {
+      args.debug = true;
     } else {
       throw new Error(`Unknown option: ${arg}`);
     }
@@ -79,8 +123,8 @@ function usage() {
   ].join('\n');
 }
 
-async function confirmInstallUv() {
-  const prompt = `${theme.symbols.info} ${theme.heading('uv is missing.')} Install it now into ${theme.accent(UV_INSTALL_DIR)}? ${theme.muted('[Y/n] ')}`;
+async function confirmInstallDependency({ name, reason }) {
+  const prompt = `${theme.symbols.info} ${theme.heading(`${name} is missing.`)} ${reason} ${theme.muted('Want me to try installing it for you? [Y/n] ')}`;
   const rl = readline.createInterface({ input: process.stdin, output: process.stdout });
   try {
     const answer = (await rl.question(prompt)).trim().toLowerCase();
@@ -105,9 +149,61 @@ async function withSpinner(text, enabled, action) {
   }
 }
 
-function printFailure(title, lines) {
+function issueContext(rawError) {
+  return {
+    installerVersion: INSTALLER_VERSION,
+    os: `${process.platform} ${release()} ${arch()}`,
+    pythonVersion: detectedPythonVersion,
+    uvVersion: detectedUvVersion,
+    nodeVersion: process.version,
+    rawError,
+  };
+}
+
+function fallbackNextSteps() {
+  return [
+    `Read the message above and follow the command it suggests.`,
+    `Re-run ${theme.accent('npx --yes claude-anyteam')} after that finishes.`,
+    `If the same error comes back, open the report link below so we can help.`,
+  ];
+}
+
+function hasGuidanceLine(lines) {
+  return lines.some((line) => /try this next|next step|install it|rerun|re-run|run these commands|run these commands/i.test(String(line)));
+}
+
+function diagnosticTail(title, rawError, options = {}) {
+  const context = issueContext(rawError);
+  return formatInstallerDiagnostic({
+    title,
+    summary: options.summary || title,
+    rawError,
+    nextStepsPerOs: options.nextStepsPerOs || fallbackNextSteps(),
+    ...context,
+    includeWhatHappened: options.includeWhatHappened ?? false,
+  }).map((line) => (line.startsWith('  ') ? `    ${theme.accent(line.trim())}` : `${theme.symbols.info} ${theme.heading(line)}`));
+}
+
+function printFailure(title, lines, options = {}) {
+  const body = [...lines];
+  const rawError = String(options.rawError || lines.join('\n'));
+  if (!hasGuidanceLine(body)) {
+    body.push('');
+    body.push(`${theme.symbols.info} ${theme.heading('Try this next')}:`);
+    body.push(...fallbackNextSteps().map((step, index) => `    ${index + 1}. ${step}`));
+  }
+  if (!body.some((line) => /Still stuck\? Report it/i.test(String(line)))) {
+    const tail = diagnosticTail(title, rawError, {
+      summary: options.summary,
+      nextStepsPerOs: options.nextStepsPerOs,
+      includeWhatHappened: false,
+    });
+    const stuckIndex = tail.findIndex((line) => /Still stuck\? Report it/i.test(String(line)));
+    body.push('');
+    body.push(...tail.slice(stuckIndex));
+  }
   console.error('');
-  console.error(renderBox(theme.danger(title), lines, 'red'));
+  console.error(renderBox(theme.danger(title), body, 'red'));
   console.error('');
 }
 
@@ -117,10 +213,37 @@ function printSuccess(lines) {
   console.log('');
 }
 
-function printWarning(title, lines) {
+function printWarning(title, lines, options = {}) {
+  const body = [...lines];
+  if (options.issue !== false) {
+    const rawError = String(options.rawError || lines.join('\n'));
+    const tail = diagnosticTail(title, rawError, {
+      summary: options.summary,
+      nextStepsPerOs: options.nextStepsPerOs,
+      includeWhatHappened: false,
+    });
+    const tryIndex = tail.findIndex((line) => /Try this next/i.test(String(line)));
+    if (!hasGuidanceLine(body) && tryIndex >= 0) {
+      const stuckIndex = tail.findIndex((line) => /Still stuck\? Report it/i.test(String(line)));
+      body.push('');
+      body.push(...tail.slice(tryIndex, stuckIndex));
+    }
+    const stuckIndex = tail.findIndex((line) => /Still stuck\? Report it/i.test(String(line)));
+    body.push('');
+    body.push(...tail.slice(stuckIndex));
+  }
   console.log('');
-  console.log(renderBox(theme.warn(title), lines, 'yellow'));
+  console.log(renderBox(theme.warn(title), body, 'yellow'));
   console.log('');
+}
+
+function printVersionBanner() {
+  console.log(theme.muted(`claude-anyteam installer v${INSTALLER_VERSION}${DEBUG_ENABLED ? ' (debug mode)' : ''}`));
+}
+
+function printSection(title, detail) {
+  console.log('');
+  console.log(`${theme.symbols.info} ${theme.accent(title)} ${theme.muted(detail)}`);
 }
 
 function rawDetailsLines(raw) {
@@ -140,7 +263,9 @@ function translatedDiagnosticLines(translated, { command, recovered } = {}) {
   if (recovered) {
     lines.push(`${theme.symbols.success} ${theme.heading('Recovered')}: ${recovered}`);
   }
-  lines.push(`${theme.symbols.info} ${theme.heading('Next step')}: ${translated.action}`);
+  lines.push(`${theme.symbols.info} ${theme.heading('Try this next')}:`);
+  const actionLines = String(translated.action || 'Re-run the installer after fixing the problem.').split(/\r?\n/).filter(Boolean);
+  lines.push(...actionLines.map((line, index) => `    ${index + 1}. ${line}`));
   if (command) {
     lines.push(`${theme.symbols.info} ${theme.heading('Command')}: ${theme.accent(command)}`);
   }
@@ -197,7 +322,18 @@ function windowsAdviceLines(advice) {
 
 function postinstallHint(error) {
   const reason = trimmedDetails(error) || error.message;
-  console.warn(`claude-anyteam: automatic setup skipped (${reason.split(/\r?\n/, 1)[0]}). Run npx --yes claude-anyteam to finish.`);
+  const rawError = reason || 'automatic setup skipped';
+  const lines = [
+    `claude-anyteam: automatic setup skipped (${rawError.split(/\r?\n/, 1)[0]}).`,
+    ...formatInstallerDiagnostic({
+      title: 'Automatic setup skipped',
+      summary: 'npm could not finish claude-anyteam setup automatically.',
+      rawError,
+      nextStepsPerOs: ['Run `npx --yes claude-anyteam` in a normal terminal to finish setup.'],
+      ...issueContext(rawError),
+    }),
+  ];
+  console.warn(lines.join('\n'));
 }
 
 function claudePluginManualSummary() {
@@ -255,6 +391,7 @@ function runPythonInstaller({ uvPath, settingsPath, stdio = 'inherit' }) {
     '--no-config',
     'tool',
     'run',
+    '--prerelease=allow',
     '--from', TOOL_NAME,
     TOOL_NAME,
     'install',
@@ -264,8 +401,25 @@ function runPythonInstaller({ uvPath, settingsPath, stdio = 'inherit' }) {
     args.push('--settings-path', settingsPath);
   }
   return new Promise((resolve, reject) => {
+    const childEnv = {
+      ...uvToolEnv(process.env),
+      CLAUDE_ANYTEAM_NPM_PARENT: '1',
+      CLAUDE_ANYTEAM_NPM_VERSION: INSTALLER_VERSION,
+      // Belt-and-suspenders: the Python child often loses TTY detection
+      // through the npx → uv tool run chain (especially on Windows).
+      // Set FORCE_COLOR + CLAUDE_ANYTEAM_FORCE_COLOR explicitly so the
+      // Python theme module's _supports_color() always says yes here,
+      // independent of whether sys.stdout.isatty() returns True.
+      FORCE_COLOR: process.env.NO_COLOR ? '0' : '1',
+      CLAUDE_ANYTEAM_FORCE_COLOR: process.env.NO_COLOR ? '0' : '1',
+    };
+    if (DEBUG_ENABLED) {
+      childEnv.CLAUDE_ANYTEAM_DEBUG = '1';
+    }
+    debugLog(`spawning Python installer: ${uvPath} ${args.map((a) => JSON.stringify(a)).join(' ')}`);
+    debugLog(`  child env adds: CLAUDE_ANYTEAM_NPM_PARENT=1 CLAUDE_ANYTEAM_NPM_VERSION=${INSTALLER_VERSION} FORCE_COLOR=${childEnv.FORCE_COLOR} CLAUDE_ANYTEAM_DEBUG=${childEnv.CLAUDE_ANYTEAM_DEBUG || '<unset>'}`);
     const child = spawn(uvPath, args, {
-      env: uvToolEnv(process.env),
+      env: childEnv,
       stdio,
     });
     child.on('error', reject);
@@ -324,31 +478,90 @@ async function main() {
     console.log(usage());
     return 0;
   }
+  if (args.debug) {
+    process.env.CLAUDE_ANYTEAM_DEBUG = '1';
+  }
 
   const postinstall = args.postinstall || process.env.npm_lifecycle_event === 'postinstall';
   const interactive = isInteractive();
   const silent = postinstall;
+  const nodeMajor = Number.parseInt(process.versions.node.split('.', 1)[0] || '0', 10);
+  debugLog(`--- npm wrapper start (v${INSTALLER_VERSION}) ---`);
+  debugLog(`postinstall=${postinstall} interactive=${interactive} silent=${silent} nodeMajor=${nodeMajor}`);
+  debugEnvSnapshot('npm-wrapper-start');
 
   if (!silent) {
     console.log(renderBanner());
-    console.log(theme.heading('Zero-friction claude-anyteam setup for Claude Code.'));
-    console.log(theme.muted('We will check Python, install uv if needed, wire up claude-anyteam, patch Claude settings, and register the Claude plugin.'));
+    printVersionBanner();
+    console.log(theme.heading('Friendly claude-anyteam setup for Claude Code.'));
+    console.log(theme.muted('I will check the tools you need, offer to install anything missing, wire up Claude Code, and keep the raw details visible if something breaks.'));
     console.log('');
+    printSection('1/3 Detect', 'First I check what is already on this computer.');
   }
 
-  const pythonCheck = await detectPython({ diagnostics: true });
-  const python = pythonCheck.python;
+  if (nodeMajor < 18) {
+    if (silent) {
+      postinstallHint(new Error(`Node.js ${process.versions.node} is too old; Node.js 18+ is required`));
+      return 0;
+    }
+    printFailure('NODE.JS VERSION TOO OLD', [
+      `${theme.symbols.error} ${theme.heading(`This installer is running on Node.js ${process.versions.node}, but it needs Node.js 18 or newer.`)}`,
+      `${theme.symbols.info} Node.js is the JavaScript runtime that runs npx. Install the current LTS version, then rerun ${theme.accent('npx --yes claude-anyteam')}.`,
+      '',
+      ...nodeInstallLines().map((line) => `${theme.symbols.info} ${line}`),
+    ], { rawError: `Node.js ${process.versions.node} < 18` });
+    return 1;
+  }
+
+  let pythonCheck = await detectPython({ diagnostics: true });
+  let python = pythonCheck.python;
+  detectedPythonVersion = python?.version || 'not found';
   if (!python) {
     if (silent) {
       postinstallHint(new Error(`${pythonLabel()} was not found`));
       return 0;
     }
+    let shouldInstall = false;
+    if (!interactive) {
+      printWarning('SKIPPING PYTHON AUTO-INSTALL', [
+        `${theme.symbols.info} I cannot ask questions because this terminal is non-interactive (for example, stdin is piped or CI is running).`,
+        `${theme.symbols.info} Please install Python manually using the steps below, then rerun ${theme.accent('npx --yes claude-anyteam')}.`,
+      ]);
+    } else {
+      shouldInstall = await confirmInstallDependency({
+        name: 'Python 3.12+',
+        reason: 'Python is the programming language that runs claude-anyteam.',
+      });
+    }
+    if (shouldInstall) {
+      try {
+        python = await withSpinner('Installing Python 3.12+ with your system package manager', !silent, () => installPython());
+        pythonCheck = { python, issue: null };
+        detectedPythonVersion = python.version || 'unknown';
+      } catch (error) {
+        const translated = pythonMissingTranslation(pythonCheck.issue);
+        printFailure('PYTHON INSTALL FAILED', [
+          `${theme.symbols.error} ${theme.heading('I tried to install Python, but the computer would not let me finish.')}`,
+          `${theme.symbols.info} Installer output: ${trimmedDetails(error) || 'No extra diagnostics.'}`,
+          '',
+          `${theme.symbols.info} ${theme.heading('Try this next')}:`,
+          ...manualInstallLines({ includePython: true }).map((line, index) => `    ${index + 1}. ${line}`),
+          '',
+          ...translatedDiagnosticLines(translated),
+        ], { rawError: trimmedDetails(error) || String(error) });
+        return 1;
+      }
+    }
+  }
+
+  if (!python) {
     const translated = pythonMissingTranslation(pythonCheck.issue);
     printFailure('PYTHON 3.12+ NOT FOUND', [
+      `${theme.symbols.warn} ${theme.heading('We need Python 3.12 or newer because claude-anyteam is a Python tool.')}`,
       ...translatedDiagnosticLines(translated),
       '',
       ...manualInstallLines({ includePython: true }).map((line) => `${theme.symbols.info} ${line}`),
-    ]);
+    ], { rawError: translated.raw });
     return 1;
   }
 
@@ -361,63 +574,93 @@ async function main() {
       postinstallHint(new Error(`Python ${python.version} is too old; Python 3.12+ is required`));
       return 0;
     }
+    if (interactive && await confirmInstallDependency({
+      name: 'a newer Python',
+      reason: `I found Python ${python.version}, but claude-anyteam needs Python 3.12 or newer.`,
+    })) {
+      try {
+        python = await withSpinner('Installing a newer Python 3.12+', !silent, () => installPython());
+        detectedPythonVersion = python.version || 'unknown';
+      } catch (error) {
+        const translated = translate({
+          raw: `Detected Python ${python.version} at ${formatDisplayPath(python.path)}\n${trimmedDetails(error)}`,
+          pythonVersion: python.version,
+        });
+        printFailure('PYTHON UPGRADE FAILED', [
+          ...translatedDiagnosticLines(translated),
+          '',
+          ...manualInstallLines({ includePython: true }).map((line) => `${theme.symbols.info} ${line}`),
+        ], { rawError: translated.raw });
+        return 1;
+      }
+      if (!isPythonVersionTooOld(python.version)) {
+        console.log(`${theme.symbols.success} ${theme.heading(`${pythonLabel()} updated`)} ${theme.muted(`(${python.version})`)} ${theme.accent(formatDisplayPath(python.path))}`);
+      }
+    }
+  }
+
+  if (isPythonVersionTooOld(python.version)) {
     const translated = translate({
       raw: `Detected Python ${python.version} at ${formatDisplayPath(python.path)}`,
       pythonVersion: python.version,
     });
-    printFailure('PYTHON VERSION TOO OLD', translatedDiagnosticLines(translated));
+    printFailure('PYTHON VERSION TOO OLD', translatedDiagnosticLines(translated), { rawError: translated.raw });
     return 1;
   }
 
   let uv = await detectUv();
+  detectedUvVersion = uv?.version || 'not found';
   if (!uv) {
-    if (process.platform === 'win32') {
-      if (silent) {
-        postinstallHint(new Error('uv is not installed'));
-        return 0;
-      }
-      printFailure('UV NOT INSTALLED', [
-        `${theme.symbols.warn} ${theme.heading('uv is required to install the Python claude-anyteam tool.')}`,
-        `${theme.symbols.info} Install it from PowerShell, then rerun ${theme.accent('npx --yes claude-anyteam')}.`,
-        '',
-        ...manualInstallLines().map((line) => `${theme.symbols.info} ${line}`),
-      ]);
-      return 1;
+    if (silent) {
+      postinstallHint(new Error('uv is not installed'));
+      return 0;
     }
-    const autoInstall = postinstall || !interactive || (await confirmInstallUv());
+
+    let autoInstall = false;
+    if (!interactive) {
+      printWarning('SKIPPING UV AUTO-INSTALL', [
+        `${theme.symbols.info} I cannot ask questions because this terminal is non-interactive (for example, stdin is piped or CI is running).`,
+        `${theme.symbols.info} Please install uv manually using the steps below, then rerun ${theme.accent('npx --yes claude-anyteam')}.`,
+      ]);
+    } else {
+      autoInstall = await confirmInstallDependency({
+        name: 'uv',
+        reason: 'uv is the small installer that downloads and runs the Python claude-anyteam tool.',
+      });
+    }
+
     if (!autoInstall) {
-      if (silent) {
-        postinstallHint(new Error('uv is not installed'));
-        return 0;
-      }
       printFailure('UV NOT INSTALLED', [
-        `${theme.symbols.warn} ${theme.heading('uv is required to install the Python claude-anyteam tool.')}`,
-        `${theme.symbols.info} Install it manually, then rerun ${theme.accent('npx --yes claude-anyteam')}.`,
+        `${theme.symbols.warn} ${theme.heading('uv is required because it installs claude-anyteam safely in its own Python environment.')}`,
+        `${theme.symbols.info} Install uv manually, then rerun ${theme.accent('npx --yes claude-anyteam')}.`,
         '',
         ...manualInstallLines().map((line) => `${theme.symbols.info} ${line}`),
-      ]);
+      ], { rawError: 'uv was not found on PATH' });
       return 1;
     }
 
     try {
       uv = await withSpinner(`Installing uv into ${UV_INSTALL_DIR}`, !silent, () => installUv());
+      detectedUvVersion = uv.version || 'unknown';
     } catch (error) {
       if (silent) {
         postinstallHint(error);
         return 0;
       }
       printFailure('UV INSTALL FAILED', [
-        `${theme.symbols.error} ${theme.heading('Automatic uv installation did not complete.')}`,
+        `${theme.symbols.error} ${theme.heading('I tried to install uv, but the computer would not let me finish.')}`,
         `${theme.symbols.info} Installer output: ${trimmedDetails(error) || 'No extra diagnostics.'}`,
         '',
         ...manualInstallLines().map((line) => `${theme.symbols.info} ${line}`),
-      ]);
+      ], { rawError: trimmedDetails(error) || String(error) });
       return 1;
     }
   }
 
   if (!silent) {
+    detectedUvVersion = uv.version || 'unknown';
     console.log(`${theme.symbols.success} ${theme.heading('uv ready')} ${theme.muted(uv.version)} ${theme.accent(formatDisplayPath(uv.path))}`);
+    printSection('2/3 Install', 'Now I install or reuse the claude-anyteam command.');
   }
 
   if (process.platform === 'win32') {
@@ -431,23 +674,38 @@ async function main() {
       printWarning('WINDOWS LONG PATHS MAY BE DISABLED', [
         `${theme.symbols.warn} ${theme.heading('uv tool install can exceed the default 260-character Windows path limit.')}`,
         `${theme.symbols.info} Automatic registry update did not succeed: ${trimmedDetails(longPaths) || 'No extra diagnostics.'}`,
-        `${theme.symbols.info} Next step: open PowerShell as Administrator and run:`,
-        `    ${theme.accent(powershellLongPathsCommand())}`,
+        `${theme.symbols.info} ${theme.heading('Try this next')}:`,
+        `    1. Open PowerShell as Administrator and run: ${theme.accent(powershellLongPathsCommand())}`,
       ]);
     }
   }
 
   let tool;
   const existingTool = await findInstalledTool({ uvPath: uv.path }).catch(() => null);
-  if (existingTool) {
-    tool = existingTool;
+  // Always run `uv tool install --force --prerelease=allow` so a cached older
+  // claude-anyteam binary gets refreshed to the latest published wheel. Without
+  // this, a user who installed at v0.5.x and re-runs `npx --yes claude-anyteam`
+  // never sees handholding/prompt logic shipped in later releases.
+  const installLabel = existingTool ? 'Refreshing' : 'Installing';
+  try {
+    tool = await withSpinner(`${installLabel} ${TOOL_NAME} v${INSTALLER_VERSION} with uv tool install`, !silent, () => installTool({ uvPath: uv.path, pythonPath: python.path, refresh: true, version: INSTALLER_VERSION }));
     if (!silent) {
-      console.log(`${theme.symbols.success} ${theme.heading('existing claude-anyteam tool detected')} ${theme.accent(formatDisplayPath(tool.binaryPath))}`);
+      const status = tool.installMode === 'refreshed' ? `refreshed to v${INSTALLER_VERSION}` : `installed v${INSTALLER_VERSION}`;
+      console.log(`${theme.symbols.success} ${theme.heading(`claude-anyteam tool ${status}`)} ${theme.accent(formatDisplayPath(tool.binaryPath))}`);
     }
-  } else {
-    try {
-      tool = await withSpinner(`Installing ${TOOL_NAME} with uv tool install`, !silent, () => installTool({ uvPath: uv.path, pythonPath: python.path }));
-    } catch (error) {
+  } catch (error) {
+    if (existingTool) {
+      // Refresh failed but we still have a working older copy — degrade
+      // gracefully rather than blocking on a transient registry error.
+      tool = existingTool;
+      if (!silent) {
+        console.log(`${theme.symbols.warn} ${theme.heading('Could not refresh claude-anyteam')} ${theme.muted('— continuing with existing copy')} ${theme.accent(formatDisplayPath(tool.binaryPath))}`);
+        const refreshDetail = (error.details || error.message || '').split(/\r?\n/, 1)[0];
+        if (refreshDetail) {
+          console.log(`${theme.symbols.info} ${theme.muted(`Refresh error: ${refreshDetail}`)}`);
+        }
+      }
+    } else {
       if (silent) {
         postinstallHint(error);
         return 0;
@@ -464,7 +722,7 @@ async function main() {
       printFailure('TOOL INSTALL FAILED', [
         ...translatedDiagnosticLines(translatedForDisplay, { command }),
         ...(advice.length ? ['', ...windowsAdviceLines(advice)] : []),
-      ]);
+      ], { rawError: translated.raw || trimmedDetails(error) || error.message });
       return 1;
     }
   }
@@ -474,6 +732,7 @@ async function main() {
   // status lines to stdout, and overlaying a spinner would fight with that output.
   if (!silent) {
     console.log('');
+    printSection('3/3 Wire up', 'Now I connect claude-anyteam to Claude Code settings.');
     const pythonInstallerSummary = process.platform === 'win32'
       ? `— Windows single-terminal compatibility, Codex/Gemini/Kimi CLI prereq checks, ${settingsDisplayPath()}, ${claudeJsonDisplayPath()}, install-state.json`
       : `— tmux + Codex/Gemini/Kimi CLI prereq checks, ${settingsDisplayPath()}, ${claudeJsonDisplayPath()}, install-state.json`;
@@ -499,7 +758,7 @@ async function main() {
       `${theme.symbols.info} Details: ${trimmedDetails(error) || error.message}`,
       `${theme.symbols.info} Retry with ${theme.accent(formatCommand(tool.binaryPath, ['install', '--assume-yes']))} after ensuring uv is on PATH.`,
       ...windowsAdviceLines(windowsAdvice(error, { binDir: tool.binDir })),
-    ]);
+    ], { rawError: trimmedDetails(error) || error.message });
     return 1;
   }
   if (installerResult.code !== 0) {
@@ -511,7 +770,10 @@ async function main() {
     // install hints, teammateMode conflict explanation, etc.) through
     // inherited stderr. Do not re-wrap; exit non-zero quietly.
     if (installerResult.code === 3) {
-      console.error(`${theme.symbols.warn} Python installer aborted (exit code 3) despite --assume-yes. This is unexpected — please file a bug at https://github.com/JonathanRosado/claude-anyteam/issues`);
+      printFailure('PYTHON INSTALLER ABORTED', [
+        `${theme.symbols.warn} The Python installer stopped with exit code 3 even though the npm wrapper passed --assume-yes.`,
+        `${theme.symbols.info} This is probably a real installer bug, not something you did wrong.`,
+      ], { rawError: `Python installer exited with code ${installerResult.code}` });
     }
     return 1;
   }
@@ -584,7 +846,7 @@ main().then(
     printFailure('UNEXPECTED INSTALLER ERROR', [
       `${theme.symbols.error} ${theme.heading(error.message)}`,
       ...(trimmedDetails(error) && trimmedDetails(error) !== error.message ? [`${theme.symbols.info} ${trimmedDetails(error)}`] : []),
-    ]);
+    ], { rawError: trimmedDetails(error) || error.stack || error.message });
     process.exitCode = 1;
   },
 );

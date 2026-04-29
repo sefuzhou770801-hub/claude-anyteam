@@ -1,7 +1,7 @@
 import assert from 'node:assert/strict';
 import { readFileSync } from 'node:fs';
 import { test } from 'node:test';
-import { translate } from '../npm/lib/error-translator.js';
+import { buildIssueUrl, formatInstallerDiagnostic, translate } from '../npm/lib/error-translator.js';
 
 function assertTranslation(raw, context, expected) {
   const result = translate(raw, context);
@@ -43,7 +43,7 @@ test('uv-no-solution', () => {
       id: 'uv-no-solution',
       title: 'Python dependency conflict',
       severity: 'hard',
-      action: /uv tool install --reinstall claude-anyteam/,
+      action: /uv tool install --reinstall --prerelease=allow claude-anyteam/,
     },
   );
 });
@@ -337,4 +337,42 @@ test('fallback-unrecognized', () => {
   assert.equal(result.severity, 'hard');
   assert.match(result.action, /issues\/new/);
   assert.equal(result.raw, raw);
+});
+
+test('issue urls include cross-platform diagnosis fields', () => {
+  const url = new URL(buildIssueUrl({
+    title: 'Broken install',
+    installerVersion: '9.9.9',
+    os: 'win32 10.0.22631 x64',
+    pythonVersion: '3.12.2',
+    uvVersion: 'uv 0.5.0',
+    nodeVersion: 'v22.0.0',
+    rawError: 'raw boom',
+  }));
+  assert.equal(`${url.origin}${url.pathname}`, 'https://github.com/JonathanRosado/claude-anyteam/issues/new');
+  assert.match(url.searchParams.get('title'), /Broken install/);
+  const body = url.searchParams.get('body');
+  assert.match(body, /Installer version: 9\.9\.9/);
+  assert.match(body, /OS: win32 10\.0\.22631 x64/);
+  assert.match(body, /Python version: 3\.12\.2/);
+  assert.match(body, /uv version: uv 0\.5\.0/);
+  assert.match(body, /Node version: v22\.0\.0/);
+  assert.match(body, /raw boom/);
+});
+
+test('formatInstallerDiagnostic renders uniform next-step and report blocks', () => {
+  const lines = formatInstallerDiagnostic({
+    title: 'Missing thing',
+    summary: 'Thing is missing.',
+    rawError: 'thing missing',
+    nextStepsPerOs: {
+      win32: ['Open PowerShell as Administrator.', 'Run winget install Thing.'],
+      default: ['Run brew install thing.'],
+    },
+    os: 'win32 10 x64',
+    platform: 'win32',
+  });
+  assert.match(lines.join('\n'), /What happened: Thing is missing\./);
+  assert.match(lines.join('\n'), /Try this next:\n  1\. Open PowerShell as Administrator\.\n  2\. Run winget install Thing\./);
+  assert.match(lines.join('\n'), /Still stuck\? Report it:\n  https:\/\/github\.com\/JonathanRosado\/claude-anyteam\/issues\/new\?/);
 });

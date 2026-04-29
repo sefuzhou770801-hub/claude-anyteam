@@ -12,7 +12,7 @@ def test_npm_package_metadata_matches_installer_contract() -> None:
     package = json.loads((NPM_DIR / 'package.json').read_text(encoding='utf-8'))
 
     assert package['name'] == 'claude-anyteam'
-    assert package['version'] == '0.7.0'
+    assert package['version'] == '0.8.0'
     assert package['bin']['claude-anyteam-setup'] == 'bin/setup.js'
     assert package['bin']['claude-anyteam'] == 'bin/setup.js'
     assert package['scripts']['postinstall'] == 'node bin/setup.js --postinstall'
@@ -79,6 +79,9 @@ def test_setup_delegates_to_python_installer() -> None:
     assert "'--assume-yes'" in setup_source, (
         'setup.js must always pass --assume-yes since npx is non-interactive'
     )
+    assert "'--prerelease=allow'" in setup_source, (
+        'setup.js must allow pre-release Python deps when uv resolves claude-anyteam'
+    )
     # stdio must be inherited so the Python installer's messages reach the user.
     assert "stdio:" in setup_source and "'inherit'" in setup_source
 
@@ -87,6 +90,13 @@ def test_setup_delegates_to_python_installer() -> None:
     assert "from '../lib/settings.js'" not in setup_source
     assert 'TEAMMATE_COMMAND_KEY' not in setup_source
     assert 'TEAMMATE_BINARY_KEY' not in setup_source
+
+
+def test_npm_version_banner_reads_package_json() -> None:
+    setup_source = (NPM_DIR / 'bin' / 'setup.js').read_text(encoding='utf-8')
+
+    assert "readFileSync(new URL('../package.json', import.meta.url)" in setup_source
+    assert 'claude-anyteam installer v${INSTALLER_VERSION}' in setup_source
 
 
 def test_setup_refreshes_plugin_on_every_run() -> None:
@@ -134,13 +144,13 @@ def test_npm_installer_contains_windows_hardening_paths() -> None:
 def test_pyproject_version_matches_npm_version() -> None:
     """Both package manifests ship as one behavior-coupled unit."""
     pyproject = (ROOT / 'pyproject.toml').read_text(encoding='utf-8')
-    # Light TOML match — we already know pyproject has `version = "X.Y.Z"` on a
-    # single line and don't want a new dep just for this one assertion.
     version_line = next(
         line for line in pyproject.splitlines()
         if line.startswith('version = ')
     )
-    assert version_line == 'version = "0.7.0"', version_line
+    pyproject_version = version_line.split('=', 1)[1].strip().strip('"')
 
     package = json.loads((NPM_DIR / 'package.json').read_text(encoding='utf-8'))
-    assert package['version'] == '0.7.0'
+    assert package['version'] == pyproject_version, (
+        f'pyproject={pyproject_version!r} npm={package["version"]!r}'
+    )

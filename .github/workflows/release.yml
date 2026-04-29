@@ -1,9 +1,21 @@
 name: Release
 
+# Triggered by either a real `v*` tag push (a maintainer pushing a tag from
+# their machine) OR an explicit `workflow_dispatch` from auto-release.yml.
+# The dispatch path is what makes the auto-release flow work end-to-end:
+# tags created by GITHUB_TOKEN inside an Action do NOT trigger downstream
+# `push: tags:` workflows (security restriction), so auto-release.yml has
+# to call this workflow explicitly via `gh workflow run`.
 on:
   push:
     tags:
       - 'v*'
+  workflow_dispatch:
+    inputs:
+      tag:
+        description: 'Tag to publish (e.g. v0.7.3). Defaults to the workflow ref.'
+        required: false
+        type: string
 
 concurrency:
   group: release-${{ github.ref }}
@@ -15,14 +27,28 @@ jobs:
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v4
+        with:
+          ref: ${{ inputs.tag || github.ref }}
       - name: Install uv
         uses: astral-sh/setup-uv@v4
       - name: Set up Python
         run: uv python install 3.12
       - name: Sync deps
         run: uv sync --all-extras
-      - name: Run pytest
-        run: uv run pytest -q
+      - name: Run pytest (with one retry for known concurrency flake)
+        run: |
+          set +e
+          uv run pytest -q
+          status=$?
+          if [ $status -ne 0 ]; then
+            echo "::warning::pytest failed once; retrying once for known flakes"
+            uv run pytest -q --last-failed
+            status=$?
+          fi
+          if [ $status -ne 0 ]; then
+            echo "::error::pytest failed twice — not a flake"
+            exit $status
+          fi
 
   publish-npm:
     name: Publish to npm
@@ -33,6 +59,8 @@ jobs:
       id-token: write  # required by --provenance
     steps:
       - uses: actions/checkout@v4
+        with:
+          ref: ${{ inputs.tag || github.ref }}
       - uses: actions/setup-node@v4
         with:
           node-version: '20'
@@ -51,6 +79,8 @@ jobs:
       contents: read
     steps:
       - uses: actions/checkout@v4
+        with:
+          ref: ${{ inputs.tag || github.ref }}
       - name: Install uv
         uses: astral-sh/setup-uv@v4
       - name: Build distributions

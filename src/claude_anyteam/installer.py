@@ -12,8 +12,10 @@ from __future__ import annotations
 import contextlib
 import copy
 import errno
+import importlib.metadata
 import json
 import os
+import platform as platform_mod
 import re
 import shutil
 import subprocess
@@ -24,6 +26,10 @@ from datetime import datetime, timezone
 from importlib import resources as importlib_resources
 from pathlib import Path
 from typing import Any, Callable, Literal
+from urllib.parse import urlencode
+
+from ._debug import log as _dlog, log_subprocess as _dlog_sub, log_which as _dlog_which
+from ._theme import get_theme, render_box
 
 TEAMMATE_COMMAND_KEY = "CLAUDE_CODE_TEAMMATE_COMMAND"
 TEAMMATE_BINARY_KEY = "CLAUDE_ANYTEAM_BINARY"
@@ -91,6 +97,7 @@ INSTALL_ERROR_EXIT_GENERIC = 2
 INSTALL_ERROR_EXIT_PROMPT_DECLINED = 3
 INSTALL_ERROR_EXIT_CORRUPTED_STATE = 4
 INSTALL_ERROR_EXIT_NO_PROVIDER = 5
+ISSUE_NEW_URL = "https://github.com/JonathanRosado/claude-anyteam/issues/new"
 
 ProviderState = Literal["READY", "NEEDS_SIGNIN", "NEEDS_UPGRADE", "MISSING"]
 InstallSeverity = Literal["blocker", "hard-stop", "soft"]
@@ -344,19 +351,142 @@ class InstallError(ValueError):
             self.cli_exit_code = cli_exit_code  # type: ignore[attr-defined]
         super().__init__(self.as_plain_text())
 
-    def as_plain_text(self, *, include_details: bool = True) -> str:
+    def as_plain_text(self, *, include_details: bool = True, include_report: bool = True) -> str:
         lines = [
             self.title,
             self.explanation,
-            f"Next step: {self.action}",
+            "Try this next:",
+            *(f"  {index}. {line}" for index, line in enumerate(self.action.splitlines() or [self.action], start=1)),
             f"Severity: {self.severity}",
         ]
         if include_details and self.details:
             lines.extend(["Raw details:", self.details])
+        if include_report:
+            raw_error = self.as_plain_text(include_details=include_details, include_report=False)
+            lines.extend(
+                [
+                    "Still stuck? Report it:",
+                    f"  {build_issue_url(title=self.title, raw_error=raw_error)}",
+                ]
+            )
         return "\n".join(lines)
 
     def __str__(self) -> str:
         return self.as_plain_text()
+
+
+def installer_version() -> str:
+    env_version = os.environ.get("CLAUDE_ANYTEAM_NPM_VERSION")
+    if env_version:
+        return env_version
+    try:
+        return importlib.metadata.version("claude-anyteam")
+    except importlib.metadata.PackageNotFoundError:
+        pyproject = Path(__file__).resolve().parents[2] / "pyproject.toml"
+        try:
+            for line in pyproject.read_text(encoding="utf-8").splitlines():
+                if line.startswith("version = "):
+                    return line.split("=", 1)[1].strip().strip('"')
+        except OSError:
+            pass
+    return "unknown"
+
+
+def _tool_version(command: str) -> str:
+    try:
+        found = shutil.which(command)
+    except Exception as exc:
+        return f"version check skipped: {exc}"
+    if not found:
+        return "not found"
+    try:
+        completed = subprocess.run(
+            [found, "--version"],
+            capture_output=True,
+            text=True,
+            timeout=3,
+            check=False,
+        )
+    except (OSError, subprocess.SubprocessError) as exc:
+        return f"found at {found}, but version check failed: {exc}"
+    return (completed.stdout or completed.stderr or "").strip() or f"found at {found}"
+
+
+def _os_label() -> str:
+    return f"{sys.platform} {platform_mod.release()} {platform_mod.machine()}"
+
+
+def _normalize_steps(
+    next_steps_per_os: dict[str, list[str] | tuple[str, ...] | str] | list[str] | tuple[str, ...] | str,
+) -> list[str]:
+    if isinstance(next_steps_per_os, str):
+        return [line for line in next_steps_per_os.splitlines() if line.strip()]
+    if isinstance(next_steps_per_os, (list, tuple)):
+        return [str(line) for line in next_steps_per_os if str(line).strip()]
+    if isinstance(next_steps_per_os, dict):
+        if _is_windows_platform() and "win32" in next_steps_per_os:
+            return _normalize_steps(next_steps_per_os["win32"])
+        if sys.platform == "darwin" and "darwin" in next_steps_per_os:
+            return _normalize_steps(next_steps_per_os["darwin"])
+        if sys.platform not in ("win32", "cygwin", "darwin") and "linux" in next_steps_per_os:
+            return _normalize_steps(next_steps_per_os["linux"])
+        return _normalize_steps(next_steps_per_os.get("default", []))
+    return []
+
+
+def build_issue_url(
+    *,
+    title: str,
+    raw_error: str,
+    what_doing: str = "I was running `claude-anyteam install`.",
+) -> str:
+    body = "\n".join(
+        [
+            "## What I was doing",
+            what_doing,
+            "",
+            "## Installer details",
+            f"- Installer version: {installer_version()}",
+            f"- OS: {_os_label()}",
+            f"- Python version: {sys.version.split()[0]}",
+            f"- uv version: {_tool_version('uv')}",
+            f"- Node version: {_tool_version('node')}",
+            "",
+            "## Raw error text",
+            "```text",
+            raw_error or "No raw error captured.",
+            "```",
+        ]
+    )
+    return f"{ISSUE_NEW_URL}?{urlencode({'title': f'[installer] {title[:120]}', 'body': body})}"
+
+
+def format_installer_diagnostic(
+    *,
+    summary: str,
+    raw_error: str,
+    next_steps_per_os: dict[str, list[str] | tuple[str, ...] | str] | list[str] | tuple[str, ...] | str,
+    title: str = "Installer error",
+    what_doing: str = "I was running `claude-anyteam install`.",
+    include_what_happened: bool = True,
+) -> list[str]:
+    steps = _normalize_steps(next_steps_per_os)
+    if not steps:
+        steps = [
+            "Read the message above.",
+            "Fix the problem it describes.",
+            "Run `claude-anyteam install` again.",
+        ]
+    lines: list[str] = []
+    if include_what_happened:
+        lines.append(f"What happened: {summary}")
+    lines.append("Try this next:")
+    lines.extend(f"  {index}. {step}" for index, step in enumerate(steps, start=1))
+    lines.append("Still stuck? Report it:")
+    lines.append(
+        f"  {build_issue_url(title=title, raw_error=raw_error, what_doing=what_doing)}"
+    )
+    return lines
 
 
 def _quote_command_path(path: Path) -> str:
@@ -562,8 +692,8 @@ def _provider_version_probe_error(
     return InstallError(
         title=f"Found `{binary}` but couldn't read its version",
         explanation=(
-            f"Found `{binary}` on PATH but it didn't return a recognizable version. "
-            "The installer will warn but continue — you may need to upgrade or reinstall the provider CLI."
+            f"Found `{binary}` on PATH (the command search list) but it didn't return a recognizable version. "
+            "The installer will warn but continue — you may need to upgrade or reinstall that provider app."
         ),
         action=f"Upgrade or reinstall {provider_name}, then run `{command}` again.",
         severity="soft",
@@ -705,9 +835,9 @@ def discover_managed_paths(
         raise InstallError(
             title="claude-anyteam is not on PATH",
             explanation=(
-                "The installer could not find the claude-anyteam command it needs to write into Claude Code settings."
+                "The installer could not find the claude-anyteam command on PATH (the list of folders your terminal searches for commands)."
             ),
-            action="Run `uv tool install --reinstall claude-anyteam`, then run `claude-anyteam install` again.",
+            action="Run `uv tool install --reinstall --prerelease=allow claude-anyteam`, then run `claude-anyteam install` again.",
             severity="blocker",
             details="Unable to resolve the claude-anyteam binary.",
         )
@@ -715,9 +845,9 @@ def discover_managed_paths(
         raise InstallError(
             title="claude-anyteam's spawn shim is not on PATH",
             explanation=(
-                "The installer could not find the spawn shim that Claude Code uses to launch routed teammates."
+                "The installer could not find the spawn shim (the small helper command Claude Code uses to launch routed teammates) on PATH."
             ),
-            action="Run `uv tool install --reinstall claude-anyteam`, then run `claude-anyteam install` again.",
+            action="Run `uv tool install --reinstall --prerelease=allow claude-anyteam`, then run `claude-anyteam install` again.",
             severity="blocker",
             details="Unable to resolve the claude-anyteam-spawn-shim binary.",
         )
@@ -1082,31 +1212,37 @@ def _delete_state(path: Path) -> bool:
 
 def _platform_name() -> str:
     raw = sys.platform
-    if raw.startswith("linux"):
-        return "linux"
-    if raw == "darwin":
-        return "darwin"
-    if raw in ("win32", "cygwin"):
-        return "windows"
-    return raw
+    name = "linux" if raw.startswith("linux") else "darwin" if raw == "darwin" else "windows" if raw in ("win32", "cygwin") else raw
+    _dlog(f"_platform_name: sys.platform={raw!r} -> {name!r}")
+    return name
 
 
 def _check_terminal_multiplexer() -> PrereqCheck:
-    """Checks PATH for tmux on Linux/macOS.
+    """Checks PATH for tmux on Linux/macOS, psmux on Windows.
 
-    Windows has no equivalent multiplexer requirement in the Python installer:
-    the install proceeds and Claude Code/plugin behavior decides how to spawn
-    panes there. This keeps Windows users from being blocked by a Unix-only
-    prerequisite.
+    On Windows we PROBE for psmux but don't BLOCK if it's missing — the
+    installer proceeds with single-terminal mode as a fallback. The
+    `_offer_multiplexer_install` prompt in cli.py invites the user to install
+    psmux for proper pane-based teammate visibility.
     """
     platform = _platform_name()
 
     if platform == "windows":
+        for name in ("psmux", "psmux.exe"):
+            found_path = shutil.which(name)
+            _dlog_which(name, found_path)
+            if found_path:
+                _dlog(f"multiplexer (psmux) found at {found_path}")
+                return PrereqCheck(found=True, binary="psmux", path=Path(found_path).resolve(), platform=platform)
+        # Windows is non-blocking: single-terminal mode works without a multiplexer.
+        _dlog("multiplexer (psmux) not found on Windows; reporting found=True (single-terminal mode)")
         return PrereqCheck(found=True, binary=None, path=None, platform=platform)
 
     for name in ("tmux",):
         found_path = shutil.which(name)
+        _dlog_which(name, found_path)
         if found_path:
+            _dlog(f"multiplexer (tmux) found at {found_path}")
             return PrereqCheck(
                 found=True,
                 binary=name,
@@ -1114,6 +1250,7 @@ def _check_terminal_multiplexer() -> PrereqCheck:
                 platform=platform,
             )
 
+    _dlog("multiplexer (tmux) NOT found; will block install on POSIX")
     return PrereqCheck(found=False, binary=None, path=None, platform=platform)
 
 
@@ -1203,7 +1340,9 @@ def _codex_meets_minimum(check: CodexCliCheck) -> bool | None:
 
 
 def _check_codex_cli() -> CodexCliCheck:
+    _dlog(f"_check_codex_cli: probing for {CODEX_CLI_BINARY!r}")
     found_path = shutil.which(CODEX_CLI_BINARY)
+    _dlog_which(CODEX_CLI_BINARY, found_path)
     if not found_path:
         return CodexCliCheck(
             found=False,
@@ -1511,7 +1650,9 @@ def _gemini_capabilities_from_help(help_text: str) -> dict[str, bool]:
 
 
 def _check_gemini_cli() -> GeminiCliCheck:
+    _dlog(f"_check_gemini_cli: probing for {GEMINI_CLI_BINARY!r}")
     found_path = shutil.which(GEMINI_CLI_BINARY)
+    _dlog_which(GEMINI_CLI_BINARY, found_path)
     if not found_path:
         return GeminiCliCheck(
             found=False,
@@ -1583,8 +1724,23 @@ def _check_gemini_cli() -> GeminiCliCheck:
     )
 
 
+def _resolve_kimi_binary() -> str | None:
+    """Find the Kimi binary by trying every alias kimi-cli registers (`kimi`,
+    `kimi-cli`) and falling back to direct uv-tool-dir scanning for cases
+    where uv installed but PATH wasn't refreshed in this process. Imported
+    lazily to avoid a circular import — cli.py imports from this module.
+    """
+    try:
+        from .cli import _resolve_binary  # noqa: PLC0415
+    except ImportError:
+        return shutil.which(KIMI_CLI_BINARY)
+    return _resolve_binary((KIMI_CLI_BINARY, "kimi-cli"), uv_tool_name="kimi-cli")
+
+
 def _check_kimi_cli() -> KimiCliCheck:
-    found_path = shutil.which(KIMI_CLI_BINARY)
+    _dlog(f"_check_kimi_cli: resolving via alias-aware probe (kimi, kimi-cli)")
+    found_path = _resolve_kimi_binary()
+    _dlog(f"_check_kimi_cli resolved to: {found_path!r}")
     if not found_path:
         return KimiCliCheck(
             found=False,
@@ -1831,19 +1987,24 @@ def _collect_soft_diagnostics(
 
 
 def _register_claude_plugin() -> InstallError | None:
+    _dlog(f"_register_claude_plugin: probing for {CLAUDE_PLUGIN_BINARY!r}")
     claude = shutil.which(CLAUDE_PLUGIN_BINARY)
+    _dlog_which(CLAUDE_PLUGIN_BINARY, claude)
     if not claude:
         return _plugin_registration_error("`claude` was not found on PATH.")
 
+    argv = [claude, "plugin", "install", "JonathanRosado/claude-anyteam"]
     try:
         completed = subprocess.run(
-            [claude, "plugin", "install", "JonathanRosado/claude-anyteam"],
+            argv,
             capture_output=True,
             text=True,
             timeout=CLAUDE_PLUGIN_INSTALL_TIMEOUT_S,
             check=False,
         )
+        _dlog_sub(argv, completed, label="plugin-install")
     except (OSError, subprocess.SubprocessError) as exc:
+        _dlog(f"plugin install exception: {type(exc).__name__}: {exc}")
         return _plugin_registration_error(f"{type(exc).__name__}: {exc}")
 
     if completed.returncode == 0:
@@ -2217,7 +2378,7 @@ def install(
 
     if not prereq.found:
         message = (
-            "claude-anyteam requires a terminal multiplexer on PATH; none was found.\n"
+            "claude-anyteam requires a terminal multiplexer called tmux (a tool that lets Claude Code show helper teammates in panes), and none was found on PATH.\n"
             "Install one of:\n"
             f"{_install_instructions(prereq.platform)}\n"
             "After installing, re-run `claude-anyteam install`."
@@ -2234,7 +2395,7 @@ def install(
         raise InstallError(
             title="A required terminal tool is missing",
             explanation=(
-                "claude-anyteam needs tmux on Linux/macOS so teammates can appear in Claude Code panes."
+                "claude-anyteam needs tmux on Linux/macOS. tmux is a terminal tool that lets teammates appear in Claude Code panes."
             ),
             action=f"Install tmux for your OS, then run `claude-anyteam install` again.\n{_install_instructions(prereq.platform)}",
             severity="blocker",
@@ -2722,9 +2883,10 @@ def _format_provider_status_table(
 def _format_no_provider_explainer() -> str:
     return "\n".join(
         [
-            "claude-anyteam routes some Claude Code teammates to external AI CLIs (Codex, Gemini, Kimi).",
-            "You need at least one signed-in CLI for it to do anything useful.",
-            "Pick whichever you have access to.",
+            "claude-anyteam lets Claude Code start helper teammates through provider apps: Codex, Gemini, or Kimi.",
+            "A provider app is a command-line app (a tool you run from Terminal or PowerShell).",
+            "You need at least one provider app installed and signed in before teammates can do useful work.",
+            "Pick whichever provider you have access to; you do not need all three.",
         ]
     )
 
@@ -2818,11 +2980,121 @@ def _format_provider_walkthroughs(
     return "\n\n".join(blocks)
 
 
+def _signin_command(provider_key: str) -> tuple[str, str | None]:
+    """Returns (command, optional alternative hint) for the sign-in step."""
+    if provider_key == "codex":
+        return (f"{CODEX_CLI_BINARY}", "opens an OAuth flow on first run")
+    if provider_key == "gemini":
+        return (f"{GEMINI_CLI_BINARY}", "or set GEMINI_API_KEY / configure Vertex")
+    if provider_key == "kimi":
+        return (f"{KIMI_CLI_BINARY} login", None)
+    return (provider_key, None)
+
+
+def _install_command_for_provider(provider_key: str) -> tuple[str, str | None] | None:
+    """Returns (command, optional hint) for installing a missing provider CLI."""
+    if provider_key == "codex":
+        return (CODEX_CLI_INSTALL_COMMAND, None)
+    if provider_key == "gemini":
+        return (GEMINI_CLI_INSTALL_COMMAND, None)
+    if provider_key == "kimi":
+        return (KIMI_CLI_INSTALL_COMMAND, "or: " + KIMI_CLI_CURL_INSTALL_COMMAND)
+    return None
+
+
+def _format_action_required_cta(
+    statuses: tuple[ProviderStatus, ...] | list[ProviderStatus],
+) -> str:
+    """Big, prominent box at the very end of install output listing every
+    action the user needs to take before they can use each teammate. Covers:
+
+    - MISSING providers (declined install or install failed): show install +
+      sign-in commands so they can finish setup later.
+    - NEEDS_SIGNIN providers (installed but not authenticated): show the
+      one-command sign-in.
+    - NEEDS_UPGRADE (have an older version than required): show the upgrade
+      command.
+
+    Skipped entirely when every provider is READY — no noise for users who
+    are fully set up. Plain-text fallback for non-color terminals + tests.
+    """
+    pending = [s for s in statuses if s.state in ("MISSING", "NEEDS_SIGNIN", "NEEDS_UPGRADE")]
+    if not pending:
+        return ""
+    theme = get_theme()
+
+    def _provider_block_themed(status: ProviderStatus) -> list[str]:
+        lines: list[str] = []
+        if status.state == "MISSING":
+            lines.append(f"{theme.symbols['info']} {theme.heading(status.display_name)} {theme.muted('— not installed')}")
+            install = _install_command_for_provider(status.provider_key)
+            if install is not None:
+                cmd, install_hint = install
+                lines.append(f"  {theme.symbols['arrow']} {theme.muted('Install:')} {theme.accent(cmd)}")
+                if install_hint:
+                    lines.append(f"    {theme.muted(install_hint)}")
+            signin_cmd, signin_hint = _signin_command(status.provider_key)
+            lines.append(f"  {theme.symbols['arrow']} {theme.muted('Then sign in:')} {theme.accent(signin_cmd)}")
+            if signin_hint:
+                lines.append(f"    {theme.muted(f'({signin_hint})')}")
+        elif status.state == "NEEDS_SIGNIN":
+            signin_cmd, signin_hint = _signin_command(status.provider_key)
+            lines.append(f"{theme.symbols['info']} {theme.heading(status.display_name)} {theme.muted('— signed in: no')}")
+            lines.append(f"  {theme.symbols['arrow']} {theme.muted('Run:')} {theme.accent(signin_cmd)}")
+            if signin_hint:
+                lines.append(f"    {theme.muted(f'({signin_hint})')}")
+        elif status.state == "NEEDS_UPGRADE":
+            install = _install_command_for_provider(status.provider_key)
+            current = f"have {status.version}" if status.version else "version too old"
+            lines.append(f"{theme.symbols['warn']} {theme.heading(status.display_name)} {theme.muted(f'— upgrade needed ({current})')}")
+            if install is not None:
+                cmd, _ = install
+                lines.append(f"  {theme.symbols['arrow']} {theme.muted('Upgrade:')} {theme.accent(cmd)}")
+        return lines
+
+    if theme.color:
+        body: list[str] = []
+        for idx, status in enumerate(pending):
+            if idx > 0:
+                body.append("")
+            body.extend(_provider_block_themed(status))
+        body.append("")
+        body.append(f"{theme.symbols['warn']} {theme.warn('Then restart Claude Code')} {theme.muted('so the new state is picked up.')}")
+        return render_box(theme.heading("Action required to start using your teammates"), body, "magenta", theme=theme)
+
+    # Plain-text fallback.
+    lines = ["Action required to start using your teammates:", ""]
+    for status in pending:
+        lines.append(f"  {status.display_name}:")
+        if status.state == "MISSING":
+            install = _install_command_for_provider(status.provider_key)
+            if install is not None:
+                cmd, install_hint = install
+                lines.append(f"    Install: {cmd}")
+                if install_hint:
+                    lines.append(f"      {install_hint}")
+            signin_cmd, signin_hint = _signin_command(status.provider_key)
+            suffix = f"  ({signin_hint})" if signin_hint else ""
+            lines.append(f"    Then sign in: {signin_cmd}{suffix}")
+        elif status.state == "NEEDS_SIGNIN":
+            signin_cmd, signin_hint = _signin_command(status.provider_key)
+            suffix = f"  ({signin_hint})" if signin_hint else ""
+            lines.append(f"    Run: {signin_cmd}{suffix}")
+        elif status.state == "NEEDS_UPGRADE":
+            install = _install_command_for_provider(status.provider_key)
+            if install is not None:
+                cmd, _ = install
+                lines.append(f"    Upgrade: {cmd}")
+        lines.append("")
+    lines.append("Then restart Claude Code so the new state is picked up.")
+    return "\n".join(lines)
+
+
 def _format_no_provider_refusal_message() -> str:
     return (
         "Refusing to install — no provider is ready.\n"
         "  Follow the steps above, then re-run `claude-anyteam install`.\n\n"
-        "  Setting up later? Pass --force-empty to install with no provider ready:\n"
+        "  Want to set up the provider later? Pass --force-empty to install the wiring now:\n"
         "    claude-anyteam install --force-empty"
     )
 
@@ -2842,7 +3114,7 @@ def _format_provider_preamble(
         blocks.append(walkthrough)
     if force_empty and no_provider_ready:
         blocks.append(
-            "Proceeding with --force-empty: claude-anyteam is installed but inert until a CLI is ready."
+            "Proceeding with --force-empty: claude-anyteam is installed, but teammates will wait until a provider app is installed and signed in."
         )
     return "\n\n".join(blocks)
 
@@ -2862,14 +3134,52 @@ def _format_no_provider_ready_message(
 
 
 def _format_soft_diagnostic(diagnostic: InstallError) -> str:
-    return "\n".join(
-        [
-            f"Warning: {diagnostic.title}",
-            diagnostic.explanation,
-            f"Next step: {diagnostic.action}",
-            f"Severity: {diagnostic.severity}",
-        ]
+    raw_error = diagnostic.as_plain_text(include_details=True, include_report=False)
+    issue_url = build_issue_url(title=diagnostic.title, raw_error=raw_error)
+    diagnostic_lines = format_installer_diagnostic(
+        summary=diagnostic.explanation,
+        raw_error=raw_error,
+        next_steps_per_os=diagnostic.action,
+        title=diagnostic.title,
+        include_what_happened=False,
     )
+    # Strip the inline "Still stuck? Report it: <giant-url>" tail — we'll
+    # print the URL on its own line AFTER the box so it doesn't word-wrap
+    # into 17 ugly lines and so terminal link parsers see the URL whole.
+    body_without_url: list[str] = []
+    skip_url_line = False
+    for line in diagnostic_lines:
+        if line.strip() == "Still stuck? Report it:":
+            skip_url_line = True
+            continue
+        if skip_url_line and line.strip().startswith("http"):
+            skip_url_line = False
+            continue
+        body_without_url.append(line)
+
+    plain_lines = [
+        f"Warning: {diagnostic.title}",
+        diagnostic.explanation,
+        *body_without_url,
+        f"Severity: {diagnostic.severity}",
+    ]
+    if diagnostic.details:
+        plain_lines.append("Raw details (for debugging):")
+        plain_lines.extend(f"  {line}" for line in diagnostic.details.splitlines())
+
+    theme = get_theme()
+    if theme.color:
+        body = [theme.muted(line) if line.startswith(("Severity:", "Raw details")) or line.startswith("  ")
+                else theme.heading(line) if line == diagnostic.explanation
+                else line
+                for line in plain_lines[1:]]
+        boxed = render_box(theme.warn(f"Warning: {diagnostic.title}"), body, "yellow", theme=theme)
+        # URL on its own line — most terminals (Windows Terminal, iTerm2,
+        # gnome-terminal) make single-line URLs clickable. Inside a box, the
+        # word-wrap kills clickability AND visual weight.
+        report_line = f"\n{theme.symbols['info']} {theme.muted('Open in browser to report:')}\n  {theme.accent(issue_url)}"
+        return f"{boxed}{report_line}"
+    return "\n".join([*plain_lines, "", "Open in browser to report:", f"  {issue_url}"])
 
 
 def format_install_message(result: InstallResult, *, include_provider_status: bool = True) -> str:
@@ -2938,7 +3248,35 @@ def format_install_message(result: InstallResult, *, include_provider_status: bo
     receipt_lines.append("Restart Claude Code for the changes to take effect. Use codex-*, gemini-*, or kimi-* teammate names to route to the matching backend.")
     if not result.changed_anything:
         receipt_lines.insert(1, "The existing settings already matched this install.")
-    lines.append("\n".join(receipt_lines))
+
+    # Beautify at display time when color is supported. theme.color is True
+    # whenever the npm wrapper, FORCE_COLOR, terminal env signals, OR isatty
+    # indicate a real terminal — see _theme._supports_color for the cascade.
+    # Tests capture without those signals so substring assertions still work.
+    theme = get_theme()
+    if theme.color:
+        themed_lines = []
+        for line in receipt_lines:
+            if line.startswith("Updated ") or line.startswith("Set ") or line.startswith("Removed "):
+                themed_lines.append(f"{theme.symbols['success']} {line}")
+            elif line.startswith("Restart Claude Code"):
+                themed_lines.append("")
+                themed_lines.append(f"{theme.symbols['warn']} {theme.warn(line)}")
+            elif "already" in line and "no change" in line:
+                themed_lines.append(f"{theme.symbols['info']} {theme.muted(line)}")
+            elif line.startswith("Permission allowlist written"):
+                themed_lines.append(f"{theme.symbols['success']} {line}")
+            else:
+                themed_lines.append(f"{theme.symbols['info']} {line}")
+        lines.append(render_box(theme.success("Setup applied"), themed_lines, "green", theme=theme))
+    else:
+        lines.append("\n".join(receipt_lines))
+
+    # Final CTA: if any installed providers still need sign-in, render a big
+    # action-required box AT THE BOTTOM so the user can't miss the next step.
+    cta = _format_action_required_cta((codex_status, gemini_status, kimi_status))
+    if cta:
+        lines.append(cta)
     return "\n\n".join(lines)
 
 

@@ -2,9 +2,9 @@
 
 All notable changes to claude-anyteam are documented here. Format follows [Keep a Changelog](https://keepachangelog.com/en/1.1.0/) and the project uses [Semantic Versioning](https://semver.org/).
 
-## [0.7.0] — 2026-04-29
+## [0.8.0] — 2026-04-29
 
-The protocol-revision drop. Substrate hardening across the three north stars (`CLAUDE.md` §1 harness preservation, §2 visibility parity, §3 peer efficiency), measured against the S6/S7/S8/S5 cross-backend stress harness and validated head-to-head against a native-Claude pair (S6n).
+The protocol-revision drop. Substrate hardening across the three north stars (`CLAUDE.md` §1 harness preservation, §2 visibility parity, §3 peer efficiency), measured against the S6/S7/S8/S5 cross-backend stress harness and validated head-to-head against a native-Claude pair (S6n). Bumped to **0.8.0** because main shipped 0.7.2-0.7.11 (installer hardening, CTA polish) while this proto-rev branch was open; the protocol-revision is a major-style change relative to the 0.7.x patch series.
 
 Headline numbers (post-fix, integration HEAD `294eb24`):
 
@@ -56,4 +56,4 @@ Headline numbers (post-fix, integration HEAD `294eb24`):
 
 - **M13 native-Claude false positives** (#3 night-shift task; commit `9310c44`): Diagnosed the 4 S2 collisions as native-Claude schema preambles being mis-flagged as prose-fallback collisions. Fix in `tools/stress/score_collab.py` (narrow guard for archived schema-preamble outputs) + `src/claude_anyteam/backends/claude_native/invoke.py` (recovery path for embedded schema JSON in prose-preambled output). Re-scoring S2 with the guard drops M13 from 4 → 0 (collision rate 0.0). Suite 1055 → 1058 with regression coverage.
 
-[0.7.0]: https://github.com/JonathanRosado/claude-anyteam/pull/27
+[0.8.0]: https://github.com/JonathanRosado/claude-anyteam/pull/27
