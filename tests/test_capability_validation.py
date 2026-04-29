@@ -14,6 +14,7 @@ from claude_anyteam import capabilities as cap_mod
 from claude_anyteam.capabilities import (
     CAPABILITY_HOOKS,
     CAPABILITY_NAMES,
+    CLAUDE_NATIVE_HEADLESS_CAPABILITIES,
     CODEX_APP_SERVER_CAPABILITIES,
     CODEX_EXEC_CAPABILITIES,
     GEMINI_ACP_CAPABILITIES,
@@ -43,6 +44,7 @@ def _declared_backend_capabilities() -> set[str]:
         GEMINI_ACP_CAPABILITIES,
         GEMINI_HEADLESS_CAPABILITIES,
         KIMI_HEADLESS_CAPABILITIES,
+        CLAUDE_NATIVE_HEADLESS_CAPABILITIES,
     ):
         declared.update(flags)
     return declared

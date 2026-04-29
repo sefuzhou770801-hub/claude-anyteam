@@ -81,6 +81,14 @@ KIMI_HEADLESS_CAPABILITIES = [
     "large_context",
 ]
 
+CLAUDE_NATIVE_HEADLESS_CAPABILITIES = [
+    "headless_invocation",
+    "structured_output",
+    "live_tool_events",
+    "native_skills",
+    "large_context",
+]
+
 CAPABILITY_MANIFEST_SCHEMA_VERSION = 1
 CAPABILITY_MANIFEST_VERSION = "2"
 
@@ -157,10 +165,12 @@ CAPABILITY_HOOKS: dict[str, CapabilityRuntimeHook] = {
         runtime_paths=(
             "claude_anyteam.codex:_visibility_for_app_server_item",
             "claude_anyteam.headless_visibility:HeadlessTurnVisibility",
+            "claude_anyteam.backends.claude_native.invoke:_parse_stdout",
             "claude_anyteam.wrapper_server:build_server",
         ),
         test_paths=(
             "tests/test_visibility_events.py::test_app_server_command_execution_writes_tool_event_to_event_log_and_active_form",
+            "tests/test_claude_native_backend.py::test_parse_stdout_synthesizes_anyteam_mcp_tool_events",
             "tests/test_wrapper_contract.py::test_exposed_tool_handlers_are_instrumented",
         ),
         note="Host-tool activity is normalized into visibility envelopes.",
@@ -172,6 +182,7 @@ CAPABILITY_HOOKS: dict[str, CapabilityRuntimeHook] = {
             "claude_anyteam.backends.gemini.invoke:run",
             "claude_anyteam.backends.gemini.acp:run",
             "claude_anyteam.backends.kimi.invoke:run",
+            "claude_anyteam.backends.claude_native.invoke:run",
         ),
         test_paths=(
             "tests/test_schema_validation.py::test_valid_output_parses_and_returns_dict",
@@ -179,6 +190,7 @@ CAPABILITY_HOOKS: dict[str, CapabilityRuntimeHook] = {
             "tests/test_gemini_invoke.py::test_run_parses_stream_json_and_validates_schema",
             "tests/test_gemini_acp_prompt_flow.py::test_acp_run_structured_result_and_state",
             "tests/test_kimi_invoke.py::test_run_exit_zero_success_captures_session_id_and_state",
+            "tests/test_claude_native_backend.py::test_invoke_run_accepts_native_preamble_before_schema_json",
         ),
         note="Task completion output is schema-constrained and Python-validated.",
     ),
@@ -187,11 +199,13 @@ CAPABILITY_HOOKS: dict[str, CapabilityRuntimeHook] = {
             "claude_anyteam.codex:run",
             "claude_anyteam.backends.gemini.invoke:run",
             "claude_anyteam.backends.kimi.invoke:run",
+            "claude_anyteam.backends.claude_native.invoke:run",
         ),
         test_paths=(
             "tests/test_codex_invocation_shape.py::test_fresh_exec_still_includes_schema_and_cwd",
             "tests/test_gemini_invoke.py::test_run_parses_stream_json_and_validates_schema",
             "tests/test_kimi_invocation_shape.py::test_fresh_argv_uses_print_stream_json_model_and_prompt",
+            "tests/test_claude_native_backend.py::test_invoke_run_builds_claude_print_stream_json_argv",
         ),
         note="Non-App-Server backends run noninteractive CLI turns with machine-readable output.",
     ),
@@ -222,7 +236,7 @@ CAPABILITY_HOOKS: dict[str, CapabilityRuntimeHook] = {
             "tests/test_gemini_plan_approval.py::test_gemini_plan_send_crash_is_logged_not_raised",
             "tests/test_kimi_plan_approval.py::test_plan_prompt_does_not_invoke_kimi_plan_flag_anywhere",
         ),
-        note="All routed backends can participate in opt-in structured plan approval.",
+        note="Backends declaring plan_mode can participate in opt-in structured plan approval.",
     ),
     "trust_modes": CapabilityRuntimeHook(
         runtime_paths=(
@@ -240,23 +254,31 @@ CAPABILITY_HOOKS: dict[str, CapabilityRuntimeHook] = {
         runtime_paths=(
             "claude_anyteam.backends.kimi.invoke:run",
             "claude_anyteam.backends.kimi.config:KimiSettings",
+            "claude_anyteam.backends.claude_native.invoke:run",
+            "claude_anyteam.backends.claude_native.loop:_backend_metadata",
         ),
         test_paths=(
             "tests/test_kimi_invocation_shape.py::test_default_invocation_preserves_kimi_native_skill_discovery",
             "tests/test_capability_declarations.py::test_kimi_headless_backend_metadata_declares_native_skills",
+            "tests/test_capability_declarations.py::test_claude_native_backend_metadata_declares_native_tool_surface",
         ),
-        note="Kimi v1 preserves Kimi-native skill discovery by not overriding --skills-dir.",
+        note=(
+            "Backend-native skill/tool discovery stays inside the routed harness "
+            "(Kimi skills or Claude Code Skill/Task tools), not anyteam."
+        ),
     ),
     "large_context": CapabilityRuntimeHook(
         runtime_paths=(
             "claude_anyteam.backends.kimi.invoke:run",
             "claude_anyteam.backends.kimi.loop:_backend_metadata",
+            "claude_anyteam.backends.claude_native.loop:_backend_metadata",
         ),
         test_paths=(
             "tests/test_kimi_invocation_shape.py::test_fresh_argv_uses_print_stream_json_model_and_prompt",
             "tests/test_capability_declarations.py::test_kimi_headless_backend_metadata_declares_large_context_and_native_skills",
+            "tests/test_capability_declarations.py::test_claude_native_backend_metadata_declares_native_tool_surface",
         ),
-        note="Kimi is the routed large-context backend; the adapter invokes the Kimi CLI directly.",
+        note="Kimi and native Claude expose large-context routed harnesses through their native CLIs.",
     ),
     "accepts_peer_steer": CapabilityRuntimeHook(
         runtime_paths=(
@@ -390,7 +412,7 @@ _BASE_CAPABILITY_MANIFEST: dict[str, dict[str, Any]] = {
             "properties": {
                 "mode": {
                     "type": "string",
-                    "enum": ["codex_exec", "gemini_headless", "kimi_headless"],
+                    "enum": ["codex_exec", "gemini_headless", "kimi_headless", "claude_native"],
                 },
                 "machine_output": {"type": "boolean", "const": True},
             },
@@ -513,23 +535,23 @@ _BASE_CAPABILITY_MANIFEST: dict[str, dict[str, Any]] = {
             "properties": {
                 "discovery": {
                     "type": "string",
-                    "enum": ["kimi_default"],
+                    "enum": ["backend_default", "kimi_default", "claude_code_default"],
                 },
                 "overrides_skills_dir": {"type": "boolean", "const": False},
             },
         },
         "description": (
-            "Preserve Kimi-native project/user/built-in skill discovery inside "
-            "the Kimi teammate."
+            "Preserve backend-native skill/tool discovery inside the routed "
+            "teammate instead of re-implementing it in anyteam."
         ),
         "when_to_use": (
-            "Route large-context or workflow-rich tasks to Kimi when its native "
-            "skills may help and you do not need to enumerate/invoke those "
-            "skills through anyteam."
+            "Route workflow-rich tasks to this teammate when Kimi-native skills "
+            "or Claude Code's Skill/Task tools may help and peers do not need to "
+            "enumerate or invoke those skills through anyteam."
         ),
         "when_not_to": (
-            "Do not assume peers can list or call Kimi skills directly in v1; "
-            "the root Kimi session owns discovery and selection."
+            "Do not assume peers can list or call backend-native skills directly "
+            "through anyteam; the root backend session owns discovery and selection."
         ),
         "failure_modes": [
             "SKILL_DISCOVERY_CHANGED_UPSTREAM",

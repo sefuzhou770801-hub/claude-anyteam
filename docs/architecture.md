@@ -6,7 +6,7 @@ claude-anyteam is a protocol adapter, not an LLM wrapper. It lets external codin
 
 This is the architectural choice the rest of the design follows from, and it is also the moat. See [CLAUDE.md §1](../CLAUDE.md) for the full north-star statement.
 
-A `codex-*` teammate does not run an LLM that "acts like Codex." It IS the Codex CLI process — full tool surface, App Server `turn/steer` mid-task injection and `thread/fork` cross-task memory, OpenAI's prompt tuning for the specific model slug, Codex's own approval/sandbox/working-directory semantics. Same for `gemini-*` (ACP transport, mid-turn permission bridge, Google's prompt tuning), `kimi-*` (native skills / swarm primitives, large-context behavior, Moonshot's prompt tuning), and any future `glm-*` / `deepseek-*` / `qwen-*` adapter.
+A `codex-*` teammate does not run an LLM that "acts like Codex." It IS the Codex CLI process — full tool surface, App Server `turn/steer` mid-task injection and `thread/fork` cross-task memory, OpenAI's prompt tuning for the specific model slug, Codex's own approval/sandbox/working-directory semantics. Same for `gemini-*` (ACP transport, mid-turn permission bridge, Google's prompt tuning), `kimi-*` (native skills / swarm primitives, large-context behavior, Moonshot's prompt tuning), native-Claude stress teammates (Claude Code's own Task/Skill/WebFetch/Read/Edit/Write/Bash surface), and any future `glm-*` / `deepseek-*` / `qwen-*` adapter.
 
 What this means in practice:
 
@@ -17,7 +17,7 @@ What this means in practice:
 This implies two distinct protocol layers — see [CLAUDE.md §1 "The two layers"](../CLAUDE.md) for the canonical statement:
 
 - **Transport** is the file-based Agent Teams contract everyone speaks (mailbox, tasks, lifecycle, locks). Universal; table stakes.
-- **Capability** is per-harness: identity declaration, typed capability inventory (`turn_steer`, `thread_fork`, `permission_bridge`, `live_tool_events`, `large_context`, `native_swarm`, …), invocation schemas, and semantic guidance (when to use, when not to, failure modes). Lightweight flags live in `config.json` for roster discovery; the rich manifest is exposed via the wrapper MCP and loaded into peer context on demand — same precedent that already works for MCP tool descriptions, extended one level up.
+- **Capability** is per-harness: identity declaration, typed capability inventory (`turn_steer`, `thread_fork`, `permission_bridge`, `live_tool_events`, `large_context`, `native_skills`, …), invocation schemas, and semantic guidance (when to use, when not to, failure modes). Lightweight flags live in `config.json` for roster discovery; the rich manifest is exposed via the wrapper MCP and loaded into peer context on demand — same precedent that already works for MCP tool descriptions, extended one level up.
 
 The router-style alternative (proxy `ANTHROPIC_BASE_URL`, route through a single session loop, expose multiple models from one harness) loses every harness-specific feature: no Codex App Server, no Gemini ACP permission bridge, no Kimi swarm. It also has no capability layer at all — every teammate gets the host's tool surface, period. To match the claude-anyteam differentiator a router would have to throw out its session loop and rebuild around external process orchestration; at that point it is no longer a router.
 
@@ -27,7 +27,7 @@ The 2026-04-28 closure set adds concrete substrate primitives that operationaliz
 
 ### §1 Harness-preserving capability substrate
 
-**Startup capability-manifest prewarm and bounded supervisor.** Every routed teammate writes a rich Agent Card at registration and broadcasts `capability_manifest_updated` before peers try to invoke harness-specific primitives (`src/claude_anyteam/registration.py:224-239`). Codex, Gemini, Kimi, and the wrapper MCP all call `CapabilityManifestCache.load_startup()` before normal inbox/tool handling (`src/claude_anyteam/loop.py:171-179`, `src/claude_anyteam/backends/gemini/loop.py:127-137`, `src/claude_anyteam/backends/kimi/loop.py:94-104`, `src/claude_anyteam/wrapper_server.py:582-587`), and the cache loader walks the roster through bounded `ThreadPoolExecutor` fan-out with per-manifest timeouts (`src/claude_anyteam/capability_manifest.py:204-220`, `src/claude_anyteam/capability_manifest.py:241-317`, `src/claude_anyteam/capability_manifest.py:522-554`). Matrix lifts **L2** and **L10**; source pattern: HydraTeams' pre-hydrated control context plus maorinka-claude-rs' bounded supervisor/channel prewarm, with clawcode's per-call MCP startup called out as the counterexample.
+**Startup capability-manifest prewarm and bounded supervisor.** Every routed teammate writes a rich Agent Card at registration and broadcasts `capability_manifest_updated` before peers try to invoke harness-specific primitives (`src/claude_anyteam/registration.py:224-239`). Codex, Gemini, Kimi, native Claude, and the wrapper MCP all call `CapabilityManifestCache.load_startup()` before normal inbox/tool handling (`src/claude_anyteam/loop.py:171-179`, `src/claude_anyteam/backends/gemini/loop.py:127-137`, `src/claude_anyteam/backends/kimi/loop.py:94-104`, `src/claude_anyteam/backends/claude_native/loop.py:76-80`, `src/claude_anyteam/wrapper_server.py:582-587`), and the cache loader walks the roster through bounded `ThreadPoolExecutor` fan-out with per-manifest timeouts (`src/claude_anyteam/capability_manifest.py:204-220`, `src/claude_anyteam/capability_manifest.py:241-317`, `src/claude_anyteam/capability_manifest.py:522-554`). Matrix lifts **L2** and **L10**; source pattern: HydraTeams' pre-hydrated control context plus maorinka-claude-rs' bounded supervisor/channel prewarm, with clawcode's per-call MCP startup called out as the counterexample.
 
 **`read_config()` protocol-tool enumeration.** The wrapper exposes a self-healing `protocol_tools` object that computes the exact callable names for the caller's backend, including Gemini's `mcp_anyteam_*` prefix, and embeds direct entries for `send_message`, `read_config`, and capability lookup (`src/claude_anyteam/wrapper_server.py:231-270`). The `read_config()` MCP tool attaches that object to the sanitized team roster so a model can verify the protocol surface instead of hallucinating missing tools (`src/claude_anyteam/wrapper_server.py:1666-1692`). Matrix lift **L11**; source pattern: Piebald's ToolSearch/load-then-call and “look before assert” prompt pattern.
 
@@ -49,7 +49,7 @@ The 2026-04-28 closure set adds concrete substrate primitives that operationaliz
 
 ### §3 Peer-efficiency substrate
 
-**Event-driven `WatchInbox`.** The control loops no longer pay a fixed poll sleep after every empty drain: `WatchInbox` watches the current teammate's inbox basename, wakes on file changes, and falls back to bounded sleep when the watcher is unavailable (`src/claude_anyteam/watch_inbox.py:47-87`, `src/claude_anyteam/watch_inbox.py:116-193`). Codex, Gemini, and Kimi loops all install the watcher and use adaptive active/idle waits at the loop boundary (`src/claude_anyteam/loop.py:237-285`, `src/claude_anyteam/backends/gemini/loop.py:296-329`, `src/claude_anyteam/backends/kimi/loop.py:252-286`). Matrix lift **L1**; source pattern: aproto-codex-bridge's `fs.watch` plus active/fallback polling, with maorinka-claude-rs' evented supervisor shape as the durability model.
+**Event-driven `WatchInbox`.** The control loops no longer pay a fixed poll sleep after every empty drain: `WatchInbox` watches the current teammate's inbox basename, wakes on file changes, and falls back to bounded sleep when the watcher is unavailable (`src/claude_anyteam/watch_inbox.py:47-87`, `src/claude_anyteam/watch_inbox.py:116-193`). Codex, Gemini, Kimi, and native-Claude loops all install the watcher and use adaptive active/idle waits at the loop boundary (`src/claude_anyteam/loop.py:237-285`, `src/claude_anyteam/backends/gemini/loop.py:296-329`, `src/claude_anyteam/backends/kimi/loop.py:252-286`, `src/claude_anyteam/backends/claude_native/loop.py:139-175`). Matrix lift **L1**; source pattern: aproto-codex-bridge's `fs.watch` plus active/fallback polling, with maorinka-claude-rs' evented supervisor shape as the durability model.
 
 **Per-target `BatchedSender` and `append_messages_batch()`.** High-volume fan-out can opt into a per-recipient buffer with a 50ms debounce (`DEFAULT_DEBOUNCE_S = 0.05`) and explicit `flush()`/`close()` hooks (`src/claude_teams/messaging.py:340-430`). The underlying `append_messages_batch()` performs one locked read-modify-write for N messages and still applies the attachment spill contract independently to each row (`src/claude_teams/messaging.py:295-337`). Matrix lift **L6**; source pattern: aproto-codex-bridge's MessageRouter per-target debounce and CAS writer, adapted to the file-lock JSON inbox substrate.
 
@@ -100,11 +100,12 @@ claude-anyteam speaks the contract directly. It reads your inbox, claims tasks, 
 │  • Codex: app-server or exec resume     │
 │  • Gemini: headless stream-json CLI     │
 │  • Kimi: headless stream-json CLI       │
+│  • Claude: native headless stream-json  │
 │  • shared MCP wrapper for team tools    │
 └─────────────────────────────────────────┘
 ```
 
-Each layer has one job. The shim is a dispatcher. The adapter is the protocol implementation. Codex, Gemini, or Kimi handles the backend reasoning based on the teammate name prefix.
+Each layer has one job. The shim is a dispatcher. The adapter is the protocol implementation. Codex, Gemini, Kimi, or native Claude handles the backend reasoning based on the teammate name prefix or stress member type.
 
 ## Backend invocation paths
 
@@ -135,6 +136,12 @@ Kimi v1 intentionally does not use ACP or a Codex App Server equivalent. Limitat
 - Kimi stream-json is per-message NDJSON (`assistant` / `tool`) rather than Codex or Gemini event taxonomies
 - MCP tools are addressed by their bare declared names (`send_message`, `task_update`), not Gemini-style `mcp_anyteam_*` names
 
+### Native Claude path (headless stream-json for stress baselines)
+
+Native-Claude stress teammates run through Claude Code itself in print mode: `claude --print --verbose --output-format stream-json --mcp-config <adapter-owned-wrapper> --strict-mcp-config -p ...`. The adapter keeps protocol I/O visible to the stress harness while preserving Claude Code's own Task, Skill, WebFetch, Read, Edit, Write, Bash, and prompt-tuning surface inside the headless turn.
+
+Native Claude is deliberately loose-coupled in this adapter: it exposes headless invocation, structured output, live tool-event visibility, native skills/tools, and large context, but it does **not** currently advertise cross-task `session_resume`, `plan_mode`, or peer `turn_steer` because the control loop starts fresh task sessions and does not implement those protocol handlers.
+
 ## How teammates become visible
 
 The TUI presence line (`@main @codex-alice @gemini-bob @kimi-cora`) renders from the leader's in-memory state, not from `config.json`. That state is only populated when Claude Code's own spawn flow is what launched the teammate.
@@ -153,12 +160,12 @@ Both pieces (leader mirror + adapter entry) are required. The shim enables step 
 1. Lead creates a task via Claude Code's task list
 2. Adapter picks it up in its event-driven inbox/task loop (with polling fallback)
 3. Adapter claims it via compare-and-set under a file lock
-4. Adapter sends the task description to the selected backend: Codex via App Server or fresh `codex exec`; Gemini via ACP or headless `gemini --prompt ... --output-format stream-json`; Kimi via headless `kimi --print --output-format stream-json`
+4. Adapter sends the task description to the selected backend: Codex via App Server or fresh `codex exec`; Gemini via ACP or headless `gemini --prompt ... --output-format stream-json`; Kimi via headless `kimi --print --output-format stream-json`; native Claude via headless `claude --print --output-format stream-json`
 5. The backend executes: reads files, writes files, runs commands, calls wrapper MCP tools to update task status / send messages to peers
 6. Task completes; adapter writes `task_complete` to lead's inbox
-7. Codex App Server teammates can incorporate peer messages mid-execution via `turn/steer`; Gemini and Kimi teammates currently receive peer messages on the next poll / prompt boundary rather than live App Server steering.
+7. Codex App Server teammates can incorporate peer messages mid-execution via `turn/steer`; Gemini, Kimi, and native-Claude teammates currently receive peer messages on the next poll / prompt boundary rather than live App Server steering.
 
-The wrapper MCP server exposes a narrowed protocol surface to external backends: core team tools (`send_message`, `task_update`, `task_create`, `task_batch_summary`, `read_inbox`, `task_list`, `read_config`), rich capability lookup (`mcp_anyteam_capability_manifest`), and non-destructive shadow helpers for filesystem/search/web access. Destructive tools like `team_delete` and `force_kill_teammate` are deliberately blocked — Codex, Gemini, or Kimi has full coding access but cannot break the team.
+The wrapper MCP server exposes a narrowed protocol surface to external backends: core team tools (`send_message`, `task_update`, `task_create`, `task_batch_summary`, `read_inbox`, `task_list`, `read_config`), rich capability lookup (`mcp_anyteam_capability_manifest`), and shadow helpers for filesystem/search/web access. Destructive team-control tools like `team_delete` and `force_kill_teammate` are deliberately blocked — Codex, Gemini, Kimi, or native Claude has full coding access but cannot break the team.
 
 ## Extending to new models
 

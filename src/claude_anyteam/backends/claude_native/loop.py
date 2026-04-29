@@ -7,7 +7,6 @@ LLM wrapper.
 """
 from __future__ import annotations
 
-import json
 import os
 import signal
 import time
@@ -17,10 +16,11 @@ from typing import Any
 from claude_anyteam import logger, protocol_io as pio
 from claude_anyteam.capability_manifest import CapabilityManifestCache
 from claude_anyteam.capabilities import (
-    KIMI_HEADLESS_CAPABILITIES,
+    CLAUDE_NATIVE_HEADLESS_CAPABILITIES,
     assert_known_capabilities,
     rich_capability_manifest,
 )
+from claude_anyteam.codex import TASK_COMPLETE_SCHEMA
 from claude_anyteam.messages import CapabilityManifestUpdatedIn, ShutdownRequestIn, parse_protocol_text
 from claude_anyteam.registration import BackendMetadata, deregister, register
 from claude_anyteam.schema_validation import inline_schema_prompt_fragment, load_schema
@@ -43,7 +43,8 @@ class ClaudeNativeLoopState:
 
 
 def _backend_metadata(settings: ClaudeNativeSettings) -> BackendMetadata:
-    capabilities = assert_known_capabilities(KIMI_HEADLESS_CAPABILITIES)
+    capabilities = assert_known_capabilities(CLAUDE_NATIVE_HEADLESS_CAPABILITIES)
+    host_tool_surface = "claude-code-native(Task,Skill,WebFetch,Read,Edit,Write,Bash)+mcp_anyteam"
     return BackendMetadata(
         agent_type="claude",
         model=settings.model or "sonnet",
@@ -56,10 +57,10 @@ def _backend_metadata(settings: ClaudeNativeSettings) -> BackendMetadata:
         capabilities=capabilities,
         capability_manifest=rich_capability_manifest(
             capabilities,
-            host_tool_surface="claude-code+mcp_anyteam",
+            host_tool_surface=host_tool_surface,
         ),
         transport="claude-native-headless",
-        host_tool_surface="claude-code+mcp_anyteam",
+        host_tool_surface=host_tool_surface,
         coupling_regime="loose",
     )
 
@@ -329,7 +330,7 @@ def _blocked(all_tasks: list, t) -> bool:
 
 def _execute_task(state: ClaudeNativeLoopState, task) -> None:
     s = state.settings
-    schema = load_schema(invoke.TASK_COMPLETE_SCHEMA)
+    schema = load_schema(TASK_COMPLETE_SCHEMA)
     result = None
     for attempt in (1, 2):
         prompt = prompts.task_prompt(
@@ -345,7 +346,7 @@ def _execute_task(state: ClaudeNativeLoopState, task) -> None:
             result = invoke.run(
                 prompt,
                 cwd=s.cwd,
-                schema=invoke.TASK_COMPLETE_SCHEMA,
+                schema=TASK_COMPLETE_SCHEMA,
                 claude_binary=s.claude_binary,
                 timeout_s=s.turn_timeout_s,
                 wrapper_identity=(s.team_name, s.agent_name),

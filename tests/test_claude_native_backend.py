@@ -19,6 +19,8 @@ import pytest
 
 from claude_anyteam.backends.claude_native import cli, config, invoke, loop
 from claude_anyteam.backends.claude_native.config import ClaudeNativeSettings
+from claude_anyteam.capabilities import CLAUDE_NATIVE_HEADLESS_CAPABILITIES
+from claude_anyteam.codex import TASK_COMPLETE_SCHEMA
 from tools.stress import run_scenario
 
 
@@ -287,7 +289,7 @@ def test_invoke_run_accepts_native_preamble_before_schema_json(
     result = invoke.run(
         "finish task",
         cwd=work,
-        schema=invoke.TASK_COMPLETE_SCHEMA,
+        schema=TASK_COMPLETE_SCHEMA,
         claude_binary="/bin/claude",
         wrapper_identity=("team-x", "claude-x"),
         event_sink=emitted.append,
@@ -385,11 +387,27 @@ def test_loop_run_initializes_registration_manifest_cache_and_deregisters_on_app
     assert metadata.model == "opus"
     assert metadata.backend_type == "claude_native"
     assert metadata.transport == "claude-native-headless"
-    assert metadata.host_tool_surface == "claude-code+mcp_anyteam"
+    assert (
+        metadata.host_tool_surface
+        == "claude-code-native(Task,Skill,WebFetch,Read,Edit,Write,Bash)+mcp_anyteam"
+    )
     assert metadata.coupling_regime == "loose"
+    assert metadata.capabilities == CLAUDE_NATIVE_HEADLESS_CAPABILITIES
     assert "headless_invocation" in metadata.capabilities
     assert "structured_output" in metadata.capabilities
+    assert "live_tool_events" in metadata.capabilities
+    assert "native_skills" in metadata.capabilities
     assert metadata.capability_manifest is not None
+    assert "plan_mode" not in metadata.capabilities
+    assert "session_resume" not in metadata.capabilities
+    assert (
+        "Claude Code's Skill/Task tools"
+        in metadata.capability_manifest["native_skills"]["when_to_use"]
+    )
+    assert (
+        metadata.capability_manifest["live_tool_events"]["host_tool_surface"]
+        == metadata.host_tool_surface
+    )
     assert calls["cache_init"] == ("native-team", "claude-a")
     assert calls["cache_loaded"] is True
     assert [item[0] for item in calls["signals"]] == [signal.SIGINT, signal.SIGTERM]

@@ -6,23 +6,23 @@ All notable changes to claude-anyteam are documented here. Format follows [Keep 
 
 The protocol-revision drop. Substrate hardening across the three north stars (`CLAUDE.md` §1 harness preservation, §2 visibility parity, §3 peer efficiency), measured against the S6/S7/S8/S5 cross-backend stress harness and validated head-to-head against a native-Claude pair (S6n).
 
-Headline numbers (post-fix, integration HEAD `bd1818e`):
+Headline numbers (post-fix, integration HEAD `294eb24`):
 
 - **5 cross-backend stress scenarios verified**: S6 codex+codex 15/15, S6n claude+claude 15/15, S7 gemini+codex 15/15, S8 kimi+codex 15/15, S5+W10 4-backend 30/30.
 - **M5 turn-failure rate**: 0.000 across all scenarios.
 - **M13 collisions**: 0 across all scenarios.
 - **s1_flatten_violations / harness_preservation_violations**: 0 across all scenarios.
-- **Test suite**: 803 → **1055 passed**.
+- **Test suite**: 803 → **1059 passed** after pre-merge cleanup.
 - **Native-Claude head-to-head (S6n vs S6)**: substrate-comparable. Wall clock 1149s vs 1404s (native 18% faster); M11a p50 73s vs 36.5s (native 2x slower per-DM, model-driven). Substrate failure metrics tied at zero.
 
 ### Added
 
-- **§1 capability layer**: typed capability declarations + hook registry (`src/claude_anyteam/capabilities.py`, +982 LOC) and capability-manifest cache (`capability_manifest.py`, +631 LOC) with peer-prompt-fragment composition, eager prewarm, and bounded supervisor.
-  - Capability vocabulary: `turn_steer`, `thread_fork`, `permission_bridge`, `live_tool_events`, `large_context`, `native_swarm`, `headless_invocation`, `session_resume`, `plan_mode`, `trust_modes`, `coupling_intent`.
+- **§1 capability layer**: typed capability declarations + hook registry (`src/claude_anyteam/capabilities.py`) and capability-manifest cache (`capability_manifest.py`) with peer-prompt-fragment composition, eager prewarm, and bounded supervisor.
+  - Capability vocabulary: `turn_steer`, `thread_fork`, `permission_bridge`, `live_tool_events`, `structured_output`, `headless_invocation`, `session_resume`, `plan_mode`, `trust_modes`, `native_skills`, `large_context`, `accepts_peer_steer`, `soft_non_progress_watchdog`.
   - Manifest-gated peer-steer enforcement (recipient interpretation, not sender structure).
 - **§2 visibility surface**: `visibility-tail` filesystem CLI with JSON/filter/since/color/multi-line tri-card and WebSocket `--serve` mode; `headless_visibility.py` backend-agnostic event normalizer (+392 LOC); `wrapper_mcp_diagnostics.py` instrumented tool-discovery; `checkpoint_commit` MCP tool for app-server-turn-timeout work salvage; `claude-anyteam diagnose` skill + 902-line read-only inspector CLI; uniform `recipient`/`to` field stamping on all `send_message` tool_events.
 - **§3 peer efficiency**: WatchInbox `fs.watch` event-driven inbox (`src/claude_anyteam/watch_inbox.py`); BatchedSender 50ms debounce; attachment protocol (4096-char auto-spill); typed lifecycle payloads; L4 `messageKind` discriminator across codex/gemini/kimi; SendMessage flap repair (#51).
-- **`claude_native` backend**: 992-line bridge at `src/claude_anyteam/backends/claude_native/` (cli, config, invoke, loop, prompts) + 402-line test suite. Wraps `claude --print --output-format stream-json --verbose --mcp-config <wrapper>` so native Claude becomes a peer of codex/gemini/kimi, with full Claude Code tool surface preserved end-to-end.
+- **`claude_native` backend**: bridge at `src/claude_anyteam/backends/claude_native/` (cli, config, invoke, loop, prompts) + focused test coverage. Wraps `claude --print --output-format stream-json --verbose --mcp-config <wrapper>` so native Claude becomes a peer of codex/gemini/kimi, with Claude Code's native Task/Skill/WebFetch/Read/Edit/Write/Bash surface preserved end-to-end.
 - **`docs/adding-a-backend.md`**: 492-line contributor walkthrough for adding a 5th harness, modeled on the kimi backend addition.
 - **Stress / verification harness**: scenarios S5–S10; workloads W1–W10; `score_collab` / `score_quality` / `score_throughput` test suites (+1,274 LOC combined).
 - **App Server / backend integration**: `app_server.py` `turn/steer` mid-task injection plumbing; codex `task_complete` payload schema + mid-turn prose handler; gemini ACP `--trust default|plan` with team-lead approval bridge; kimi v1 headless prompt-plus-validation structured outputs.

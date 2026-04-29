@@ -7,12 +7,11 @@ import shutil
 import subprocess
 import sys
 import tempfile
-from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any, Callable
 
 from claude_anyteam import logger
-from claude_anyteam.codex import CodexResult, PLAN_SCHEMA, TASK_COMPLETE_SCHEMA
+from claude_anyteam.codex import CodexResult
 from claude_anyteam.env import identity_env
 from claude_anyteam.headless_visibility import HeadlessTurnVisibility, coerce_stream_text
 from claude_anyteam.messages import VisibilityEvent
@@ -41,10 +40,6 @@ def _write_atomic_json(path: Path, data: dict[str, Any]) -> None:
 
 def _safe_component(value: str) -> str:
     return "".join(ch if ch.isalnum() or ch in "._-" else "_" for ch in value)
-
-
-def _utc_now() -> str:
-    return datetime.now(timezone.utc).isoformat(timespec="seconds").replace("+00:00", "Z")
 
 
 def state_dir(team: str, agent_name: str) -> Path:

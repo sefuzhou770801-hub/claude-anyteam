@@ -8,11 +8,14 @@ import pytest
 from jsonschema import validate
 
 from claude_anyteam import loop as codex_loop
+from claude_anyteam.backends.claude_native.config import ClaudeNativeSettings
+from claude_anyteam.backends.claude_native import loop as claude_native_loop
 from claude_anyteam.backends.gemini.config import GeminiSettings
 from claude_anyteam.backends.gemini import loop as gemini_loop
 from claude_anyteam.backends.kimi.config import KimiSettings
 from claude_anyteam.backends.kimi import loop as kimi_loop
 from claude_anyteam.capabilities import (
+    CLAUDE_NATIVE_HEADLESS_CAPABILITIES,
     CODEX_APP_SERVER_CAPABILITIES,
     CODEX_EXEC_CAPABILITIES,
     GEMINI_ACP_CAPABILITIES,
@@ -153,7 +156,43 @@ def test_kimi_headless_backend_metadata_declares_native_skills(tmp_path: Path):
     assert "native_skills" in metadata.capabilities
     native = metadata.capability_manifest["native_skills"]
     assert native["callable_from_peers"] is False
-    assert "Kimi-native" in native["description"]
+    assert "backend-native" in native["description"]
+
+
+def test_claude_native_backend_metadata_declares_native_tool_surface(tmp_path: Path):
+    settings = ClaudeNativeSettings(
+        team_name="t",
+        agent_name="claude-a",
+        cwd=tmp_path,
+        poll_interval_s=1.0,
+        color="cyan",
+        plan_mode_required=False,
+    )
+
+    metadata = claude_native_loop._backend_metadata(settings)
+
+    assert metadata.capabilities == CLAUDE_NATIVE_HEADLESS_CAPABILITIES
+    assert metadata.capabilities == [
+        "headless_invocation",
+        "structured_output",
+        "live_tool_events",
+        "native_skills",
+        "large_context",
+    ]
+    assert "session_resume" not in metadata.capabilities
+    assert "plan_mode" not in metadata.capabilities
+    assert "Task,Skill,WebFetch,Read,Edit,Write,Bash" in metadata.host_tool_surface
+    modes = metadata.capability_manifest["headless_invocation"]["schema"]["properties"]["mode"][
+        "enum"
+    ]
+    assert "claude_native" in modes
+    assert (
+        metadata.capability_manifest["live_tool_events"]["host_tool_surface"]
+        == metadata.host_tool_surface
+    )
+    native = metadata.capability_manifest["native_skills"]
+    assert native["callable_from_peers"] is False
+    assert "Claude Code's Skill/Task tools" in native["when_to_use"]
 
 
 def test_capability_taxonomy_rejects_unknown_flags():
