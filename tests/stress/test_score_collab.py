@@ -624,6 +624,116 @@ def test_m13_generic_tool_use_without_send_is_not_collision(
     assert scenario["aggregate"]["M13_total_collisions"] == 0
 
 
+def test_m13_native_claude_task_json_preamble_is_not_collision(
+    teams_dir: Path,
+    tmp_path: Path,
+):
+    team = "team-m13-native-preamble"
+    final_text = (
+        "Task #20 is complete. The implementation and tests were already present.\n\n"
+        '{"files_changed":["src/mcp_anyteam_grep.py"],"summary":"Verified all tests pass."}'
+    )
+    append_event(
+        team,
+        "claude-a",
+        "turn_started",
+        1,
+        at=0,
+        backend="claude_native",
+        turn_id="turn-native",
+    )
+    send(team, "claude-a", 2, "claude-b", at=5, backend="wrapper_mcp", turn_id="turn-native")
+    append_event(
+        team,
+        "claude-a",
+        "turn_failed",
+        3,
+        at=8,
+        backend="claude_native",
+        turn_id="turn-native",
+        payload={
+            "tool_call_events": 2,
+            "last_message_preview": final_text[:500],
+            "error": (
+                "claude final message failed schema validation: output was not "
+                "valid JSON (Expecting value)"
+            ),
+            "error_class": "schema_validation_failed",
+            "tool_call_event_source": "claude_native",
+            "events": [
+                {
+                    "type": "assistant",
+                    "message": {
+                        "content": [{"type": "text", "text": final_text}],
+                    },
+                },
+                {"type": "result", "result": final_text},
+            ],
+        },
+    )
+
+    scenario, pairs, agents = run_score(team, tmp_path / "out")
+
+    assert agents["claude-a"]["metrics"]["M13_prose_fallback_collisions"] == 0
+    assert agents["claude-a"]["metrics"]["M13_per_collision_attribution"] == []
+    assert scenario["aggregate"]["M13_total_collisions"] == 0
+    assert pairs["pairs"][0]["prose_fallback_collisions"] == 0
+
+
+def test_m13_native_claude_schema_failure_without_task_json_still_collides(
+    teams_dir: Path,
+    tmp_path: Path,
+):
+    team = "team-m13-native-real-prose"
+    append_event(
+        team,
+        "claude-a",
+        "turn_started",
+        1,
+        at=0,
+        backend="claude_native",
+        turn_id="turn-native",
+    )
+    send(team, "claude-a", 2, "claude-b", at=5, backend="wrapper_mcp", turn_id="turn-native")
+    append_event(
+        team,
+        "claude-a",
+        "turn_failed",
+        3,
+        at=8,
+        backend="claude_native",
+        turn_id="turn-native",
+        payload={
+            "tool_call_events": 2,
+            "last_message_preview": "sent the structured peer reply and then leaked prose fallback too",
+            "error": (
+                "claude final message failed schema validation: output was not "
+                "valid JSON (Expecting value)"
+            ),
+            "error_class": "schema_validation_failed",
+            "tool_call_event_source": "claude_native",
+            "events": [
+                {
+                    "type": "assistant",
+                    "message": {
+                        "content": [
+                            {
+                                "type": "text",
+                                "text": "sent the structured peer reply and then leaked prose fallback too",
+                            }
+                        ],
+                    },
+                }
+            ],
+        },
+    )
+
+    scenario, _pairs, agents = run_score(team, tmp_path / "out")
+
+    assert agents["claude-a"]["metrics"]["M13_prose_fallback_collisions"] == 1
+    assert scenario["aggregate"]["M13_total_collisions"] == 1
+
+
 def test_m13_attribution_includes_backend_timestamps_and_ordering(
     teams_dir: Path,
     tmp_path: Path,

@@ -514,6 +514,132 @@ def steer_delivery(payload: dict[str, Any]) -> str:
     return value
 
 
+def balanced_json_object_candidates(text: str) -> list[str]:
+    """Return balanced JSON-object substrings embedded in text.
+
+    This is intentionally local to the scorer.  Archived visibility payloads
+    may preserve only backend terminal prose plus raw events; validating the
+    embedded task-complete object lets M13 distinguish native-Claude schema
+    preambles from real prose-fallback leakage.
+    """
+
+    candidates: list[str] = []
+    for start, char in enumerate(text):
+        if char != "{":
+            continue
+        depth = 0
+        in_string = False
+        escaped = False
+        for end in range(start, len(text)):
+            current = text[end]
+            if in_string:
+                if escaped:
+                    escaped = False
+                elif current == "\\":
+                    escaped = True
+                elif current == '"':
+                    in_string = False
+                continue
+            if current == '"':
+                in_string = True
+            elif current == "{":
+                depth += 1
+            elif current == "}":
+                depth -= 1
+                if depth == 0:
+                    candidates.append(text[start : end + 1])
+                    break
+    return candidates
+
+
+def looks_like_task_complete_json(value: Any) -> bool:
+    """Structural task-complete check used for archived native-Claude output."""
+
+    return (
+        isinstance(value, dict)
+        and set(value) == {"files_changed", "summary"}
+        and isinstance(value.get("files_changed"), list)
+        and all(isinstance(item, str) for item in value["files_changed"])
+        and isinstance(value.get("summary"), str)
+        and bool(value["summary"].strip())
+    )
+
+
+def contains_task_complete_json(text: str) -> bool:
+    stripped = text.strip()
+    candidates = [stripped, *balanced_json_object_candidates(stripped)]
+    seen: set[str] = set()
+    for candidate in candidates:
+        if not candidate or candidate in seen:
+            continue
+        seen.add(candidate)
+        try:
+            parsed = json.loads(candidate)
+        except (TypeError, ValueError):
+            continue
+        if looks_like_task_complete_json(parsed):
+            return True
+    return False
+
+
+def native_claude_terminal_text(payload: dict[str, Any]) -> str:
+    """Best-effort full native-Claude terminal text from archived payloads."""
+
+    last = ""
+    events = payload.get("events")
+    if isinstance(events, list):
+        for raw in events:
+            if not isinstance(raw, dict):
+                continue
+            if raw.get("type") == "result" and isinstance(raw.get("result"), str):
+                last = raw["result"].strip()
+                continue
+            if raw.get("type") != "assistant":
+                continue
+            message = raw.get("message")
+            if not isinstance(message, dict):
+                continue
+            content = message.get("content")
+            if not isinstance(content, list):
+                continue
+            parts = [
+                item.get("text", "")
+                for item in content
+                if isinstance(item, dict)
+                and item.get("type") == "text"
+                and isinstance(item.get("text"), str)
+            ]
+            if parts:
+                last = "".join(parts).strip()
+    if last:
+        return last
+    return str(payload.get("last_message_preview") or "").strip()
+
+
+def is_native_claude_schema_preamble(event: VisibilityEvent) -> bool:
+    """Return True for native Claude's prose-before-task-JSON schema miss.
+
+    S2 native-Claude runs showed task turns that already delivered peer DMs
+    via send_message and then returned final text like "Task #20 is complete"
+    followed by a valid task-complete JSON object.  That is a native schema
+    formatting miss, not a prose fallback delivered to the peer, so M13 should
+    not count it as a collision.  Keep the guard narrow: native-Claude source,
+    schema-validation failure, and a valid embedded task-complete object.
+    """
+
+    payload = event.payload or {}
+    backend = str(event.backend or "")
+    source = str(payload.get("tool_call_event_source") or "")
+    if backend not in {"claude_native", "claude-native-headless"} and source != "claude_native":
+        return False
+    if payload.get("error_class") != "schema_validation_failed":
+        return False
+    error = str(payload.get("error") or "")
+    if "claude final message failed schema validation" not in error:
+        return False
+    return contains_task_complete_json(native_claude_terminal_text(payload))
+
+
 def is_collision(event: VisibilityEvent) -> bool:
     if event.kind not in {"turn_completed", "turn_failed"}:
         return False
@@ -525,6 +651,8 @@ def is_collision(event: VisibilityEvent) -> bool:
     except (TypeError, ValueError):
         tool_calls = 0
     preview = str(payload.get("last_message_preview") or "").strip()
+    if is_native_claude_schema_preamble(event):
+        return False
     return tool_calls > 0 and len(preview) > 32
 
 

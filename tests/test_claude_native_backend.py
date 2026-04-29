@@ -245,6 +245,65 @@ def test_invoke_run_builds_claude_print_stream_json_argv(tmp_path: Path, monkeyp
     assert emitted[-1].payload["session_id"] == "claude-session-1"
 
 
+def test_invoke_run_accepts_native_preamble_before_schema_json(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    work = tmp_path / "work"
+    work.mkdir()
+    mcp_config = tmp_path / "anyteam-mcp.json"
+    mcp_config.write_text("{}", encoding="utf-8")
+    final_text = (
+        "Task #20 is complete. The implementation and tests were already present.\n\n"
+        '{"files_changed":["src/mcp_anyteam_grep.py"],"summary":"Verified all tests pass."}'
+    )
+
+    monkeypatch.setattr(invoke, "write_mcp_config", lambda *_args, **_kwargs: mcp_config)
+
+    def fake_subprocess_run(args: list[str], **_run_kwargs: Any) -> subprocess.CompletedProcess[str]:
+        stdout = "\n".join(
+            [
+                json.dumps(
+                    {
+                        "type": "assistant",
+                        "session_id": "claude-session-embedded-json",
+                        "message": {"content": [{"type": "text", "text": final_text}]},
+                    }
+                ),
+                json.dumps(
+                    {
+                        "type": "result",
+                        "session_id": "claude-session-embedded-json",
+                        "result": final_text,
+                    }
+                ),
+            ]
+        )
+        return subprocess.CompletedProcess(args, 0, stdout=stdout + "\n", stderr="")
+
+    monkeypatch.setattr(invoke.subprocess, "run", fake_subprocess_run)
+    emitted = []
+
+    result = invoke.run(
+        "finish task",
+        cwd=work,
+        schema=invoke.TASK_COMPLETE_SCHEMA,
+        claude_binary="/bin/claude",
+        wrapper_identity=("team-x", "claude-x"),
+        event_sink=emitted.append,
+    )
+
+    assert result.exit_code == 0
+    assert result.error is None
+    assert result.structured == {
+        "files_changed": ["src/mcp_anyteam_grep.py"],
+        "summary": "Verified all tests pass.",
+    }
+    assert emitted[-1].kind == "turn_completed"
+    assert emitted[-1].payload["structured"] is True
+    assert "error" not in emitted[-1].payload
+
+
 def test_parse_stdout_synthesizes_anyteam_mcp_tool_events() -> None:
     stdout = json.dumps(
         {

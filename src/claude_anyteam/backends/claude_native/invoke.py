@@ -224,6 +224,68 @@ def _extract_json_candidate(text: str) -> str:
     return stripped
 
 
+def _embedded_json_object_candidates(text: str) -> list[str]:
+    """Return balanced JSON-object substrings embedded in ``text``.
+
+    Native Claude sometimes satisfies the task-complete schema semantically but
+    prefixes the final JSON object with a human sentence ("Task #N is complete…
+    here is the final output").  Treat that as recoverable only when the
+    embedded object itself validates against the requested schema; arbitrary
+    trailing prose still fails below.
+    """
+
+    candidates: list[str] = []
+    for start, char in enumerate(text):
+        if char != "{":
+            continue
+        depth = 0
+        in_string = False
+        escaped = False
+        for end in range(start, len(text)):
+            current = text[end]
+            if in_string:
+                if escaped:
+                    escaped = False
+                elif current == "\\":
+                    escaped = True
+                elif current == '"':
+                    in_string = False
+                continue
+            if current == '"':
+                in_string = True
+            elif current == "{":
+                depth += 1
+            elif current == "}":
+                depth -= 1
+                if depth == 0:
+                    candidates.append(text[start : end + 1])
+                    break
+    return candidates
+
+
+def _parse_and_validate_final_message(
+    text: str,
+    schema_obj: dict[str, Any],
+) -> tuple[dict[str, Any] | None, str | None]:
+    primary = _extract_json_candidate(text)
+    parsed, err = parse_and_validate(primary, schema_obj)
+    if parsed is not None:
+        return parsed, None
+
+    seen = {primary}
+    first_error = err
+    for candidate in _embedded_json_object_candidates(primary):
+        if candidate in seen:
+            continue
+        seen.add(candidate)
+        parsed, embedded_err = parse_and_validate(candidate, schema_obj)
+        if parsed is not None:
+            return parsed, None
+        if first_error is None:
+            first_error = embedded_err
+    return None, first_error
+
+
 def _prompt_with_schema(prompt: str, schema_obj: dict[str, Any] | None, *, retry_error: str | None = None) -> str:
     out = prompt
     if schema_obj is not None and "Your final response MUST be a single JSON object matching this schema:" not in out:
@@ -345,7 +407,7 @@ def run(
     structured: dict[str, Any] | None = None
     error: str | None = None
     if schema_obj is not None:
-        parsed, err = parse_and_validate(_extract_json_candidate(last_message), schema_obj)
+        parsed, err = _parse_and_validate_final_message(last_message, schema_obj)
         structured = parsed
         if err:
             error = f"claude final message failed schema validation: {err}"
