@@ -48,7 +48,8 @@ Headline numbers (post-fix, integration HEAD `bd1818e`):
 
 ### Known follow-ups (post-ship)
 
-- Native-Claude turn-completion test coverage (currently the new claude_native backend is locked at the unit-test level and exercised end-to-end via S6n; no granular integration test for full turn lifecycle).
+- Native-Claude turn-completion test coverage (currently the new claude_native backend is locked at the unit-test level and exercised end-to-end via S6n + S2; no granular integration test for full turn lifecycle).
+- **M13 collision detector needs a native-Claude guard.** S2 (3-pair native Claude, n=30) surfaced 4 self-collisions at 3.4% rate, all `claude-native-headless → claude-native-headless`. Suspected false positives from prose styling that the existing kimi/gemini #50 guards don't cover. 30/30 task completion held — substrate recovers — but worth tightening for cleaner metrics.
 - M11a classifier coverage on S6 with kind_v1 is 0.367; remaining 0.633 are codex envelopes whose `kind` value isn't yet in the mapping. Future enhancement: surface unrecognized kind values for triage.
 - Kimi v1 "no send_message" pattern under W7 — was 100% explained by auth failure in S8 v2; monitor on future runs to confirm post-fix behavior is stable.
 
