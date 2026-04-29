@@ -20,7 +20,8 @@ import pytest
 from claude_anyteam.backends.claude_native import cli, config, invoke, loop
 from claude_anyteam.backends.claude_native.config import ClaudeNativeSettings
 from claude_anyteam.capabilities import CLAUDE_NATIVE_HEADLESS_CAPABILITIES
-from claude_anyteam.codex import TASK_COMPLETE_SCHEMA
+from claude_anyteam.codex import TASK_COMPLETE_SCHEMA, CodexResult
+from claude_anyteam.messages import ShutdownRequestIn
 from tools.stress import run_scenario
 
 
@@ -39,6 +40,54 @@ def _settings(tmp_path: Path, **overrides: Any) -> ClaudeNativeSettings:
     }
     values.update(overrides)
     return ClaudeNativeSettings(**values)
+
+
+def _task_result(
+    *,
+    exit_code: int = 0,
+    structured: dict[str, Any] | None = None,
+    last_message: str = "",
+    error: str | None = None,
+    tool_call_events: int = 0,
+    events: list[dict[str, Any]] | None = None,
+    session_id: str | None = None,
+) -> CodexResult:
+    return CodexResult(
+        exit_code=exit_code,
+        structured=structured,
+        last_message=last_message,
+        events=[] if events is None else events,
+        error=error,
+        tool_call_events=tool_call_events,
+        session_id=session_id,
+    )
+
+
+def _patch_claude_invoke_run(
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+    responses: list[dict[str, Any] | BaseException],
+) -> list[tuple[list[str], dict[str, Any]]]:
+    """Replace subprocess/config side effects while preserving invoke.run()."""
+    calls: list[tuple[list[str], dict[str, Any]]] = []
+    mcp_config = tmp_path / "anyteam-mcp.json"
+    mcp_config.write_text("{}", encoding="utf-8")
+    monkeypatch.setattr(invoke, "write_mcp_config", lambda *_args, **_kwargs: mcp_config)
+
+    def fake_subprocess_run(args: list[str], **kwargs: Any) -> subprocess.CompletedProcess[str]:
+        calls.append((args, kwargs))
+        response = responses.pop(0)
+        if isinstance(response, BaseException):
+            raise response
+        return subprocess.CompletedProcess(
+            args,
+            response.get("returncode", 0),
+            stdout=response.get("stdout", ""),
+            stderr=response.get("stderr", ""),
+        )
+
+    monkeypatch.setattr(invoke.subprocess, "run", fake_subprocess_run)
+    return calls
 
 
 def test_config_from_env_reads_native_claude_knobs(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
@@ -77,6 +126,32 @@ def test_config_rejects_unknown_effort(tmp_path: Path) -> None:
                 "effort": "turbo",
             }
         )
+
+
+def test_feature_test_raises_when_claude_help_is_missing_required_flag(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    calls: list[list[str]] = []
+
+    def fake_run(args: list[str], **_kwargs: Any) -> subprocess.CompletedProcess[str]:
+        calls.append(args)
+        return subprocess.CompletedProcess(
+            args,
+            0,
+            stdout="--print --verbose --output-format --mcp-config",
+            stderr="",
+        )
+
+    monkeypatch.setattr(invoke.shutil, "which", lambda binary: f"/usr/bin/{binary}")
+    monkeypatch.setattr(invoke.subprocess, "run", fake_run)
+
+    with pytest.raises(RuntimeError) as excinfo:
+        invoke.feature_test("claude")
+
+    message = str(excinfo.value)
+    assert "Claude CLI is missing required flags" in message
+    assert "--strict-mcp-config" in message
+    assert calls == [["claude", "--help"]]
 
 
 def test_cli_main_parses_args_and_calls_loop_with_settings(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
@@ -306,6 +381,129 @@ def test_invoke_run_accepts_native_preamble_before_schema_json(
     assert "error" not in emitted[-1].payload
 
 
+def test_invoke_timeout_emits_terminal_turn_failed_visibility(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    timeout_stdout = json.dumps(
+        {
+            "type": "assistant",
+            "session_id": "claude-timeout-session",
+            "message": {"content": [{"type": "text", "text": "partial work"}]},
+        }
+    )
+    _patch_claude_invoke_run(
+        monkeypatch,
+        tmp_path,
+        [
+            subprocess.TimeoutExpired(
+                cmd=["claude"],
+                timeout=0.25,
+                output=timeout_stdout + "\n",
+                stderr="still running",
+            )
+        ],
+    )
+    emitted = []
+
+    result = invoke.run(
+        "slow prompt",
+        cwd=tmp_path,
+        claude_binary="/bin/claude",
+        timeout_s=0.25,
+        wrapper_identity=("team-x", "claude-timeout"),
+        task_id="44",
+        event_sink=emitted.append,
+    )
+
+    assert result.exit_code == 124
+    assert result.last_message == "partial work"
+    assert result.session_id == "claude-timeout-session"
+    assert result.error and "claude timed out after 0.25s" in result.error
+    assert [event.kind for event in emitted] == ["turn_started", "turn_failed"]
+    assert emitted[-1].task_id == "44"
+    payload = emitted[-1].payload
+    assert payload["exit_code"] == 124
+    assert payload["error_class"] == "turn_timeout"
+    assert payload["last_message_preview"] == "partial work"
+    assert payload["partial_events_available"] is True
+    assert payload["session_id"] == "claude-timeout-session"
+
+
+def test_invoke_nonzero_exit_emits_terminal_turn_failed_visibility(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    stdout = json.dumps(
+        {
+            "type": "assistant",
+            "message": {"content": [{"type": "text", "text": "failed final text"}]},
+        }
+    )
+    _patch_claude_invoke_run(
+        monkeypatch,
+        tmp_path,
+        [{"stdout": stdout + "\n", "stderr": "boom from cli", "returncode": 7}],
+    )
+    emitted = []
+
+    result = invoke.run(
+        "failing prompt",
+        cwd=tmp_path,
+        claude_binary="/bin/claude",
+        wrapper_identity=("team-x", "claude-nonzero"),
+        event_sink=emitted.append,
+    )
+
+    assert result.exit_code == 7
+    assert result.error == "claude exited 7; output: boom from cli"
+    assert [event.kind for event in emitted] == ["turn_started", "turn_failed"]
+    payload = emitted[-1].payload
+    assert payload["exit_code"] == 7
+    assert payload["error_class"] == "process_exit"
+    assert payload["last_message_preview"] == "failed final text"
+    assert payload["partial_events_available"] is True
+    assert payload["tool_call_events"] == 0
+
+
+def test_invoke_schema_failure_emits_terminal_turn_failed_visibility(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    stdout = json.dumps(
+        {
+            "type": "assistant",
+            "message": {"content": [{"type": "text", "text": "not json"}]},
+        }
+    )
+    _patch_claude_invoke_run(
+        monkeypatch,
+        tmp_path,
+        [{"stdout": stdout + "\n", "stderr": "", "returncode": 0}],
+    )
+    emitted = []
+
+    result = invoke.run(
+        "schema prompt",
+        cwd=tmp_path,
+        schema=TASK_COMPLETE_SCHEMA,
+        claude_binary="/bin/claude",
+        wrapper_identity=("team-x", "claude-schema"),
+        event_sink=emitted.append,
+    )
+
+    assert result.exit_code == 0
+    assert result.structured is None
+    assert result.error and "claude final message failed schema validation" in result.error
+    assert [event.kind for event in emitted] == ["turn_started", "turn_failed"]
+    payload = emitted[-1].payload
+    assert payload["exit_code"] == 0
+    assert payload["structured"] is False
+    assert payload["error_class"] == "schema_validation_failed"
+    assert "schema validation" in payload["error"]
+    assert payload["last_message_preview"] == "not json"
+
+
 def test_parse_stdout_synthesizes_anyteam_mcp_tool_events() -> None:
     stdout = json.dumps(
         {
@@ -447,6 +645,267 @@ def test_main_loop_polls_inbox_then_executes_claimed_task(tmp_path: Path, monkey
     assert calls["inbox"] == 1
     assert calls["executed"] == [(state, claimed_task)]
     assert calls["closed"] is True
+
+
+def test_execute_task_success_completes_task_and_sends_lifecycle_message(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    state = loop.ClaudeNativeLoopState(settings=_settings(tmp_path, effort="high"))
+    task = SimpleNamespace(id="21", subject="ship it", description="finish the work")
+    state.in_flight_task = task.id
+    invocations: list[dict[str, Any]] = []
+    task_updates: list[tuple[str, str, dict[str, Any]]] = []
+    completions: list[dict[str, Any]] = []
+
+    def fake_run(prompt: str, **kwargs: Any) -> CodexResult:
+        invocations.append({"prompt": prompt, **kwargs})
+        return _task_result(
+            structured={"files_changed": ["tests/test_claude_native_backend.py"], "summary": "Added coverage."},
+            last_message='{"files_changed":["tests/test_claude_native_backend.py"],"summary":"Added coverage."}',
+            session_id="native-session-success",
+        )
+
+    monkeypatch.setattr(loop.invoke, "run", fake_run)
+    monkeypatch.setattr(
+        loop.pio,
+        "update_task",
+        lambda team, task_id, **kwargs: task_updates.append((team, task_id, kwargs)),
+    )
+    monkeypatch.setattr(
+        loop.pio,
+        "send_task_complete",
+        lambda team, sender, **kwargs: completions.append({"team": team, "sender": sender, **kwargs}),
+    )
+
+    loop._execute_task(state, task)
+
+    assert state.in_flight_task is None
+    assert state.claude_session_id == "native-session-success"
+    assert len(invocations) == 1
+    call = invocations[0]
+    assert "ship it" in call["prompt"]
+    assert call["schema"] == TASK_COMPLETE_SCHEMA
+    assert call["resume_session_id"] is None
+    assert call["wrapper_identity"] == ("native-team", "claude-a")
+    assert call["model"] == "sonnet"
+    assert call["effort"] == "high"
+    assert call["task_id"] == "21"
+    assert task_updates == [("native-team", "21", {"status": "completed"})]
+    assert completions == [
+        {
+            "team": "native-team",
+            "sender": "claude-a",
+            "task_id": "21",
+            "files_changed": ["tests/test_claude_native_backend.py"],
+            "summary_text": "Added coverage.",
+            "codex_exit_code": 0,
+        }
+    ]
+
+
+def test_execute_task_blocks_after_schema_validation_failures(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    state = loop.ClaudeNativeLoopState(settings=_settings(tmp_path))
+    task = SimpleNamespace(id="22", subject="bad json", description="return invalid output")
+    state.in_flight_task = task.id
+    invocations: list[str] = []
+    task_updates: list[tuple[str, str, dict[str, Any]]] = []
+    blocked_messages: list[tuple[str, str, str, str]] = []
+    validation_error = "claude final message failed schema validation: output was not valid JSON"
+
+    def fake_run(prompt: str, **_kwargs: Any) -> CodexResult:
+        invocations.append(prompt)
+        return _task_result(
+            exit_code=0,
+            structured=None,
+            last_message="not json",
+            error=validation_error,
+        )
+
+    monkeypatch.setattr(loop.invoke, "run", fake_run)
+    monkeypatch.setattr(loop.pio, "get_task", lambda _team, _task_id: SimpleNamespace(status="in_progress"))
+    monkeypatch.setattr(
+        loop.pio,
+        "update_task",
+        lambda team, task_id, **kwargs: task_updates.append((team, task_id, kwargs)),
+    )
+    monkeypatch.setattr(
+        loop.pio,
+        "send_task_blocked",
+        lambda team, sender, task_id, reason: blocked_messages.append((team, sender, task_id, reason)),
+    )
+    monkeypatch.setattr(
+        loop.pio,
+        "send_task_complete",
+        lambda *_args, **_kwargs: pytest.fail("schema-invalid task must not complete"),
+    )
+
+    loop._execute_task(state, task)
+
+    assert state.in_flight_task is None
+    assert len(invocations) == 2
+    assert "PRIOR ATTEMPT FAILED" not in invocations[0]
+    assert "PRIOR ATTEMPT FAILED" in invocations[1]
+    assert len(task_updates) == 1
+    team, task_id, update_kwargs = task_updates[0]
+    assert (team, task_id) == ("native-team", "22")
+    assert update_kwargs["active_form"].startswith("blocked: claude final message failed schema validation")
+    assert update_kwargs["metadata"] == {
+        "blocked_reason": validation_error,
+        "blocked_by": "claude-a",
+    }
+    assert blocked_messages == [("native-team", "claude-a", "22", validation_error)]
+
+
+def test_execute_task_retries_transient_nonzero_then_completes(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    state = loop.ClaudeNativeLoopState(settings=_settings(tmp_path))
+    task = SimpleNamespace(id="23", subject="retry task", description="first attempt fails transiently")
+    state.in_flight_task = task.id
+    responses = [
+        _task_result(exit_code=1, structured=None, last_message="", error="temporary Claude CLI failure"),
+        _task_result(
+            structured={"files_changed": [], "summary": "Recovered on retry."},
+            last_message='{"files_changed":[],"summary":"Recovered on retry."}',
+            session_id="native-session-retry",
+        ),
+    ]
+    prompts_seen: list[str] = []
+    task_updates: list[dict[str, Any]] = []
+    completions: list[dict[str, Any]] = []
+
+    def fake_run(prompt: str, **_kwargs: Any) -> CodexResult:
+        prompts_seen.append(prompt)
+        return responses.pop(0)
+
+    monkeypatch.setattr(loop.invoke, "run", fake_run)
+    monkeypatch.setattr(loop, "_mark_blocked", lambda *_args, **_kwargs: pytest.fail("retry success must not block"))
+    monkeypatch.setattr(loop.pio, "update_task", lambda _team, _task_id, **kwargs: task_updates.append(kwargs))
+    monkeypatch.setattr(
+        loop.pio,
+        "send_task_complete",
+        lambda team, sender, **kwargs: completions.append({"team": team, "sender": sender, **kwargs}),
+    )
+
+    loop._execute_task(state, task)
+
+    assert state.in_flight_task is None
+    assert state.claude_session_id == "native-session-retry"
+    assert len(prompts_seen) == 2
+    assert "PRIOR ATTEMPT FAILED" in prompts_seen[1]
+    assert task_updates == [{"status": "completed"}]
+    assert completions[0]["task_id"] == "23"
+    assert completions[0]["summary_text"] == "Recovered on retry."
+
+
+def test_handle_shutdown_approves_clean_shutdown_once(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    state = loop.ClaudeNativeLoopState(settings=_settings(tmp_path), claude_session_id="session-to-drop")
+    approvals: list[tuple[str, str, str]] = []
+
+    monkeypatch.setattr(
+        loop.pio,
+        "send_shutdown_approved",
+        lambda team, sender, request_id: approvals.append((team, sender, request_id)),
+    )
+    monkeypatch.setattr(
+        loop.pio,
+        "send_shutdown_rejected",
+        lambda *_args, **_kwargs: pytest.fail("clean shutdown must not be rejected"),
+    )
+
+    payload = ShutdownRequestIn(request_id="req-clean")
+    loop._handle_shutdown(state, payload)
+    loop._handle_shutdown(state, payload)
+
+    assert approvals == [("native-team", "claude-a", "req-clean")]
+    assert state.approved_shutdown is True
+    assert state.shutdown_requested is False
+    assert state.claude_session_id is None
+
+
+def test_handle_shutdown_rejects_when_task_in_flight_and_defers_exit(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    state = loop.ClaudeNativeLoopState(settings=_settings(tmp_path), in_flight_task="55")
+    rejections: list[tuple[str, str, str, str]] = []
+
+    monkeypatch.setattr(
+        loop.pio,
+        "send_shutdown_approved",
+        lambda *_args, **_kwargs: pytest.fail("in-flight shutdown must not be approved"),
+    )
+    monkeypatch.setattr(
+        loop.pio,
+        "send_shutdown_rejected",
+        lambda team, sender, request_id, reason: rejections.append((team, sender, request_id, reason)),
+    )
+
+    payload = ShutdownRequestIn(request_id="req-busy")
+    loop._handle_shutdown(state, payload)
+    loop._handle_shutdown(state, payload)
+
+    assert rejections == [("native-team", "claude-a", "req-busy", "in-flight task #55")]
+    assert state.approved_shutdown is False
+    assert state.shutdown_requested is True
+    assert state.in_flight_task == "55"
+
+
+def test_handle_prose_skips_fallback_when_send_message_tool_delivered_reply(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    state = loop.ClaudeNativeLoopState(settings=_settings(tmp_path))
+    msg = SimpleNamespace(from_="codex-peer", text="please ack", summary="peer dm")
+    invocations: list[dict[str, Any]] = []
+
+    def fake_run(prompt: str, **kwargs: Any) -> CodexResult:
+        invocations.append({"prompt": prompt, **kwargs})
+        return _task_result(
+            last_message="Already sent via tool.",
+            tool_call_events=1,
+            events=[{"type": "tool_use", "name": "mcp__anyteam__send_message"}],
+        )
+
+    monkeypatch.setattr(loop.invoke, "run", fake_run)
+    send_prose_calls: list[tuple[Any, ...]] = []
+    monkeypatch.setattr(loop.pio, "send_prose", lambda *args, **_kwargs: send_prose_calls.append(args))
+
+    loop._handle_prose(state, msg)
+
+    assert send_prose_calls == []
+    assert len(invocations) == 1
+    assert invocations[0]["schema"] is None
+    assert invocations[0]["wrapper_identity"] == ("native-team", "claude-a")
+    assert callable(invocations[0]["event_sink"])
+
+
+def test_handle_prose_sends_fallback_when_reply_was_plain_prose_only(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    state = loop.ClaudeNativeLoopState(settings=_settings(tmp_path))
+    msg = SimpleNamespace(from_="codex-peer", text="plain reply is fine", summary="peer dm")
+
+    monkeypatch.setattr(
+        loop.invoke,
+        "run",
+        lambda *_args, **_kwargs: _task_result(last_message="Plain prose reply.", events=[], tool_call_events=0),
+    )
+    send_prose_calls: list[tuple[Any, ...]] = []
+    monkeypatch.setattr(loop.pio, "send_prose", lambda *args, **_kwargs: send_prose_calls.append(args))
+
+    loop._handle_prose(state, msg)
+
+    assert send_prose_calls == [("native-team", "claude-a", "codex-peer", "Plain prose reply.")]
 
 
 def test_stress_spawn_command_routes_claude_members_to_native_cli(monkeypatch: pytest.MonkeyPatch, tmp_path: Path) -> None:
