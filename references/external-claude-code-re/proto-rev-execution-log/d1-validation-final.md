@@ -555,3 +555,39 @@ S6n captured the 2-pair native baseline. S2 scales it to a 3-pair native-Claude 
 **Not a ship-blocker.** 30/30 task completion across the trio is the critical proof. M5/M13 at 3.4% with all tasks recovered is within tolerance for a brand-new bridge module on a 30-task workload — comparable to where codex was at v0.6.0 introduction. Worth a follow-up investigation: the four claude-native-headless self-collisions almost certainly indicate the M13 detector needs a guard for native Claude's prose style, similar to the kimi/gemini guards added in #50.
 
 The PR ships at HEAD `2c3cb04` (v0.7.0) with both S6n and S2 numbers landed. Follow-up tracked in CHANGELOG "Known follow-ups".
+
+## S3 / S4 homogeneous backend runs — external service state, not substrate
+
+Two additional homogeneous-backend stress runs were launched overnight to round out the verification matrix:
+
+- **S3 (homogeneous-gemini, n=20)**: 6/20 completed, hit 90-min timeout. M5 turn-failure rate = 0.84.
+- **S4 (homogeneous-kimi, n=20)**: 0/20 completed, hit 90-min timeout. M5 = None (no turns started).
+
+Both incomplete, but **neither reflects a substrate regression**. The procs/<agent>.stderr.log files show the actual failure modes:
+
+### S3 — Gemini quota exhaustion
+
+```
+{"error":{"code":429,"message":"No capacity available for model gemini-2.5-pro on the server",
+ "status":"RESOURCE_EXHAUSTED","details":[{"reason":"MODEL_CAPACITY_EXHAUSTED",...}]}}
+```
+
+Gemini's `cloudcode-pa.googleapis.com` was returning 429 RESOURCE_EXHAUSTED for `gemini-2.5-pro` during the run window. The auth_preflight classifier correctly identified these as `quota_exhausted` (not as `invalid_authentication`), and gemini-tgt-a/b/c kept retrying until the 90-min budget elapsed. Substrate behavior was correct; the upstream service was unavailable.
+
+### S4 — Kimi API key expiration
+
+```
+{"error":{"message":"The API Key appears to be invalid or may have expired.",
+ "type":"invalid_authentication_error"}}  (HTTP 401)
+```
+
+Kimi's API key was invalid at the run window. Critically, the auth-classifier fix at `61b841a` correctly identified this as `invalid_authentication` (not `quota_exhausted` — the run-id contains "0452" and "0429" digit sequences that the pre-fix regex would have mis-tagged as a 429). All three kimi-tgt-{a,b,c} adapters crashed at auth_preflight before joining the team; the runner waited the full 90-min budget hoping for replacement spawns that never came.
+
+### Implications
+
+- **Auth-classifier fix verified live**: the kimi 401 was correctly identified, not mis-tagged as quota. The S8 v2 incident (where a real 401 was reported as `quota_exhausted` because the diagnostic carried "0429" digits) cannot recur.
+- **Substrate harness preservation held**: §1 states "preserve every harness's unique capabilities" — this includes their auth/quota failure modes. Each backend reported its true error class without substrate flattening.
+- **No ship signal**: substrate code paths exercised correctly. The rate-limit/auth-failure responses are upstream service state, not protocol issues.
+- **Future verification policy**: pre-flight backend credentials before launching long stress runs. Add a `--require-auth` runner flag that aborts before sandbox creation if any member's auth_preflight fails.
+
+These runs are documented for completeness; they don't change the PR's verdict, which rests on the cross-backend scenarios where credentials held (S6, S6n, S7, S8 rerun, S5+W10, S2).
