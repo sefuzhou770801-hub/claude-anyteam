@@ -91,6 +91,58 @@ def send(
     )
 
 
+def codex_structured_send(
+    team: str,
+    agent: str,
+    seq: int,
+    to: str,
+    *,
+    message_kind: str | None,
+    body: str = "structured message body without an R14 prefix",
+    at: float = 0,
+    turn_id: str | None = None,
+    summary: str = "mcpToolCall: to='agent-b'",
+):
+    arguments = {
+        "body": body,
+        "summary": "structured summary without an R14 prefix",
+        "to": to,
+    }
+    if message_kind is not None:
+        arguments["kind"] = message_kind
+    return send(
+        team,
+        agent,
+        seq,
+        to,
+        at=at,
+        turn_id=turn_id,
+        summary=summary,
+        payload_extra={
+            "raw_backend_type": "mcpToolCall",
+            "raw_event_preview": json.dumps(
+                {
+                    "arguments": arguments,
+                    "durationMs": 5,
+                    "error": None,
+                    "id": f"call-{agent}-{seq}",
+                    "result": {
+                        "structuredContent": {
+                            "delivered_to": to,
+                            "sender": agent,
+                        }
+                    },
+                    "server": "claude_anyteam_wrapper",
+                    "status": "completed",
+                    "tool": "send_message",
+                    "type": "mcpToolCall",
+                },
+                sort_keys=True,
+            ),
+        },
+    )
+
+
 def steer_ack(team: str, agent: str, seq: int, delivery: str):
     return append_event(
         team,
@@ -106,6 +158,7 @@ def run_score(
     out: Path,
     *,
     coupling_intent: str | None = None,
+    classifier: str | None = None,
 ) -> tuple[dict, dict, dict[str, dict]]:
     argv = [
         "--team",
@@ -119,6 +172,8 @@ def run_score(
     ]
     if coupling_intent is not None:
         argv.extend(["--coupling-intent", coupling_intent])
+    if classifier is not None:
+        argv.extend(["--classifier", classifier])
     rc = score_collab.main(argv)
     assert rc == 0
     scenario = json.loads((out / "scenario.json").read_text())
@@ -174,6 +229,117 @@ def test_m3_m4_basic(teams_dir: Path, tmp_path: Path):
         "other": 0,
     }
     assert scenario["aggregate"]["M3_total_peer_dms"] == 3
+
+
+def test_kind_v1_classifies_codex_structured_envelopes(teams_dir: Path, tmp_path: Path):
+    team = "team-kind-v1"
+    codex_structured_send(team, "agent-a", 1, "agent-b", message_kind="question")
+    codex_structured_send(team, "agent-a", 2, "agent-b", message_kind="response")
+    codex_structured_send(team, "agent-a", 3, "agent-b", message_kind="informational")
+    codex_structured_send(team, "agent-a", 4, "agent-b", message_kind="delegate")
+
+    scenario, _pairs, agents = run_score(team, tmp_path / "out")
+    metrics = agents["agent-a"]["metrics"]
+
+    assert metrics["M3_peer_dm_semantic_breakdown"] == {
+        "ask": 1,
+        "answer": 1,
+        "handoff": 1,
+        "fyi": 1,
+        "other": 0,
+    }
+    assert metrics["M4_semantic_breakdown"] == {
+        "ask": 1,
+        "answer": 1,
+        "handoff": 1,
+        "fyi": 1,
+        "other": 0,
+    }
+    assert metrics["M11a_classification_coverage"] == 1.0
+    assert metrics["M11a_peer_dm_rtt_seconds_by_semantic"]["classifier_method"] == "kind_v1"
+    assert scenario["aggregate"]["M3_peer_dm_semantic_breakdown"]["other"] == 0
+    assert scenario["aggregate"]["M11a_peer_dm_rtt_seconds_by_semantic"]["classifier_method"] == "kind_v1"
+
+
+def test_kind_v1_falls_back_to_prefix_when_kind_absent(teams_dir: Path, tmp_path: Path):
+    team = "team-kind-v1-prefix-fallback"
+    codex_structured_send(
+        team,
+        "agent-a",
+        1,
+        "agent-b",
+        message_kind=None,
+        body="[ASK]: can you review this shard?",
+    )
+
+    _scenario, _pairs, agents = run_score(team, tmp_path / "out", classifier="kind_v1")
+    metrics = agents["agent-a"]["metrics"]
+
+    assert metrics["M3_peer_dm_semantic_breakdown"] == {
+        "ask": 1,
+        "answer": 0,
+        "handoff": 0,
+        "fyi": 0,
+        "other": 0,
+    }
+    assert metrics["M11a_classification_coverage"] == 1.0
+    assert metrics["M11a_peer_dm_rtt_seconds_by_semantic"]["classifier_method"] == "kind_v1"
+
+
+def test_prefix_v1_ignores_structured_kind_when_explicit(teams_dir: Path, tmp_path: Path):
+    team = "team-prefix-explicit"
+    codex_structured_send(
+        team,
+        "agent-a",
+        1,
+        "agent-b",
+        message_kind="question",
+        body="structured body without a prefix",
+    )
+
+    _scenario, _pairs, agents = run_score(team, tmp_path / "out", classifier="prefix_v1")
+    metrics = agents["agent-a"]["metrics"]
+
+    assert metrics["M3_peer_dm_semantic_breakdown"]["other"] == 1
+    assert metrics["M11a_classification_coverage"] == 0.0
+    assert metrics["M11a_peer_dm_rtt_seconds_by_semantic"]["classifier_method"] == "prefix_v1"
+
+
+@pytest.mark.parametrize(
+    ("message_kind", "expected"),
+    [
+        ("informational", "fyi"),
+        ("fyi", "fyi"),
+        ("question", "ask"),
+        ("ask", "ask"),
+        ("inquiry", "ask"),
+        ("answer", "answer"),
+        ("response", "answer"),
+        ("handoff", "handoff"),
+        ("delegate", "handoff"),
+        ("steer", "other"),
+    ],
+)
+def test_kind_v1_maps_kind_enum_values(message_kind: str, expected: str):
+    payload = {
+        "tool_name": "send_message",
+        "phase": "completed",
+        "raw_event_preview": json.dumps(
+            {
+                "arguments": {
+                    "body": "plain message with no prefix",
+                    "kind": message_kind,
+                    "summary": "plain summary",
+                    "to": "agent-b",
+                },
+                "tool": "send_message",
+                "type": "mcpToolCall",
+            },
+            sort_keys=True,
+        ),
+    }
+
+    assert score_collab.classify_semantic(None, payload, classifier="kind_v1") == expected
 
 
 def test_recipient_preserved_verbatim(teams_dir: Path, tmp_path: Path):

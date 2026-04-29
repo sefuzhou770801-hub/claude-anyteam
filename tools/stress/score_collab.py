@@ -10,6 +10,7 @@ from __future__ import annotations
 import argparse
 import ast
 import json
+import re
 import statistics
 import sys
 from collections import Counter, defaultdict
@@ -34,13 +35,38 @@ KNOWN_STEER_VALUES = {
     "dropped",
 }
 SEMANTIC_LABELS = ("ask", "answer", "handoff", "fyi", "other")
-CLASSIFIER_METHOD = "prefix_v1"
+CLASSIFIER_PREFIX_V1 = "prefix_v1"
+CLASSIFIER_KIND_V1 = "kind_v1"
+CLASSIFIER_AUTO = "auto"
+CLASSIFIER_CHOICES = (CLASSIFIER_KIND_V1, CLASSIFIER_PREFIX_V1, CLASSIFIER_AUTO)
+DEFAULT_CLASSIFIER = CLASSIFIER_AUTO
+KIND_SEMANTIC_MAP = {
+    "informational": "fyi",
+    "fyi": "fyi",
+    "question": "ask",
+    "ask": "ask",
+    "inquiry": "ask",
+    "answer": "answer",
+    "response": "answer",
+    "handoff": "handoff",
+    "delegate": "handoff",
+}
 SEMANTIC_PREFIXES = {
+    "[ask]:": "ask",
     "ask:": "ask",
+    "[answer]:": "answer",
     "answer:": "answer",
+    "[handoff]:": "handoff",
     "handoff:": "handoff",
+    "[fyi]:": "fyi",
     "fyi:": "fyi",
 }
+JSON_STRING_RE = r'"(?:\\.|[^"\\])*"'
+RAW_KIND_RE = re.compile(r'"kind"\s*:\s*(?P<value>' + JSON_STRING_RE + r')')
+RAW_ARGUMENT_TEXT_RE = re.compile(
+    r'"(?P<key>body|summary|message_summary|tool_summary)"\s*:\s*"(?P<value>(?:\\.|[^"\\])*)',
+    re.DOTALL,
+)
 BLOCKING_CANDIDATE_SEMANTICS = {"ask", "handoff"}
 NONBLOCKING_SEMANTICS = {"answer", "fyi"}
 COUPLING_INTENT_ALIASES = {
@@ -241,27 +267,163 @@ def classification_coverage(counter: Counter[str], total_peer_sends: int) -> flo
     return ratio(classified, total_peer_sends)
 
 
-def classify_semantic(summary: str | None, payload: dict[str, Any]) -> str:
-    """Coarse semantic label for peer-DM summaries.
+def parse_jsonish(value: Any) -> Any:
+    """Return decoded JSON-ish data without treating malformed previews as fatal."""
 
-    ``prefix_v1`` is intentionally strict: only explicit ``ask:``,
-    ``answer:``, ``handoff:``, and ``fyi:`` prefixes classify. Older W7 runs
-    without prefix discipline should remain ``other`` rather than getting
-    silently reinterpreted by heuristic content matching.
+    if isinstance(value, (dict, list)):
+        return value
+    if not isinstance(value, str) or not value.strip():
+        return None
+    try:
+        return json.loads(value)
+    except (TypeError, ValueError):
+        return None
+
+
+def decode_json_string_token(token: str) -> str:
+    """Decode a JSON string token captured from raw_event_preview text."""
+
+    try:
+        decoded = json.loads(token)
+    except (TypeError, ValueError):
+        return token.strip('"')
+    return str(decoded)
+
+
+def send_message_argument_maps(payload: dict[str, Any]) -> list[dict[str, Any]]:
+    """Best-effort argument dictionaries from visibility tool-event payloads.
+
+    The scorer is intentionally read-only and must work against archived
+    events.  Codex App Server runs preserve the native MCP tool-call envelope
+    only as ``payload.raw_event_preview`` JSON, whose ``arguments`` object
+    contains the structured ``send_message`` fields (``kind``, ``body``,
+    ``summary``, ``to``).  Other adapters may surface an equivalent map
+    directly under common tool-call keys, so collect all known shapes.
     """
 
-    candidates = (
-        payload.get("message_summary"),
-        payload.get("summary"),
-        payload.get("tool_summary"),
-        summary,
-    )
-    for candidate in candidates:
+    maps: list[dict[str, Any]] = []
+
+    def add(value: Any) -> None:
+        parsed = parse_jsonish(value)
+        if isinstance(parsed, dict):
+            maps.append(parsed)
+
+    for key in ("arguments", "args", "input", "parameters", "tool_input"):
+        add(payload.get(key))
+
+    raw = parse_jsonish(payload.get("raw_event_preview"))
+    if isinstance(raw, dict):
+        for key in ("arguments", "args", "input", "parameters", "tool_input"):
+            add(raw.get(key))
+        for container_key in ("call", "function", "tool_call", "toolCall"):
+            container = parse_jsonish(raw.get(container_key))
+            if not isinstance(container, dict):
+                continue
+            for key in ("arguments", "args", "input", "parameters", "tool_input"):
+                add(container.get(key))
+
+    return maps
+
+
+def kind_value_from_payload(payload: dict[str, Any]) -> tuple[bool, str | None]:
+    """Return (kind_present, kind_value) for a send_message tool event."""
+
+    for key in ("message_kind", "send_kind", "kind"):
+        value = payload.get(key)
+        if value not in (None, ""):
+            return True, str(value)
+
+    for arguments in send_message_argument_maps(payload):
+        value = arguments.get("kind")
+        if value not in (None, ""):
+            return True, str(value)
+
+    # ``raw_event_preview`` is bounded and may be truncated, making it invalid
+    # JSON.  If the short ``kind`` field survived the preview, recover it
+    # without relying on full JSON parsing.
+    raw_preview = payload.get("raw_event_preview")
+    if isinstance(raw_preview, str):
+        match = RAW_KIND_RE.search(raw_preview)
+        if match:
+            return True, decode_json_string_token(match.group("value"))
+
+    return False, None
+
+
+def normalize_kind_semantic(kind: str | None) -> str:
+    if kind is None:
+        return "other"
+    key = str(kind).strip().lower().replace("-", "_")
+    return KIND_SEMANTIC_MAP.get(key, "other")
+
+
+def prefix_candidates(summary: str | None, payload: dict[str, Any]) -> list[str]:
+    candidates: list[str] = []
+
+    for arguments in send_message_argument_maps(payload):
+        for key in ("body", "message_body", "message", "text", "summary"):
+            value = arguments.get(key)
+            if value not in (None, ""):
+                candidates.append(str(value))
+
+    for key in ("body", "message_body", "message", "text"):
+        value = payload.get(key)
+        if value not in (None, ""):
+            candidates.append(str(value))
+
+    for key in ("message_summary", "summary", "tool_summary"):
+        value = payload.get(key)
+        if value not in (None, ""):
+            candidates.append(str(value))
+
+    if summary not in (None, ""):
+        candidates.append(str(summary))
+
+    # Recover body/summary prefixes from truncated raw previews.  This is
+    # especially useful when the body begins with an R14 tag but the preview is
+    # not valid JSON due to a later truncation marker.
+    raw_preview = payload.get("raw_event_preview")
+    if isinstance(raw_preview, str):
+        for match in RAW_ARGUMENT_TEXT_RE.finditer(raw_preview):
+            fragment = match.group("value")
+            candidates.append(decode_json_string_token(f'"{fragment}"'))
+
+    return candidates
+
+
+def classify_prefix_semantic(summary: str | None, payload: dict[str, Any]) -> str:
+    """Coarse semantic label using explicit R14 body/summary prefixes only."""
+
+    for candidate in prefix_candidates(summary, payload):
         candidate_text = str(candidate or "").strip().lower()
         for prefix, label in SEMANTIC_PREFIXES.items():
             if candidate_text.startswith(prefix):
                 return label
     return "other"
+
+
+def classify_kind_semantic(summary: str | None, payload: dict[str, Any]) -> str:
+    """Classify by structured send_message kind, with prefix fallback.
+
+    ``kind_v1`` first reads the Codex-style structured ``kind`` value from the
+    MCP tool-call arguments.  If the field is absent, it falls back to the
+    strict ``prefix_v1`` parser for historical R14-tagged messages.  Unknown
+    present kind values remain ``other`` rather than being reinterpreted from
+    message text.
+    """
+
+    kind_present, kind_value = kind_value_from_payload(payload)
+    if kind_present:
+        return normalize_kind_semantic(kind_value)
+    return classify_prefix_semantic(summary, payload)
+
+
+def classify_semantic(summary: str | None, payload: dict[str, Any], *, classifier: str) -> str:
+    if classifier == CLASSIFIER_KIND_V1:
+        return classify_kind_semantic(summary, payload)
+    if classifier == CLASSIFIER_PREFIX_V1:
+        return classify_prefix_semantic(summary, payload)
+    raise ValueError(f"unknown classifier {classifier!r}")
 
 
 def _tool_name(event: VisibilityEvent) -> str | None:
@@ -276,6 +438,37 @@ def is_send_message_event(event: VisibilityEvent) -> bool:
     # R18 wrapper instrumentation emits started + terminal events. Count calls,
     # not lifecycle edges, by ignoring the non-terminal started record.
     return event.payload.get("phase") != "started"
+
+
+def normalize_classifier_choice(classifier: str | None) -> str:
+    value = classifier or DEFAULT_CLASSIFIER
+    if value not in CLASSIFIER_CHOICES:
+        raise ScoreInputError(
+            f"unknown classifier {value!r}; expected one of {', '.join(CLASSIFIER_CHOICES)}"
+        )
+    return value
+
+
+def resolve_classifier_method(
+    events_by_agent: dict[str, list[VisibilityEvent]],
+    *,
+    classifier: str | None,
+) -> str:
+    """Resolve CLI/API classifier choice to the emitted scorer method.
+
+    ``auto`` preserves historical prefix-only behavior for old archived runs,
+    but switches to ``kind_v1`` as soon as any counted send_message event
+    carries a structured ``kind`` field.
+    """
+
+    choice = normalize_classifier_choice(classifier)
+    if choice != CLASSIFIER_AUTO:
+        return choice
+    for events in events_by_agent.values():
+        for event in events:
+            if is_send_message_event(event) and kind_value_from_payload(event.payload or {})[0]:
+                return CLASSIFIER_KIND_V1
+    return CLASSIFIER_PREFIX_V1
 
 
 def is_tool_call_event(event: VisibilityEvent, tool_name: str) -> bool:
@@ -390,7 +583,11 @@ def load_dataset(*, team: str | None, events_dir: Path | None) -> CollabDataset:
     )
 
 
-def extract_send_messages(events_by_agent: dict[str, list[VisibilityEvent]]) -> list[SendMessageEvent]:
+def extract_send_messages(
+    events_by_agent: dict[str, list[VisibilityEvent]],
+    *,
+    classifier_method: str,
+) -> list[SendMessageEvent]:
     sends: list[SendMessageEvent] = []
     for agent, events in events_by_agent.items():
         for event in events:
@@ -409,7 +606,11 @@ def extract_send_messages(events_by_agent: dict[str, list[VisibilityEvent]]) -> 
                     sender=sender,
                     recipient=recipient,
                     timestamp=parse_timestamp(event.timestamp),
-                    semantic=classify_semantic(event.summary, payload),
+                    semantic=classify_semantic(
+                        event.summary,
+                        payload,
+                        classifier=classifier_method,
+                    ),
                 )
             )
     return sends
@@ -580,9 +781,10 @@ def semantic_rtt_doc(
     rtt: RttResult,
     *,
     sender: str | None = None,
+    classifier_method: str,
 ) -> dict[str, Any]:
     buckets, unmatched = semantic_rtt_buckets(rtt, sender=sender)
-    out: dict[str, Any] = {"classifier_method": CLASSIFIER_METHOD}
+    out: dict[str, Any] = {"classifier_method": classifier_method}
     for label in SEMANTIC_LABELS:
         out[label] = percentile_triplet(
             buckets.get(label, []),
@@ -819,6 +1021,7 @@ def build_scorecards(
     scenario: str,
     run_id: str,
     coupling_intent: str | None = None,
+    classifier: str | None = DEFAULT_CLASSIFIER,
 ) -> tuple[dict[str, Any], dict[str, Any], dict[str, dict[str, Any]]]:
     coupling_intent = normalize_coupling_intent(coupling_intent)
     merged_events_by_agent: dict[str, list[VisibilityEvent]] = defaultdict(list)
@@ -831,9 +1034,13 @@ def build_scorecards(
     events_by_agent = {
         agent: sort_events(events) for agent, events in merged_events_by_agent.items()
     }
+    classifier_method = resolve_classifier_method(events_by_agent, classifier=classifier)
     backend_by_agent = {agent: backend_for(events) for agent, events in events_by_agent.items()}
     agents = sorted(events_by_agent)
-    send_messages = extract_send_messages(events_by_agent)
+    send_messages = extract_send_messages(
+        events_by_agent,
+        classifier_method=classifier_method,
+    )
     terminals = extract_terminal_events(events_by_agent)
     rtt = compute_rtt(send_messages)
     m13_attributions = m13_attribution_records(send_messages, terminals, backend_by_agent)
@@ -933,7 +1140,11 @@ def build_scorecards(
             backend_by_agent,
         )
         m11a_peer = percentile_triplet(agent_samples, include_unmatched=agent_unmatched)
-        m11a_by_semantic = semantic_rtt_doc(rtt, sender=agent)
+        m11a_by_semantic = semantic_rtt_doc(
+            rtt,
+            sender=agent,
+            classifier_method=classifier_method,
+        )
         agent_classification_coverage = classification_coverage(semantic_by_sender[agent], peer_sent)
         agent_compliance = coupling_compliance_doc(
             coupling_intent=coupling_intent,
@@ -1048,7 +1259,10 @@ def build_scorecards(
             "M9_delivery_breakdown": delivery_breakdown_dict(total_steer_counter),
             "M11a_team_p95_rtt_seconds": team_m11a["p95"],
             "M11a_team_rtt_seconds": team_m11a,
-            "M11a_peer_dm_rtt_seconds_by_semantic": semantic_rtt_doc(rtt),
+            "M11a_peer_dm_rtt_seconds_by_semantic": semantic_rtt_doc(
+                rtt,
+                classifier_method=classifier_method,
+            ),
             "M11a_classification_coverage": team_classification_coverage,
             "M11a_coupling_compliance": team_compliance,
             "samples_used_for_M11a": team_m11a["samples"],
@@ -1115,6 +1329,16 @@ def build_arg_parser() -> argparse.ArgumentParser:
             "Legacy aliases tight/loose are normalized here only."
         ),
     )
+    parser.add_argument(
+        "--classifier",
+        choices=CLASSIFIER_CHOICES,
+        default=DEFAULT_CLASSIFIER,
+        help=(
+            "Semantic classifier for send_message events. auto selects kind_v1 "
+            "when structured send_message kind fields are present, otherwise "
+            "prefix_v1."
+        ),
+    )
     return parser
 
 
@@ -1128,6 +1352,7 @@ def main(argv: list[str] | None = None) -> int:
             scenario=args.scenario,
             run_id=args.run_id,
             coupling_intent=args.coupling_intent,
+            classifier=args.classifier,
         )
         write_outputs(args.out, scenario_doc, pairs_doc, per_agent)
     except ScoreInputError as exc:
