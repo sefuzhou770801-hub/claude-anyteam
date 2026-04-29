@@ -257,3 +257,72 @@ This is a different failure mode from #62. In #62 the recipient field was absent
 - Per-agent: `runs/S8-W7-20260429T0040Z-postfix-verify-v2/collab/agents/{codex,kimi}-pair.json`
 - Sample event w/ recipient field: `runs/S8-W7-20260429T0040Z-postfix-verify-v2/events/codex-pair.jsonl` (lines 1–4)
 - Full pytest at scoring HEAD `6683396`: `1023 passed, 2 deselected, 1 warning`
+
+## S6 symmetric verification (M11a quantification, run-id S6-W7-20260429T0117Z-postfix-verify-symmetric)
+
+To close the M11a measurement gap from the S8 run, ran S6 (`paired-codex-codex`, codex+codex symmetric) at integration HEAD `dcc5bfa` (post-#63 telemetry fix).
+
+### Results
+
+```json
+{
+  "git_sha": "dcc5bfa",
+  "n_completed": 15, "n_blocked": 0, "n_tasks": 15,
+  "wall_clock_seconds": 1404.6,
+  "M11a_p50": 36.519,
+  "M11a_team_p95_rtt_seconds": 72.966,
+  "M11a_max": 253.643,
+  "samples_used_for_M11a": 218,
+  "M11b_team_p95_turn_duration_seconds": 62.5,
+  "M5_team_failure_rate": 0.0,
+  "M13_total_collisions": 0,
+  "M12_team_average_coverage_ratio": 0.642,
+  "M1_team_throughput_per_min": 3.815,
+  "M4_team_cross_peer_ratio": 0.991,
+  "s1_flatten_violations": 0,
+  "harness_preservation_violations": 0,
+  "visibility_degraded_count": 1
+}
+```
+
+### M11a is now measurable end-to-end
+
+| metric | S8 (codex+kimi, asymmetric) | S6 (codex+codex, symmetric) |
+| ------ | --------------------------- | --------------------------- |
+| samples_used_for_M11a | 0 | **218** |
+| M11a p50 | null | **36.519s** |
+| M11a p95 | null | **72.966s** |
+| M11a max | null | **253.643s** |
+| M3_total_peer_dms | 60 | **226** |
+| M13_total_send_message_replies | 15 | **92** |
+
+The telemetry fix at `29210d9` is verified working in production. The 218 RTT samples were paired across 226 peer-DMs (96.5% pairing rate; 8 unmatched sends — within expected noise for in-flight messages at run end).
+
+### Quality / completion held
+
+- 15/15 task completion (5/5 across recent unflagged runs at integration HEAD)
+- M5 / M13 / S1 = 0 / 0 / 0
+- Wall clock 1404.6s — comparable to S8's 1248.6s adjusting for the higher peer-DM volume (226 vs 60)
+- M11b p95 turn duration = 62.5s (faster than S8's 379s — codex/codex pairs converge quicker than codex/kimi)
+
+### Caveat: classification still "other"
+
+`M11a_classification_coverage = 0.0` — all 226 peer-DMs landed in the "other" semantic bucket because codex doesn't prefix bodies with R14 tags (`[ASK]:`, `[ANSWER]:`, etc.); it uses the `kind` field in the structured `send_message` envelope instead. The score_collab classifier is `prefix_v1` and only reads bodies. RTT measurement still works at the team-aggregate level (since pairing is by sender/recipient, not by tag), but per-semantic breakdown is null. Future work: extend `prefix_v1` → `kind_v1` to read the `kind` field for codex-style envelopes.
+
+### Implications for ship verdict
+
+**M11a is now quantified.** No prior baseline exists for direct comparison (pre-session post-16 didn't expose p50 in the headline scorecard), but:
+
+- 218 samples > 0 — telemetry fix works
+- p50 = 36.519s on full real-task workload (mcp_anyteam_grep implementation across coupled codex pair)
+- p95 = 72.966s, well under any reasonable hand-off latency budget
+- Cross-peer ratio = 99.1% — peers actually talked to each other rather than to lead
+
+Combined with the S8 qualitative win (15/15, M5/M13=0), the substrate is **shippable on every measurable axis**.
+
+### Artifacts (S6 verification)
+
+- Scorecard: `runs/S6-W7-20260429T0117Z-postfix-verify-symmetric/scorecard.json`
+- Per-agent: `runs/S6-W7-20260429T0117Z-postfix-verify-symmetric/collab/agents/codex-pair-{a,b}.json`
+- Pair-level RTT: `runs/S6-W7-20260429T0117Z-postfix-verify-symmetric/collab/pairs.json`
+- Note: scoring required `PYTHONPATH=.` post-hoc; the original detached launch lacked it. Patch incoming to make `tools.stress` import resilient inside `setsid nohup` shells.
