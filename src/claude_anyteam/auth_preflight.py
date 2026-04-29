@@ -86,6 +86,10 @@ def reset_after_seconds(text: str) -> int | None:
     return total or None
 
 
+_QUOTA_HTTP_RE = re.compile(r"(?<!\d)429(?!\d)")
+_INVALID_AUTH_HTTP_RE = re.compile(r"(?<!\d)401(?!\d)")
+
+
 def classify_auth_error(text: str) -> tuple[AuthErrorClass, int | None] | None:
     """Classify backend API diagnostics that should fail spawn fast."""
 
@@ -101,9 +105,8 @@ def classify_auth_error(text: str) -> tuple[AuthErrorClass, int | None] | None:
         "rate limit exceeded",
         "rate_limit_exceeded",
         "too many requests",
-        "429",
     )
-    if any(marker in lowered for marker in quota_markers):
+    if any(marker in lowered for marker in quota_markers) or _QUOTA_HTTP_RE.search(lowered):
         return "quota_exhausted", reset_after_seconds(text)
 
     invalid_markers = (
@@ -123,8 +126,7 @@ def classify_auth_error(text: str) -> tuple[AuthErrorClass, int | None] | None:
         "no credentials",
         "permission denied",
         "moonshot_api_key",
-        "401",
     )
-    if any(marker in lowered for marker in invalid_markers):
+    if any(marker in lowered for marker in invalid_markers) or _INVALID_AUTH_HTTP_RE.search(lowered):
         return "invalid_authentication", None
     return None
