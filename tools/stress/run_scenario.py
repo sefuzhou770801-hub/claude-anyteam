@@ -111,6 +111,16 @@ SCENARIOS: dict[str, dict[str, Any]] = {
         "n_tasks": 15,
         "env": {},
     },
+    "S6n": {
+        "name": "paired-claude-claude",
+        "team_size": 2,
+        "members": [
+            {"name": "claude-pair-a", "agent_type": "claude", "model": "sonnet"},
+            {"name": "claude-pair-b", "agent_type": "claude", "model": "sonnet"},
+        ],
+        "n_tasks": 15,
+        "env": {},
+    },
     "S7": {
         "name": "paired-gemini-codex",
         "team_size": 2,
