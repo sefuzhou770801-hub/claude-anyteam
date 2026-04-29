@@ -406,3 +406,44 @@ Both are substantial follow-ups. We are shipping with the **measured-improvement
 - Auth classifier fix: src/claude_anyteam/auth_preflight.py (61b841a)
 - Backend onboarding doc: `docs/adding-a-backend.md` (468659e)
 - kind_v1 classifier extension: tools/stress/score_collab.py (9ab518f) — rescored S6 → M11a_classification_coverage 0.0 → 0.367, fyi bucket 0 → 83 samples
+
+## S5+W10 cross-backend stability (4-backend rendezvous workload, run-id S5-W10-20260429T0237Z-stability)
+
+The longest cross-backend run captured to date. All four routed harnesses (codex+gemini+kimi+claude) on the coupled W10 rendezvous workload (n_tasks=30). 90-min budget; finished within 89.8 min.
+
+```json
+{
+  "git_sha": "087020d",
+  "scenario_name": "heterogeneous-mixed",
+  "n_completed": 30, "n_blocked": 0, "n_tasks": 30,
+  "wall_clock_seconds": 5389.3,
+  "M1_team_throughput_per_min": 0.32,
+  "M5_team_failure_rate": 0.0,
+  "M11b_team_p95_turn_duration_seconds": 303.9,
+  "M12_team_average_coverage_ratio": 0.571,
+  "M13_total_collisions": 0,
+  "s1_flatten_violations": 0,
+  "harness_preservation_violations": 0,
+  "visibility_degraded_count": 2
+}
+```
+
+**30/30 task completion across the full 4-backend matrix.** Substrate failure metrics held: M5=0, M13=0, S1=0. visibility_degraded_count=2 within the established tolerance. M11a samples=0 because W10's rendezvous protocol routes through the lead more than peer-DMs (the workload framing biases away from direct peer coordination).
+
+This is the broadest demonstration of §1 (harness preservation): four heterogeneous CLI harnesses, none flattened or quirked, completing 30 coupled tasks together.
+
+Per-agent breakdown (collab/agents/*.json): no agent emitted task_blocked or visibility_degraded above the team aggregate. All four backends stayed alive through the full 90-min window.
+
+## Native-Claude bridge (proto-rev/impl/native-claude-spawn → integration 9c3e134)
+
+The S6n verification gap led to building a fourth routed backend: `src/claude_anyteam/backends/claude_native/`. 992 lines across 6 files (cli, config, invoke, loop, prompts, __init__) plus integration hooks in `tools/stress/run_scenario.py`.
+
+Key design points:
+- Wraps `claude --print --output-format stream-json --verbose --mcp-config <wrapper-mcp.json>` to drive native Claude in headless mode while the bridge owns Agent Teams I/O (inbox polling, task claim, visibility events, lifecycle).
+- Same shape as the kimi backend (which also uses `--print` + MCP wrapper). The stream-JSON is parsed in invoke.py and bridged into the standard `HeadlessTurnVisibility` event stream.
+- Native Claude's full tool surface (Read/Edit/Write/Bash/etc) flows through to teammates — preserves §1 (harness specificity) end-to-end.
+- The interactive `claude --agent-id ...` pattern remains available for in-session Agent Teams use; the new headless pattern is only triggered by the stress runner / external launchers.
+
+Full pytest at integration HEAD `9c3e134`: **1045 passed, 2 deselected, 1 warning**.
+
+S6n native baseline rerun launched detached (PID 3104427, run-id `S6n-W7-20260429T0416Z-native-baseline-v2`); both `claude_native.cli` processes alive, both `claude-anyteam-wrapper` MCP servers running. Scorecard pending.
