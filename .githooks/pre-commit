@@ -1,0 +1,36 @@
+#!/usr/bin/env bash
+# Block direct commits to protected branches. Reviewer-gated workflow only.
+#
+# Background (proto-rev/impl-2026-04-27 retro): the freelance-direct-edit
+# pattern by codex-impl-peer / codex-r5 / codex-workload caused at least
+# three documented `commit:` (not `merge:`) entries on
+# proto-rev/impl-2026-04-27, contaminating the FF-merge audit trail. Each
+# such commit forced opus-rev-impl into a stash/pop dance during their
+# next FF merge, multiplying rescue overhead.
+#
+# Enable on this checkout with:
+#     git config core.hooksPath .githooks
+#
+# Emergency override (e.g. cherry-pick rescue, hotfix, automated flow):
+#     ANYTEAM_BYPASS_GATE=1 git commit ...
+#
+# Exit codes: 0 allow, 1 block.
+
+set -euo pipefail
+
+branch="$(git symbolic-ref --short HEAD 2>/dev/null || true)"
+
+case "${branch}" in
+    proto-rev/impl-2026-04-27|main)
+        if [[ "${ANYTEAM_BYPASS_GATE:-0}" == "1" ]]; then
+            echo "WARN: bypassing review gate (ANYTEAM_BYPASS_GATE=1) on ${branch}" >&2
+            exit 0
+        fi
+        echo "ERROR: direct commits to ${branch} are forbidden." >&2
+        echo "  - Use a feature branch + reviewer FF merge (see docs/architecture.md §contributing)." >&2
+        echo "  - Emergency override: set ANYTEAM_BYPASS_GATE=1." >&2
+        exit 1
+        ;;
+esac
+
+exit 0

@@ -15,7 +15,14 @@ from unittest.mock import patch
 
 from claude_anyteam import loop as loop_mod
 from claude_anyteam.config import Settings
-from claude_anyteam.loop import LoopState, _find_and_claim, _handle_message
+from claude_anyteam.loop import (
+    LoopState,
+    _find_and_claim,
+    _handle_message,
+    _handle_prose_batch,
+    _mid_turn_prose_should_be_steer,
+    _partition_inbox,
+)
 
 
 def _settings() -> Settings:
@@ -46,6 +53,7 @@ class FakeTask:
     status: str = "pending"
     owner: str | None = None
     blocked_by: list[str] = field(default_factory=list)
+    coupling: dict | str | None = None
 
 
 # ---- _handle_message / shutdown ----------------------------------------------
@@ -59,17 +67,17 @@ def test_shutdown_while_idle_approves_and_exits():
     sent: list[tuple] = []
     with patch.object(
         loop_mod.pio,
-        "send_shutdown_response",
+        "send_shutdown_approved",
         side_effect=lambda *a, **k: sent.append((a, k)),
     ):
         _handle_message(state, msg)
     assert state.approved_shutdown is True
     assert state.shutdown_requested is False
     assert len(sent) == 1
-    # (team, agent, req_id, approve=True)
+    # (team, agent, req_id)
     args, kwargs = sent[0]
     assert args[2] == "r1"
-    assert kwargs["approve"] is True
+    assert kwargs == {}
 
 
 def test_shutdown_while_idle_clears_lineage_state():
@@ -82,7 +90,7 @@ def test_shutdown_while_idle_clears_lineage_state():
         text=json.dumps({"type": "shutdown_request", "request_id": "r1b"}),
     )
 
-    with patch.object(loop_mod.pio, "send_shutdown_response"):
+    with patch.object(loop_mod.pio, "send_shutdown_approved"):
         _handle_message(state, msg)
 
     assert state.approved_shutdown is True
@@ -98,7 +106,7 @@ def test_shutdown_while_mid_task_rejects_with_feedback():
     sent: list[tuple] = []
     with patch.object(
         loop_mod.pio,
-        "send_shutdown_response",
+        "send_shutdown_rejected",
         side_effect=lambda *a, **k: sent.append((a, k)),
     ):
         _handle_message(state, msg)
@@ -106,8 +114,7 @@ def test_shutdown_while_mid_task_rejects_with_feedback():
     assert state.shutdown_requested is True  # queued for later
     args, kwargs = sent[0]
     assert args[2] == "r2"
-    assert kwargs["approve"] is False
-    assert "in-flight task #4" in kwargs["feedback"]
+    assert "in-flight task #4" in kwargs["reason"]
 
 
 def test_shutdown_duplicate_request_id_ignored():
@@ -116,19 +123,28 @@ def test_shutdown_duplicate_request_id_ignored():
     msg = FakeInboxMessage(
         text=json.dumps({"type": "shutdown_request", "request_id": "r3"}),
     )
-    with patch.object(loop_mod.pio, "send_shutdown_response") as m:
+    with (
+        patch.object(loop_mod.pio, "send_shutdown_approved") as approved,
+        patch.object(loop_mod.pio, "send_shutdown_rejected") as rejected,
+    ):
         _handle_message(state, msg)
     assert state.approved_shutdown is False
-    assert m.call_count == 0
+    assert approved.call_count == 0
+    assert rejected.call_count == 0
 
 
-def _fake_codex_result(reply: str = "Four.", exit_code: int = 0, tool_call_events: int = 0):
+def _fake_codex_result(
+    reply: str = "Four.",
+    exit_code: int = 0,
+    tool_call_events: int = 0,
+    events: list[dict] | None = None,
+):
     from claude_anyteam import codex as codex_mod
     return codex_mod.CodexResult(
         exit_code=exit_code,
         structured=None,
         last_message=reply,
-        events=[],
+        events=events or [],
         error=None if exit_code == 0 else "oops",
         tool_call_events=tool_call_events,
     )
@@ -139,6 +155,13 @@ def _settings_no_app_server() -> Settings:
     s = _settings()
     d = {f: getattr(s, f) for f in s.__dataclass_fields__}
     d["app_server"] = False
+    return s.__class__(**d)
+
+
+def _settings_with_turn_timeout(timeout_s: float) -> Settings:
+    s = _settings()
+    d = {f: getattr(s, f) for f in s.__dataclass_fields__}
+    d["turn_timeout_s"] = timeout_s
     return s.__class__(**d)
 
 
@@ -172,6 +195,24 @@ def test_prose_message_app_server_invokes_codex_and_replies_to_sender():
     to, text = sent[0]
     assert to == "peer-bob"
     assert "Four." in text
+
+
+def test_prose_message_app_server_uses_configured_turn_timeout():
+    state = LoopState(settings=_settings_with_turn_timeout(1800.0))
+    msg = FakeInboxMessage(text="status?", from_="peer-bob")
+    captured: dict[str, object] = {}
+
+    def fake_invoke(**kwargs):
+        captured.update(kwargs)
+        return _fake_codex_result("Still working.")
+
+    with (
+        patch.object(loop_mod.codex_mod, "app_server_invoke", side_effect=fake_invoke),
+        patch.object(loop_mod.pio, "send_prose"),
+    ):
+        _handle_message(state, msg)
+
+    assert captured["overall_timeout_s"] == 1800.0
 
 
 def test_prose_message_fresh_exec_path_replies_to_sender():
@@ -231,6 +272,157 @@ def test_prose_message_skips_fallback_when_codex_used_send_message_tool():
 
     # No fallback sent — model delivered via tool already.
     assert sent == []
+
+
+def test_prose_message_skips_final_text_when_codex_used_send_message_tool():
+    """Forward-compat: Codex also treats post-tool prose as non-delivery text."""
+    state = LoopState(settings=_settings())
+    msg = FakeInboxMessage(text="hello", from_="peer-bob")
+    result = loop_mod.codex_mod.CodexResult(
+        exit_code=0,
+        structured=None,
+        last_message="Already replied via send_message.",
+        events=[{"type": "mcp_tool_call", "name": "send_message"}],
+        error=None,
+        tool_call_events=1,
+    )
+
+    sent: list[tuple] = []
+
+    with (
+        patch.object(loop_mod.codex_mod, "app_server_invoke", return_value=result),
+        patch.object(
+            loop_mod.pio,
+            "send_prose",
+            side_effect=lambda team, sender, to, text, summary: sent.append((to, text)),
+        ),
+    ):
+        _handle_message(state, msg)
+
+    assert sent == []
+
+
+def test_prose_message_skips_final_text_when_app_server_tool_field_names_send_message():
+    """Codex App Server reports the called wrapper tool in params.item.tool.
+
+    The #51 diagnostic probe observed this exact event shape. Before the
+    regression fix the delivered-via-tool guard only checked name/tool_name,
+    missed this event, and could relay redundant final prose after a real
+    send_message delivery.
+    """
+    state = LoopState(settings=_settings())
+    msg = FakeInboxMessage(text="hello", from_="peer-bob")
+    result = _fake_codex_result(
+        "Already replied via team mailbox.",
+        exit_code=0,
+        tool_call_events=2,
+        events=[
+            {
+                "method": "item/completed",
+                "params": {
+                    "item": {
+                        "type": "mcpToolCall",
+                        "server": "claude_anyteam_wrapper",
+                        "tool": "send_message",
+                        "status": "completed",
+                    }
+                },
+            }
+        ],
+    )
+
+    sent: list[tuple] = []
+
+    with (
+        patch.object(loop_mod.codex_mod, "app_server_invoke", return_value=result),
+        patch.object(
+            loop_mod.pio,
+            "send_prose",
+            side_effect=lambda team, sender, to, text, summary: sent.append((to, text)),
+        ),
+    ):
+        _handle_message(state, msg)
+
+    assert sent == []
+
+
+def test_prose_message_retries_send_message_unavailable_flap():
+    """A missing-send_message final answer is repaired, not relayed.
+
+    Pre-fix behavior sent the invalid prose directly to the peer. The fixed
+    path retries once with a hard read_config/protocol_tools repair prompt and
+    suppresses fallback when the retry delivers through send_message.
+    """
+    state = LoopState(settings=_settings())
+    msg = FakeInboxMessage(text="please ack", from_="peer-bob")
+    bad = _fake_codex_result(
+        "I don't have a send_message MCP tool available in this session.",
+        exit_code=0,
+    )
+    repaired = _fake_codex_result("", exit_code=0, tool_call_events=1)
+    invocations: list[dict] = []
+    results = iter([bad, repaired])
+
+    def fake_invoke(**kwargs):
+        invocations.append(kwargs)
+        return next(results)
+
+    sent: list[tuple] = []
+
+    with (
+        patch.object(loop_mod.codex_mod, "app_server_invoke", side_effect=fake_invoke),
+        patch.object(
+            loop_mod.pio,
+            "send_prose",
+            side_effect=lambda team, sender, to, text, summary: sent.append((to, text)),
+        ),
+    ):
+        _handle_message(state, msg)
+
+    assert len(invocations) == 2
+    repair_prompt = invocations[1]["task_prompt"]
+    assert "previous final prose claimed" in repair_prompt
+    assert "read_config()" in repair_prompt
+    assert "protocol_tools" in repair_prompt
+    assert "send_message(to='peer-bob'" in repair_prompt
+    assert sent == []
+
+
+def test_prose_message_suppresses_repeated_send_message_unavailable_flap():
+    """If the repair turn still flaps, send diagnostic fallback instead."""
+    state = LoopState(settings=_settings())
+    msg = FakeInboxMessage(text="please ack", from_="peer-bob")
+    bad = _fake_codex_result(
+        "I don't have access to a `send_message` MCP tool.",
+        exit_code=0,
+    )
+    still_bad = _fake_codex_result(
+        "There is no send_message MCP tool available.",
+        exit_code=0,
+    )
+    results = iter([bad, still_bad])
+
+    def fake_invoke(**kwargs):
+        return next(results)
+
+    sent: list[tuple] = []
+
+    with (
+        patch.object(loop_mod.codex_mod, "app_server_invoke", side_effect=fake_invoke),
+        patch.object(
+            loop_mod.pio,
+            "send_prose",
+            side_effect=lambda team, sender, to, text, summary: sent.append((to, text)),
+        ),
+    ):
+        _handle_message(state, msg)
+
+    assert len(sent) == 1
+    to, text = sent[0]
+    assert to == "peer-bob"
+    assert "mcp_send_message_unavailable" in text
+    assert "I don't have" not in text
+    assert "no send_message MCP tool" not in text
 
 
 def test_prose_message_codex_fail_sends_fallback_ack():
@@ -309,7 +501,7 @@ def test_mid_turn_shutdown_sends_reject_response_immediately(tmp_path: Path):
         patch.object(loop_mod.pio, "read_own_inbox", return_value=[shutdown_msg]),
         patch.object(
             loop_mod.pio,
-            "send_shutdown_response",
+            "send_shutdown_rejected",
             side_effect=lambda *a, **k: sent.append((a, k)),
         ),
         patch.object(loop_mod.codex_mod, "app_server_invoke", side_effect=fake_invoke),
@@ -321,8 +513,28 @@ def test_mid_turn_shutdown_sends_reject_response_immediately(tmp_path: Path):
     assert len(sent) == 1
     args, kwargs = sent[0]
     assert args[2] == "mid-task-1"
-    assert kwargs["approve"] is False
-    assert kwargs["feedback"] == "in-flight task #42"
+    assert kwargs["reason"] == "in-flight task #42"
+
+
+def test_task_app_server_uses_configured_turn_timeout(tmp_path: Path):
+    state = LoopState(settings=_settings_with_turn_timeout(2400.0))
+    task = SimpleNamespace(id="42")
+    schema_path = tmp_path / "task-complete-schema.json"
+    schema_path.write_text("{}", encoding="utf-8")
+    captured: dict[str, object] = {}
+
+    def fake_invoke(**kwargs):
+        captured.update(kwargs)
+        return _fake_codex_result("done")
+
+    with (
+        patch.object(loop_mod.codex_mod, "TASK_COMPLETE_SCHEMA", schema_path),
+        patch.object(loop_mod.pio, "read_own_inbox", return_value=[]),
+        patch.object(loop_mod.codex_mod, "app_server_invoke", side_effect=fake_invoke),
+    ):
+        loop_mod._execute_task_app_server(state, task, prompt="do work")
+
+    assert captured["overall_timeout_s"] == 2400.0
 
 
 def test_mid_turn_shutdown_duplicate_request_id_is_ignored(tmp_path: Path):
@@ -345,7 +557,7 @@ def test_mid_turn_shutdown_duplicate_request_id_is_ignored(tmp_path: Path):
         patch.object(loop_mod.pio, "read_own_inbox", return_value=[shutdown_msg]),
         patch.object(
             loop_mod.pio,
-            "send_shutdown_response",
+            "send_shutdown_rejected",
             side_effect=lambda *a, **k: sent.append((a, k)),
         ),
         patch.object(loop_mod.codex_mod, "app_server_invoke", side_effect=fake_invoke),
@@ -446,6 +658,47 @@ def test_claim_treats_empty_string_owner_as_unassigned():
     assert state.in_flight_task == "9"
 
 
+def test_claim_emits_coupling_conflict_without_blocking_dispatch():
+    state = LoopState(
+        settings=_settings_no_app_server(),  # codex_exec manifest declares loose
+        self_capability_manifest={
+            "agent_name": "a",
+            "coupling_regime": "loose",
+            "coupling": {"intent": "loose_parallel"},
+        },
+    )
+    tasks = [
+        FakeTask(id="7", status="pending", owner="a", coupling="tight"),
+    ]
+    emitted: list[dict] = []
+
+    def fake_claim(team, tid, owner, active_form):
+        return tasks[0]
+
+    def fake_emit(**kwargs):
+        emitted.append(kwargs)
+        return None
+
+    with (
+        patch.object(loop_mod.pio, "list_tasks", return_value=tasks),
+        patch.object(loop_mod.pio, "claim_task", side_effect=fake_claim),
+        patch.object(loop_mod.pio, "emit_coupling_conflict_if_needed", side_effect=fake_emit),
+    ):
+        result = _find_and_claim(state)
+
+    assert result is tasks[0]
+    assert state.in_flight_task == "7"
+    assert emitted == [
+        {
+            "team": "t",
+            "agent": "a",
+            "backend": "codex_exec",
+            "task": tasks[0],
+            "manifest": state.self_capability_manifest,
+        }
+    ]
+
+
 def test_claim_skips_blocked_tasks():
     state = LoopState(settings=_settings())
     tasks = [
@@ -484,3 +737,310 @@ def test_claim_returns_none_when_all_claimed_or_blocked():
     assert result is None
     assert state.in_flight_task is None
     assert m.call_count == 0
+
+
+# ---- _mid_turn_prose_should_be_steer (phase4 #17) ---------------------------
+#
+# Phase4 #17 lands the L4 half of the R3/#59 sender-side messageKind
+# discriminator. These tests pin the per-kind decision matrix so future
+# refactors cannot silently undo the throughput-regression fix observed in
+# stress run S6+W7-post59 (n_completed=3/15, M11a p95 RTT=237s) where
+# informational peer-DMs jammed recipient turn budgets via queued steers.
+
+
+def test_mid_turn_prose_should_be_steer_lead_prose_always_steer_default_kind():
+    # Lead prose without an explicit kind defaults to steer for operational
+    # parity with native Claude leads.
+    assert _mid_turn_prose_should_be_steer(
+        sender="team-lead",
+        recipient_capabilities=[],
+        message_kind=None,
+    ) is True
+
+
+def test_mid_turn_prose_should_be_steer_lead_informational_still_steer():
+    # Lead authority overrides messageKind: an explicit "informational" lead
+    # prose still becomes a steer, because §3 declares lead-as-orchestrator
+    # in all backends regardless of how the helper labelled the wire.
+    assert _mid_turn_prose_should_be_steer(
+        sender="team-lead",
+        recipient_capabilities=["accepts_peer_steer"],
+        message_kind="informational",
+    ) is True
+
+
+def test_mid_turn_prose_should_be_steer_peer_informational_never_steer_even_when_recipient_accepts():
+    # Core regression — without this branch, a peer's kind="informational"
+    # coordination DM would queue as steer when recipient declares
+    # accepts_peer_steer, which is exactly the post-#59 throughput collapse.
+    assert _mid_turn_prose_should_be_steer(
+        sender="codex-r1",
+        recipient_capabilities=["accepts_peer_steer"],
+        message_kind="informational",
+    ) is False
+
+
+def test_mid_turn_prose_should_be_steer_peer_steer_kind_with_capability_is_steer():
+    # When sender explicitly tagged kind="steer" and recipient declares
+    # accepts_peer_steer, the prose should become a steer fragment.
+    assert _mid_turn_prose_should_be_steer(
+        sender="codex-r1",
+        recipient_capabilities=["accepts_peer_steer"],
+        message_kind="steer",
+    ) is True
+
+
+def test_mid_turn_prose_should_be_steer_peer_handoff_with_capability_defers():
+    # Matrix lift #5: peer messages are informational by default; handoff is
+    # ordinary coordination, not a mid-turn interrupt.
+    assert _mid_turn_prose_should_be_steer(
+        sender="codex-r1",
+        recipient_capabilities=["accepts_peer_steer"],
+        message_kind="handoff",
+    ) is False
+
+
+def test_mid_turn_prose_should_be_steer_peer_unknown_kind_with_capability_defers():
+    # Unknown kinds must not accidentally acquire interrupt semantics.
+    assert _mid_turn_prose_should_be_steer(
+        sender="codex-r1",
+        recipient_capabilities=["accepts_peer_steer"],
+        message_kind="future_kind",
+    ) is False
+
+
+def test_mid_turn_prose_should_be_steer_peer_default_kind_with_capability_defers():
+    # Missing/legacy peer kind is now informational by default; only explicit
+    # kind="steer" may interrupt.
+    assert _mid_turn_prose_should_be_steer(
+        sender="codex-r1",
+        recipient_capabilities=["accepts_peer_steer"],
+        message_kind=None,
+    ) is False
+
+
+def test_mid_turn_prose_should_be_steer_peer_default_kind_without_capability_defers():
+    # Pre-R3 wire row from peer; recipient does NOT declare
+    # accepts_peer_steer → defer to post-turn handler (post-#56 contract).
+    assert _mid_turn_prose_should_be_steer(
+        sender="codex-r1",
+        recipient_capabilities=[],
+        message_kind=None,
+    ) is False
+
+
+def test_mid_turn_prose_should_be_steer_peer_informational_without_capability_defers():
+    # Belt-and-suspenders: even when capability is absent, kind="informational"
+    # never becomes steer. Both branches agree on defer.
+    assert _mid_turn_prose_should_be_steer(
+        sender="codex-r1",
+        recipient_capabilities=[],
+        message_kind="informational",
+    ) is False
+
+
+def test_mid_turn_prose_should_be_steer_peer_steer_kind_without_capability_defers():
+    # kind="steer" alone does NOT override the recipient's lack of
+    # accepts_peer_steer. The capability declaration governs.
+    assert _mid_turn_prose_should_be_steer(
+        sender="codex-r1",
+        recipient_capabilities=[],
+        message_kind="steer",
+    ) is False
+
+
+def test_mid_turn_prose_should_be_steer_no_sender_defers():
+    # Defensive: sender=None must not crash and must not become a steer.
+    assert _mid_turn_prose_should_be_steer(
+        sender=None,
+        recipient_capabilities=["accepts_peer_steer"],
+        message_kind=None,
+    ) is False
+    assert _mid_turn_prose_should_be_steer(
+        sender=None,
+        recipient_capabilities=["accepts_peer_steer"],
+        message_kind="steer",
+    ) is False
+
+
+# ---- _handle_prose_batch (#18 prose-handler cascade fix) -------------------
+#
+# Phase4 #18 collapses consecutive prose messages in one inbox drain into a
+# single Codex invocation. Pre-#18, N peer DMs produced N separate
+# `app_server_invoke` calls; each pays full thread/start + system-prompt cost.
+# These tests pin the empirical invariant so future refactors can't silently
+# regress the throughput fix. Per `feedback_tests_lock_empirical_invariants.md`,
+# tests are what prevent the regression — without them the fix would not stick.
+
+
+def test_prose_batch_5_messages_one_invocation():
+    """5 consecutive peer prose messages -> 1 app_server_invoke call.
+
+    Pre-fix: this asserts call_count==1 after dispatching 5 prose messages.
+    With the pre-#18 single-message handler the count would be 5, so this is
+    the load-bearing regression assertion for the cascade collapse.
+    """
+    state = LoopState(settings=_settings())
+    msgs = [
+        FakeInboxMessage(text=f"hello {i}", from_=f"peer-{i}") for i in range(5)
+    ]
+    invocations: list[dict] = []
+
+    def fake_invoke(**kwargs):
+        invocations.append(kwargs)
+        # Simulate Codex delivering replies via the send_message MCP tool —
+        # the success path with no fallback noise.
+        return _fake_codex_result("", exit_code=0, tool_call_events=5)
+
+    sent: list[tuple] = []
+    with (
+        patch.object(loop_mod.codex_mod, "app_server_invoke", side_effect=fake_invoke),
+        patch.object(
+            loop_mod.pio, "send_prose",
+            side_effect=lambda team, sender, to, text, summary: sent.append((to, text)),
+        ),
+    ):
+        _handle_prose_batch(state, msgs)
+
+    assert len(invocations) == 1, (
+        f"prose batch must collapse to 1 invocation; got {len(invocations)}"
+    )
+    prompt = invocations[0]["task_prompt"]
+    assert "# Team messaging" in prompt
+    assert "Plain prose output is NOT visible to teammates" in prompt
+    assert "try SendMessage (capitalized)" in prompt
+    # delivered_via_tool path: no fan-out send_prose calls (Codex addressed
+    # each sender via the MCP tool itself).
+    assert sent == []
+
+
+def test_prose_batch_preserves_per_sender_fallback():
+    """Codex crash mid-batch -> diagnostic fallback ack to EACH sender.
+
+    Preserves the "no silence" invariant. Collapsing N senders into a single
+    fallback would leave N-1 senders waiting for a reply that never arrives.
+    """
+    state = LoopState(settings=_settings())
+    msgs = [
+        FakeInboxMessage(text="hi", from_="peer-a"),
+        FakeInboxMessage(text="yo", from_="peer-b"),
+        FakeInboxMessage(text="?", from_="peer-c"),
+    ]
+    sent: list[tuple] = []
+    with (
+        patch.object(
+            loop_mod.codex_mod, "app_server_invoke",
+            side_effect=RuntimeError("codex segfault"),
+        ),
+        patch.object(
+            loop_mod.pio, "send_prose",
+            side_effect=lambda team, sender, to, text, summary: sent.append((to, text)),
+        ),
+    ):
+        _handle_prose_batch(state, msgs)
+
+    # One fallback per original sender — order-independent, no duplicates.
+    sent_to = sorted(to for to, _ in sent)
+    assert sent_to == ["peer-a", "peer-b", "peer-c"]
+    # Each fallback should be the diagnostic-shaped message with an
+    # incident id embedded — verify the shape, not the exact incident id.
+    for _, text in sent:
+        assert "incident=" in text
+        assert "claude-anyteam diagnose" in text
+
+
+def test_prose_batch_does_not_batch_protocol_messages():
+    """_partition_inbox keeps protocol messages individual; prose runs collapse.
+
+    Mixing 2 prose + 1 shutdown_request in one drain produces:
+    - 1 prose batch (2 messages) -> 1 app_server_invoke
+    - 1 protocol group (1 shutdown_request) -> handled by _handle_shutdown
+    """
+    msgs = [
+        FakeInboxMessage(text="hello", from_="peer-a"),
+        FakeInboxMessage(text="hi", from_="peer-b"),
+        FakeInboxMessage(
+            text=json.dumps({"type": "shutdown_request", "request_id": "r-batch-1"}),
+        ),
+    ]
+
+    groups = _partition_inbox(msgs)
+    assert len(groups) == 2
+    assert groups[0][0] == "prose"
+    assert len(groups[0][1]) == 2
+    assert groups[1][0] == "protocol"
+    assert len(groups[1][1]) == 1
+
+
+def test_prose_single_message_still_works():
+    """1 prose message -> 1 invocation, identical to pre-#18 single path."""
+    state = LoopState(settings=_settings())
+    msg = FakeInboxMessage(text="just one", from_="peer-solo")
+    invocations: list[dict] = []
+
+    def fake_invoke(**kwargs):
+        invocations.append(kwargs)
+        return _fake_codex_result("Solo reply.", exit_code=0)
+
+    sent: list[tuple] = []
+    with (
+        patch.object(loop_mod.codex_mod, "app_server_invoke", side_effect=fake_invoke),
+        patch.object(
+            loop_mod.pio, "send_prose",
+            side_effect=lambda team, sender, to, text, summary: sent.append((to, text)),
+        ),
+    ):
+        _handle_prose_batch(state, [msg])
+
+    assert len(invocations) == 1
+    # Single-message path uses send_prose for the reply (last_message text,
+    # no tool calls), so the sender receives the codex reply directly.
+    assert len(sent) == 1
+    to, text = sent[0]
+    assert to == "peer-solo"
+    assert "Solo reply." in text
+
+
+def test_prose_invocation_passes_event_sink():
+    """Both the single and batch invocations pass event_sink (§2 fix).
+
+    Pre-#18, `app_server_invoke` was called WITHOUT event_sink for prose
+    turns. Tool calls during prose (Read / Edit / Bash) vanished into the
+    wrapper instead of surfacing to the lead. This pins the §2 fix so a
+    future refactor can't silently drop the kwarg.
+    """
+    state = LoopState(settings=_settings())
+    invocations: list[dict] = []
+
+    def fake_invoke(**kwargs):
+        invocations.append(kwargs)
+        return _fake_codex_result("hi back")
+
+    # Single-message path
+    msg_solo = FakeInboxMessage(text="ping", from_="peer-x")
+    with (
+        patch.object(loop_mod.codex_mod, "app_server_invoke", side_effect=fake_invoke),
+        patch.object(loop_mod.pio, "send_prose"),
+    ):
+        _handle_prose_batch(state, [msg_solo])
+
+    # Batch path
+    msgs_many = [
+        FakeInboxMessage(text="a", from_="peer-y"),
+        FakeInboxMessage(text="b", from_="peer-z"),
+    ]
+    with (
+        patch.object(loop_mod.codex_mod, "app_server_invoke", side_effect=fake_invoke),
+        patch.object(loop_mod.pio, "send_prose"),
+    ):
+        _handle_prose_batch(state, msgs_many)
+
+    assert len(invocations) == 2
+    for inv in invocations:
+        assert "event_sink" in inv, "event_sink kwarg must be present"
+        assert inv["event_sink"] is not None, (
+            "prose invocations must pass a non-None event_sink so prose-time "
+            "tool calls surface to the lead (§2 visibility parity)"
+        )
+        # Sanity: it must be callable so app_server_invoke can fire it.
+        assert callable(inv["event_sink"])

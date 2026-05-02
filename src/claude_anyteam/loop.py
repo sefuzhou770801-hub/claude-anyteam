@@ -23,6 +23,7 @@ Safety properties:
 from __future__ import annotations
 
 import json
+import os
 import signal
 import time
 from dataclasses import dataclass, field
@@ -31,13 +32,69 @@ from typing import Any
 from . import codex as codex_mod
 from . import logger, protocol_io as pio
 from . import prompts as prompts_mod
+from .capabilities import (
+    CODEX_APP_SERVER_CAPABILITIES,
+    CODEX_EXEC_CAPABILITIES,
+    assert_known_capabilities,
+    effective_peer_steer_capabilities,
+    rich_capability_manifest,
+)
+from .capability_manifest import CapabilityManifestCache
 from .config import Settings
 from .messages import (
+    CapabilityManifestUpdatedIn,
     PlanApprovalRequestIn,
     ShutdownRequestIn,
+    SteerIn,
     parse_protocol_text,
 )
-from .registration import deregister, register
+from .registration import BackendMetadata, deregister, register
+from .watch_inbox import WatchInbox, adaptive_wait_s
+
+
+APP_SERVER_TASK_STATE_SAMPLE_EVERY = 5
+
+
+def _normalized_message_kind(kind: str | None) -> str | None:
+    if not isinstance(kind, str):
+        return None
+    normalized = kind.strip().lower()
+    if not normalized:
+        return None
+    return normalized.replace("_", "-")
+
+
+def _message_kind(msg: Any) -> str | None:
+    raw = getattr(msg, "message_kind", None)
+    if raw is None:
+        raw = getattr(msg, "messageKind", None)
+    return raw if isinstance(raw, str) else None
+
+
+def _mid_turn_prose_should_be_steer(
+    *,
+    sender: str | None,
+    recipient_capabilities: list[str],
+    message_kind: str | None = None,
+) -> bool:
+    """Return whether an untyped prose inbox message should become steer.
+
+    Lead prose remains an operational steer while a task is in flight. Peer
+    prose is ordinary coordination by default: only an explicit
+    ``messageKind=steer`` label, combined with recipient peer-steer
+    authorization, may become a mid-turn steer fragment.  This closes the
+    aproto-codex-bridge anti-pattern where any peer body that looked like a
+    steer (or any unlabelled peer prose to an accepting recipient) could
+    interrupt the active turn.
+    """
+
+    if sender == "team-lead":
+        return True
+    if sender is None:
+        return False
+    if _normalized_message_kind(message_kind) != "steer":
+        return False
+    return "accepts_peer_steer" in recipient_capabilities
 
 
 @dataclass
@@ -60,6 +117,44 @@ class LoopState:
     # conversational context. Same in-memory, same-process-lifetime scope
     # as codex_session_id.
     app_server_last_thread_id: str | None = None
+    peer_manifest_cache: CapabilityManifestCache | None = None
+    self_capability_manifest: dict[str, Any] | None = None
+
+
+def _backend_metadata(settings: Settings) -> BackendMetadata:
+    """Registration metadata for the Codex adapter.
+
+    09 R11 stores 08 §6.3 Agent Card-derived cheap capability flags on
+    the roster; the richer manifest is intentionally deferred to R12/R13 wrapper MCP.
+    """
+    capabilities = (
+        CODEX_APP_SERVER_CAPABILITIES if settings.app_server else CODEX_EXEC_CAPABILITIES
+    )
+    capabilities = assert_known_capabilities(capabilities)
+    if settings.app_server:
+        return BackendMetadata(
+            capabilities=capabilities,
+            capability_manifest=rich_capability_manifest(
+                capabilities,
+                delivery_mode="live",
+                expiry_semantics="live_only",
+                steer_authorization="lead_only",
+                host_tool_surface="codex-native",
+            ),
+            transport="codex-app-server",
+            host_tool_surface="codex-native",
+            coupling_regime="tight",
+        )
+    return BackendMetadata(
+        capabilities=capabilities,
+        capability_manifest=rich_capability_manifest(
+            capabilities,
+            host_tool_surface="codex-native",
+        ),
+        transport="codex-exec",
+        host_tool_surface="codex-native",
+        coupling_regime="loose",
+    )
 
 
 def run(settings: Settings) -> int:
@@ -70,9 +165,18 @@ def run(settings: Settings) -> int:
         team=settings.team_name,
         agent_name=settings.agent_name,
     )
-    register(settings)
+    register(settings, _backend_metadata(settings))
 
     state = LoopState(settings=settings)
+    state.self_capability_manifest = pio.read_agent_manifest(
+        settings.team_name,
+        settings.agent_name,
+    )
+    state.peer_manifest_cache = CapabilityManifestCache(
+        settings.team_name,
+        self_name=settings.agent_name,
+    )
+    state.peer_manifest_cache.load_startup()
 
     def _sig_handler(signum: int, _frame: Any) -> None:
         logger.warn("signal.received", signum=signum)
@@ -130,46 +234,65 @@ def _main_loop(state: LoopState) -> None:
     )
 
     idle_last_sent_at: float | None = None
+    inbox_watch = WatchInbox.for_team(
+        s.team_name,
+        s.agent_name,
+        fallback_timeout_s=s.poll_interval_s,
+    )
 
-    while not state.approved_shutdown:
-        # 1. Drain inbox. Use read_own_inbox so the "self-only" invariant is
-        # asserted at call time — the protocol mark-as-read path rewrites the
-        # file, and touching another teammate's inbox would corrupt its schema.
-        messages = pio.read_own_inbox(s.team_name, s.agent_name, s.agent_name)
-        for m in messages:
-            _handle_message(state, m)
-            if state.approved_shutdown:
+    try:
+        while not state.approved_shutdown:
+            # 1. Drain inbox. Use read_own_inbox so the "self-only" invariant is
+            # asserted at call time — the protocol mark-as-read path rewrites the
+            # file, and touching another teammate's inbox would corrupt its schema.
+            #
+            # Prose-batch dispatch (#18): consecutive prose messages collapse into
+            # a single Codex invocation via _handle_prose_batch. Protocol messages
+            # (shutdown_request, plan_approval_request, capability_manifest_*)
+            # always flow through their own one-per-dispatch path so each gets
+            # individual handling and idempotency checks.
+            messages = pio.read_own_inbox(s.team_name, s.agent_name, s.agent_name)
+            saw_messages = bool(messages)
+            for kind, group in _partition_inbox(messages):
+                if kind == "prose":
+                    _handle_prose_batch(state, group)
+                else:
+                    for m in group:
+                        _handle_message(state, m)
+                if state.approved_shutdown:
+                    return
+
+            # 2. Claim-and-execute.
+            if not state.shutdown_requested:
+                claimed = _find_and_claim(state)
+                if claimed is not None:
+                    _execute_task(state, claimed)
+                    idle_last_sent_at = None
+                    continue  # loop again to drain inbox before idling
+
+            # 3. Idle notification (rate-limited to once per 60s while idle).
+            if not _has_claimable(state):
+                now = time.monotonic()
+                if idle_last_sent_at is None or (now - idle_last_sent_at) > 60.0:
+                    try:
+                        pio.send_idle_notification(s.team_name, s.agent_name)
+                        idle_last_sent_at = now
+                        logger.info("idle.sent")
+                    except Exception as e:
+                        logger.warn("idle.send_fail", error=str(e))
+
+            # 4. Wait for inbox change or adaptive timeout.
+            inbox_watch.wait_for_change(adaptive_wait_s(saw_messages=saw_messages))
+
+            # 5. Honour SIGINT/SIGTERM if we haven't already agreed to shut down.
+            if state.shutdown_requested and state.in_flight_task is None:
+                logger.info("loop.signal_exit")
+                state.codex_session_id = None
+                state.app_server_last_thread_id = None
+                state.approved_shutdown = True
                 return
-
-        # 2. Claim-and-execute.
-        if not state.shutdown_requested:
-            claimed = _find_and_claim(state)
-            if claimed is not None:
-                _execute_task(state, claimed)
-                idle_last_sent_at = None
-                continue  # loop again to drain inbox before idling
-
-        # 3. Idle notification (rate-limited to once per 60s while idle).
-        if not _has_claimable(state):
-            now = time.monotonic()
-            if idle_last_sent_at is None or (now - idle_last_sent_at) > 60.0:
-                try:
-                    pio.send_idle_notification(s.team_name, s.agent_name)
-                    idle_last_sent_at = now
-                    logger.info("idle.sent")
-                except Exception as e:
-                    logger.warn("idle.send_fail", error=str(e))
-
-        # 4. Sleep.
-        time.sleep(s.poll_interval_s)
-
-        # 5. Honour SIGINT/SIGTERM if we haven't already agreed to shut down.
-        if state.shutdown_requested and state.in_flight_task is None:
-            logger.info("loop.signal_exit")
-            state.codex_session_id = None
-            state.app_server_last_thread_id = None
-            state.approved_shutdown = True
-            return
+    finally:
+        inbox_watch.close()
 
 
 def _handle_message(state: LoopState, msg: Any) -> None:
@@ -184,11 +307,350 @@ def _handle_message(state: LoopState, msg: Any) -> None:
     if isinstance(payload, PlanApprovalRequestIn):
         _handle_plan_approval(state, payload)
         return
+    if isinstance(payload, CapabilityManifestUpdatedIn):
+        if state.peer_manifest_cache is not None:
+            state.peer_manifest_cache.apply_update(payload)
+        logger.info(
+            "capability_manifest.update_seen",
+            agent=payload.agent_name,
+            capability_version=payload.capability_version,
+            removed=payload.removed,
+        )
+        return
     # task_assignment, plan_approval_response — noted but not acted on here.
     # task_assignment messages are informational; the shared task list is the
     # source of truth. plan_approval_response is only meaningful if we sent a
     # request, handled in the opt-in branch.
     logger.debug("inbox.protocol_noop", type=payload.__class__.__name__)
+
+
+def _partition_inbox(messages: list[Any]) -> list[tuple[str, list[Any]]]:
+    """Group an inbox drain into prose runs and individual protocol messages.
+
+    Phase4 #18: consecutive prose messages collapse into a single
+    `_handle_prose_batch` call so a burst of N peer DMs becomes ONE Codex
+    invocation instead of N. Protocol messages stay one-per-dispatch — each
+    needs its own idempotency check and handler-specific control flow.
+
+    Returns a list of ``(kind, [messages])`` tuples preserving original order:
+
+    - ``("prose", [m1, m2, m3])`` — a run of consecutive prose messages
+    - ``("protocol", [m4])`` — exactly one protocol message per group
+
+    Lead-prose vs peer-prose can mix in the same batch — the batched prompt
+    carries explicit ``[from <sender>]`` attribution and Codex addresses each
+    sender via the ``send_message`` MCP tool.
+    """
+    groups: list[tuple[str, list[Any]]] = []
+    for m in messages:
+        is_prose = parse_protocol_text(m.text) is None
+        if is_prose:
+            if groups and groups[-1][0] == "prose":
+                groups[-1][1].append(m)
+            else:
+                groups.append(("prose", [m]))
+        else:
+            groups.append(("protocol", [m]))
+    return groups
+
+
+def _peer_prompt_fragments(state: LoopState) -> str:
+    """Return cached R14 peer capability prompt fragments for this turn.
+
+    Honors the S10a ablation knob ``CLAUDE_ANYTEAM_DISABLE_PEER_PROMPT_FRAGMENTS=1``
+    per references/external-claude-code-re/proto-rev-execution-log/specs/
+    S10-ablation-implementation-spec.md §2 — when set, returns empty string
+    so peer-capability fragments are absent from the system prompt without
+    touching the cache or substrate.
+    """
+    if os.environ.get("CLAUDE_ANYTEAM_DISABLE_PEER_PROMPT_FRAGMENTS") == "1":
+        return ""
+    if state.peer_manifest_cache is None:
+        return ""
+    try:
+        return state.peer_manifest_cache.peer_prompt_fragments_for(
+            state.settings.agent_name
+        )
+    except Exception as e:
+        logger.warn("capability_manifest.peer_prompt_fragments_fail", error=str(e))
+        return ""
+
+
+def _prose_visibility_event_sink(state: LoopState):
+    """Build a §2-fix event sink for ephemeral prose-time Codex invocations.
+
+    Phase4 #18 §2: the lead must see prose-time tool activity (Read / Edit /
+    Bash) with the same operational visibility as task-time activity. Without
+    a sink, App Server events vanish into the wrapper and only stderr carries
+    a trace.
+
+    Differs from the task-bound `_visibility_event_sink` closure built inside
+    `_execute_task_app_server`:
+
+    - No `task` reference → no `pio.update_task` projection (prose has no
+      task to project onto). The event log and mailbox surfacing remain.
+    - No sampling counter (prose turns are short; surface every event).
+
+    Mirrors the same envelope flags (`mailbox`, `event_log`, `task_state`)
+    already used by the task path so the lead's TUI rendering is uniform.
+    """
+    s = state.settings
+
+    def _sink(event) -> None:
+        try:
+            pio.append_event(s.team_name, s.agent_name, event)
+        except Exception as e:
+            logger.warn(
+                "visibility.append_fail",
+                kind=getattr(event, "kind", None),
+                error=str(e),
+                surface="prose",
+            )
+        visibility = getattr(event, "visibility", None)
+        if getattr(visibility, "mailbox", False):
+            try:
+                pio.send_visibility_event_to_lead(
+                    s.team_name,
+                    s.agent_name,
+                    event,
+                    summary=event.summary[:120],
+                )
+            except Exception as e:
+                logger.warn(
+                    "visibility.mailbox_fail",
+                    kind=getattr(event, "kind", None),
+                    error=str(e),
+                    surface="prose",
+                )
+
+    return _sink
+
+
+def _invoke_codex_prose(
+    state: LoopState,
+    *,
+    prompt: str,
+    event_sink,
+):
+    """Run one ephemeral Codex turn for a prose reply.
+
+    Phase4 #18: extracted from `_handle_prose` so the single-message and
+    batched paths share identical invocation semantics. The single-message
+    path keeps the same prompt shape (built by `v7_prose_reply_prompt`); the
+    batch path composes its own prompt with sender attribution and reuses
+    this helper.
+
+    Always passes `event_sink` (the §2 fix) — prose-time tool calls now
+    surface to the event log and lead mailbox the same way task-time tool
+    calls do.
+
+    Returns ``(result, error_exception)``:
+    - On normal completion: ``(CodexResult, None)``
+    - On exception: ``(None, exception)``
+    """
+    s = state.settings
+    try:
+        if s.app_server:
+            result = codex_mod.app_server_invoke(
+                task_prompt=prompt,
+                cwd=s.cwd,
+                schema=None,
+                settings_team=s.team_name,
+                settings_agent=s.agent_name,
+                codex_binary=s.codex_binary,
+                model=s.model,
+                effort=s.effort,
+                overall_timeout_s=s.turn_timeout_s,
+                non_progress_warn_s=s.non_progress_warn_s,
+                non_progress_interrupt_s=s.non_progress_interrupt_s,
+                event_sink=event_sink,
+                # No resume_thread_id — ephemeral, not chained to task lineage.
+            )
+        else:
+            # Fresh-exec path has no event_sink hook today (`codex.run` reads
+            # JSONL events into its own internal counters); the App Server
+            # path is where §2 visibility actually lands.
+            result = codex_mod.run(
+                prompt=prompt,
+                cwd=s.cwd,
+                schema=None,
+                codex_binary=s.codex_binary,
+                extra_args=codex_mod.wrapper_mcp_config_args(
+                    s.team_name,
+                    s.agent_name,
+                    cwd=s.cwd,
+                ),
+                wrapper_identity=(s.team_name, s.agent_name),
+                model=s.model,
+                effort=s.effort,
+            )
+        return result, None
+    except Exception as e:
+        return None, e
+
+
+def _prose_fallback_reply(
+    state: LoopState,
+    *,
+    sender: str,
+    result: Any,
+) -> str:
+    """Build the diagnostics-backed fallback reply for one sender.
+
+    Records a per-incident artifact and renders the user-facing message with
+    the incident_id embedded so the lead can run
+    ``claude-anyteam diagnose --incident <id>`` to recover details without
+    raw error strings leaking into chat.
+    """
+    from . import diagnostics  # local import keeps loop.py import graph thin
+    s = state.settings
+    error_class = diagnostics.classify_failure(result)
+    incident_id = diagnostics.record_incident(
+        team=s.team_name,
+        agent=s.agent_name,
+        backend="codex",
+        error_class=error_class,
+        summary=(result.error if result is not None and result.error else "no reply produced"),
+        sender=sender,
+        payload={
+            "exit_code": (result.exit_code if result is not None else None),
+            "tool_call_events": (
+                getattr(result, "tool_call_events", 0) if result is not None else 0
+            ),
+            "error": (result.error if result is not None else None),
+        },
+    )
+    return diagnostics.fallback_message(
+        backend="codex",
+        incident_id=incident_id,
+        error_class=error_class,
+    )
+
+
+def _claims_send_message_unavailable(text: str | None) -> bool:
+    """Return True for the recurring invalid "send_message is missing" prose.
+
+    #51 diagnostics showed the wrapper MCP still advertises ``send_message``
+    when this prose appears. Treat it as a model-output flap, not a valid
+    teammate reply to relay.
+    """
+
+    if not isinstance(text, str) or not text.strip():
+        return False
+    lowered = " ".join(text.lower().split())
+    if "send_message" not in lowered and "send message" not in lowered:
+        return False
+    if "mcp" not in lowered and "tool" not in lowered:
+        return False
+
+    direct_markers = (
+        "don't have",
+        "do not have",
+        "don't see",
+        "do not see",
+        "cannot access",
+        "can't access",
+        "unable to access",
+        "not exposed",
+        "not registered",
+        "not listed",
+        "missing",
+    )
+    if any(marker in lowered for marker in direct_markers):
+        return True
+    if "not available" in lowered or "isn't available" in lowered:
+        return True
+    if "no " in lowered and "available" in lowered:
+        return True
+    return False
+
+
+def _truncate_for_prompt(text: str, *, limit: int = 4000) -> str:
+    if len(text) <= limit:
+        return text
+    return text[: limit - 1] + "…"
+
+
+def _send_message_repair_prompt(
+    *,
+    original_prompt: str,
+    senders: list[str],
+    previous_reply: str,
+) -> str:
+    recipients = ", ".join(repr(sender) for sender in senders)
+    per_sender = (
+        f"Call send_message(to={senders[0]!r}, body=<brief helpful reply>) exactly once."
+        if len(senders) == 1
+        else (
+            "Call send_message once for each original sender "
+            f"({recipients}), with a brief helpful reply tailored to that sender."
+        )
+    )
+    return (
+        "Retry the previous teammate-DM response.\n\n"
+        "# Why this is a retry\n"
+        "Your previous final prose claimed that the `send_message` MCP tool "
+        "was unavailable. That claim is invalid for claude-anyteam Codex "
+        "sessions: the wrapper MCP exposes lowercase `send_message`, and "
+        "`read_config().protocol_tools.send_message` reports the exact visible "
+        "tool name if you need to verify it.\n\n"
+        "# Required repair action\n"
+        "Do not repeat or paraphrase the missing-tool claim. If uncertain, "
+        "first call read_config() and inspect protocol_tools. Then use the "
+        "actual MCP tool delivery path: "
+        f"{per_sender} Final assistant prose, if any, must be empty or only "
+        "say that the reply was sent via the team mailbox.\n\n"
+        "# Invalid previous final prose\n"
+        f"{_truncate_for_prompt(previous_reply, limit=1200)}\n\n"
+        "# Original prompt to answer\n"
+        f"{_truncate_for_prompt(original_prompt)}"
+    )
+
+
+def _suppressed_send_message_claim_result(result: Any, *, previous_reply: str):
+    """Synthetic failure result used when the repair path still flaps.
+
+    Feeding this through the existing diagnostics-backed prose fallback keeps
+    the sender informed without leaking the invalid "I don't have the tool"
+    claim back into teammate chat.
+    """
+
+    return codex_mod.CodexResult(
+        exit_code=1,
+        structured=None,
+        last_message="",
+        events=list(getattr(result, "events", []) or []),
+        error=(
+            "send_message not available hallucination suppressed; "
+            f"invalid final prose was: {_truncate_for_prompt(previous_reply, limit=500)}"
+        ),
+        tool_call_events=int(getattr(result, "tool_call_events", 0) or 0),
+        session_id=getattr(result, "session_id", None),
+    )
+
+
+def _retry_after_send_message_claim(
+    state: LoopState,
+    *,
+    original_prompt: str,
+    event_sink,
+    senders: list[str],
+    previous_reply: str,
+):
+    logger.warn(
+        "prose.send_message_unavailable_claim",
+        senders=senders,
+        reply_head=previous_reply[:160],
+    )
+    return _invoke_codex_prose(
+        state,
+        prompt=_send_message_repair_prompt(
+            original_prompt=original_prompt,
+            senders=senders,
+            previous_reply=previous_reply,
+        ),
+        event_sink=event_sink,
+    )
 
 
 def _handle_prose(state: LoopState, msg: Any) -> None:
@@ -206,6 +668,10 @@ def _handle_prose(state: LoopState, msg: Any) -> None:
     The prose invocation is intentionally ephemeral — it does not update
     `state.codex_session_id` or `state.app_server_last_thread_id`, keeping
     the task-lineage slots clean for the next real task.
+
+    Phase4 #18 §2: the App Server invocation now passes `event_sink` so
+    prose-time tool activity (Read / Edit / Bash) surfaces to the event log
+    and lead mailbox with the same visibility as task-time activity.
     """
     s = state.settings
     sender = getattr(msg, "from_", "unknown")
@@ -216,37 +682,73 @@ def _handle_prose(state: LoopState, msg: Any) -> None:
         body=msg.text,
         agent_name=s.agent_name,
         team_name=s.team_name,
+        peer_prompt_fragments=_peer_prompt_fragments(state),
     )
 
     reply: str | None = None
-    result = None
-    try:
-        if s.app_server:
-            result = codex_mod.app_server_invoke(
-                task_prompt=prompt,
-                cwd=s.cwd,
-                schema=None,
-                settings_team=s.team_name,
-                settings_agent=s.agent_name,
-                codex_binary=s.codex_binary,
-                model=s.model,
-                effort=s.effort,
-                overall_timeout_s=s.turn_timeout_s,
-                # No resume_thread_id — ephemeral, not chained to task lineage.
+    event_sink = _prose_visibility_event_sink(state)
+    result, exc = _invoke_codex_prose(
+        state,
+        prompt=prompt,
+        event_sink=event_sink,
+    )
+    if exc is not None:
+        logger.warn("prose.codex_crash", sender=sender, error=str(exc))
+    elif result is not None:
+        if pio.should_skip_prose_fallback(result):
+            logger.info(
+                "prose.delivered_via_tool",
+                sender=sender,
+                tool_calls=getattr(result, "tool_call_events", 0),
             )
-        else:
-            result = codex_mod.run(
-                prompt=prompt,
-                cwd=s.cwd,
-                schema=None,
-                codex_binary=s.codex_binary,
-                extra_args=codex_mod.wrapper_mcp_config_args(s.team_name, s.agent_name),
-                wrapper_identity=(s.team_name, s.agent_name),
-                model=s.model,
-                effort=s.effort,
-            )
+            return
         if result.exit_code == 0 and result.last_message:
-            reply = result.last_message
+            if _claims_send_message_unavailable(result.last_message):
+                invalid_reply = result.last_message
+                retry_result, retry_exc = _retry_after_send_message_claim(
+                    state,
+                    original_prompt=prompt,
+                    event_sink=event_sink,
+                    senders=[sender],
+                    previous_reply=invalid_reply,
+                )
+                if retry_exc is not None:
+                    logger.warn(
+                        "prose.send_message_repair_crash",
+                        sender=sender,
+                        error=str(retry_exc),
+                    )
+                    result = _suppressed_send_message_claim_result(
+                        result,
+                        previous_reply=invalid_reply,
+                    )
+                elif retry_result is not None:
+                    if pio.should_skip_prose_fallback(retry_result):
+                        logger.info(
+                            "prose.repaired_via_send_message_tool",
+                            sender=sender,
+                            tool_calls=getattr(retry_result, "tool_call_events", 0),
+                        )
+                        return
+                    result = retry_result
+                    if (
+                        retry_result.exit_code == 0
+                        and retry_result.last_message
+                        and not _claims_send_message_unavailable(retry_result.last_message)
+                    ):
+                        reply = retry_result.last_message
+                    else:
+                        result = _suppressed_send_message_claim_result(
+                            retry_result,
+                            previous_reply=invalid_reply,
+                        )
+                else:
+                    result = _suppressed_send_message_claim_result(
+                        result,
+                        previous_reply=invalid_reply,
+                    )
+            else:
+                reply = result.last_message
         else:
             logger.warn(
                 "prose.codex_fail",
@@ -254,50 +756,192 @@ def _handle_prose(state: LoopState, msg: Any) -> None:
                 exit_code=result.exit_code,
                 error=result.error,
             )
-    except Exception as e:
-        logger.warn("prose.codex_crash", sender=sender, error=str(e))
-
-    # If the model already delivered the reply via the send_message MCP tool,
-    # last_message is empty by design (the model did everything in tools and
-    # produced no trailing assistant text). Don't double-send a canned
-    # fallback on top of the real reply.  Mirrors the Kimi adapter fix at
-    # backends/kimi/loop.py (PR #11) — same bug, same shape, same guard.
-    if reply is None and result is not None and result.exit_code == 0 and getattr(result, "tool_call_events", 0) > 0:
-        logger.info("prose.delivered_via_tool", sender=sender, tool_calls=result.tool_call_events)
-        return
 
     if reply is None:
-        # Codex couldn't produce a reply — record full error context to a
-        # per-incident diagnostic file and embed the incident_id in the
-        # user-facing reply so the lead can run
-        # `claude-anyteam diagnose --incident <id>` to recover details
-        # without us leaking raw error strings into chat.
-        from . import diagnostics  # local import keeps loop.py import graph thin
-        error_class = diagnostics.classify_failure(result)
-        incident_id = diagnostics.record_incident(
-            team=s.team_name,
-            agent=s.agent_name,
-            backend="codex",
-            error_class=error_class,
-            summary=(result.error if result is not None and result.error else "no reply produced"),
-            sender=sender,
-            payload={
-                "exit_code": (result.exit_code if result is not None else None),
-                "tool_call_events": (getattr(result, "tool_call_events", 0) if result is not None else 0),
-                "error": (result.error if result is not None else None),
-            },
-        )
-        reply = diagnostics.fallback_message(
-            backend="codex",
-            incident_id=incident_id,
-            error_class=error_class,
-        )
+        reply = _prose_fallback_reply(state, sender=sender, result=result)
 
     try:
         pio.send_prose(s.team_name, s.agent_name, sender, reply, summary="prose_reply")
         logger.info("prose.reply_sent", sender=sender)
     except Exception as e:
         logger.warn("prose.reply_send_fail", sender=sender, error=str(e))
+
+
+def _handle_prose_batch(state: LoopState, messages: list[Any]) -> None:
+    """Handle a run of consecutive prose messages with ONE Codex invocation.
+
+    Phase4 #18 — prose-handler cascade fix. Pre-#18, a burst of N peer DMs in
+    one inbox drain produced N separate `app_server_invoke` calls; each
+    invocation pays the full thread/start + system-prompt cost. Collapsing
+    them into a single batched turn restores parity with native Claude
+    teammates, which see all N messages at once and reply to each within a
+    single model turn.
+
+    Behaviour:
+
+    - **N == 1**: delegate to `_handle_prose` (one-message fast path; no
+      batching overhead, identical observable shape to pre-#18).
+    - **N > 1**: compose one prompt with explicit ``[from <sender>]``
+      attribution per message, run a single Codex turn with the §2 event
+      sink, let Codex address each sender via the ``send_message`` MCP
+      wrapper tool. On Codex failure / crash, send the diagnostic-backed
+      fallback ack to **each** original sender (preserves the "no silence"
+      invariant — never collapse a batch failure into a single ack).
+
+    Lead-prose and peer-prose can coexist in one batch; the model sees the
+    attribution and decides per-sender what to send. Phase4 #17 keeps
+    `messageKind="steer"` prose handled by the mid-turn drain, not here, so
+    only idle prose lands in this path.
+    """
+    if not messages:
+        return
+    if len(messages) == 1:
+        _handle_prose(state, messages[0])
+        return
+
+    s = state.settings
+    senders = [getattr(m, "from_", "unknown") for m in messages]
+    logger.info(
+        "inbox.prose_batch",
+        count=len(messages),
+        senders=senders,
+    )
+
+    # Compose batched prompt with explicit per-sender attribution. The
+    # `send_message` wrapper tool already takes a `to=` argument, so Codex
+    # can address each sender independently in a single turn.
+    body_blocks = "\n\n".join(
+        f"[from {getattr(m, 'from_', 'unknown')}]: {m.text}" for m in messages
+    )
+    peer_section = _peer_prompt_fragments(state)
+    peer_tail = f"{peer_section}\n\n" if peer_section else ""
+    prompt = (
+        f"You are {s.agent_name}, a Codex teammate on the {s.team_name} team. "
+        f"You received {len(messages)} direct messages in this drain "
+        f"(senders: {', '.join(sorted(set(senders)))}). Read each below "
+        f"and reply to each sender independently using the `send_message` "
+        f"MCP tool — call `send_message(to=<sender>, body=<your reply>)` "
+        f"once per sender. Do not execute code unless explicitly asked.\n\n"
+        f"# Messages\n{body_blocks}\n\n"
+        f"{prompts_mod.TEAM_MESSAGING_BLOCK}\n\n"
+        f"{peer_tail}"
+        f"Do not produce a structured JSON object; address each sender via "
+        f"the `send_message` tool. Final assistant prose, if any, is "
+        f"informational only — the per-sender deliveries happen via the tool."
+    )
+
+    event_sink = _prose_visibility_event_sink(state)
+    result, exc = _invoke_codex_prose(
+        state,
+        prompt=prompt,
+        event_sink=event_sink,
+    )
+    if exc is not None:
+        logger.warn("prose_batch.codex_crash", error=str(exc), count=len(messages))
+    elif result is not None and result.exit_code != 0:
+        logger.warn(
+            "prose_batch.codex_fail",
+            exit_code=result.exit_code,
+            error=result.error,
+            count=len(messages),
+        )
+
+    if (
+        exc is None
+        and result is not None
+        and result.exit_code == 0
+        and result.last_message
+        and not pio.should_skip_prose_fallback(result)
+        and _claims_send_message_unavailable(result.last_message)
+    ):
+        invalid_reply = result.last_message
+        retry_result, retry_exc = _retry_after_send_message_claim(
+            state,
+            original_prompt=prompt,
+            event_sink=event_sink,
+            senders=senders,
+            previous_reply=invalid_reply,
+        )
+        if retry_exc is not None:
+            logger.warn(
+                "prose_batch.send_message_repair_crash",
+                error=str(retry_exc),
+                count=len(messages),
+            )
+            result = _suppressed_send_message_claim_result(
+                result,
+                previous_reply=invalid_reply,
+            )
+        elif retry_result is not None:
+            result = retry_result
+            if (
+                not pio.should_skip_prose_fallback(retry_result)
+                and _claims_send_message_unavailable(retry_result.last_message)
+            ):
+                result = _suppressed_send_message_claim_result(
+                    retry_result,
+                    previous_reply=invalid_reply,
+                )
+        else:
+            result = _suppressed_send_message_claim_result(
+                result,
+                previous_reply=invalid_reply,
+            )
+
+    # Success path: Codex delivered per-sender via send_message tool calls.
+    # When result is healthy and at least one tool call was emitted, we have
+    # the same "delivered_via_tool" guard the single path uses — assume the
+    # model addressed every sender it intended to. Don't double-send.
+    success = (
+        exc is None
+        and result is not None
+        and result.exit_code == 0
+        and pio.should_skip_prose_fallback(result)
+    )
+    if success:
+        logger.info(
+            "prose_batch.delivered_via_tool",
+            count=len(messages),
+            tool_calls=getattr(result, "tool_call_events", 0),
+        )
+        return
+
+    # If Codex returned a clean exit with last_message text but no tool
+    # calls, broadcast that single reply to every sender. Pre-#18 each sender
+    # received their own bespoke reply; we preserve "every sender gets a
+    # reply" by fanning the same text out. The expected path is the
+    # send_message-per-sender flow above.
+    if exc is None and result is not None and result.exit_code == 0 and result.last_message:
+        text = result.last_message
+        for m in messages:
+            sender = getattr(m, "from_", "unknown")
+            try:
+                pio.send_prose(
+                    s.team_name, s.agent_name, sender, text, summary="prose_reply"
+                )
+                logger.info("prose_batch.reply_sent", sender=sender)
+            except Exception as e:
+                logger.warn(
+                    "prose_batch.reply_send_fail", sender=sender, error=str(e)
+                )
+        return
+
+    # Failure path: send a diagnostics-backed fallback ack to EACH original
+    # sender. Preserves the "no silence" invariant from the single-message
+    # path — collapsing N senders into one fallback would leave N-1 senders
+    # waiting on a reply that never lands.
+    for m in messages:
+        sender = getattr(m, "from_", "unknown")
+        reply = _prose_fallback_reply(state, sender=sender, result=result)
+        try:
+            pio.send_prose(
+                s.team_name, s.agent_name, sender, reply, summary="prose_reply"
+            )
+            logger.info("prose_batch.fallback_sent", sender=sender)
+        except Exception as e:
+            logger.warn(
+                "prose_batch.fallback_send_fail", sender=sender, error=str(e)
+            )
 
 
 def _handle_shutdown(state: LoopState, payload: ShutdownRequestIn) -> None:
@@ -314,9 +958,7 @@ def _handle_shutdown(state: LoopState, payload: ShutdownRequestIn) -> None:
         feedback = f"in-flight task #{state.in_flight_task}"
         logger.info("shutdown.reject", request_id=req_id, in_flight=state.in_flight_task)
         try:
-            pio.send_shutdown_response(
-                s.team_name, s.agent_name, req_id, approve=False, feedback=feedback
-            )
+            pio.send_shutdown_rejected(s.team_name, s.agent_name, req_id, reason=feedback)
         except Exception as e:
             logger.warn("shutdown.response_fail", error=str(e))
         state.shutdown_requested = True  # honour after current task finishes
@@ -324,7 +966,7 @@ def _handle_shutdown(state: LoopState, payload: ShutdownRequestIn) -> None:
 
     logger.info("shutdown.approve", request_id=req_id)
     try:
-        pio.send_shutdown_response(s.team_name, s.agent_name, req_id, approve=True)
+        pio.send_shutdown_approved(s.team_name, s.agent_name, req_id)
     except Exception as e:
         logger.warn("shutdown.response_fail", error=str(e))
     state.codex_session_id = None
@@ -478,10 +1120,15 @@ def _generate_plan(state: LoopState, task, *, tighten: bool) -> dict[str, Any] |
             cwd=s.cwd,
             schema=codex_mod.PLAN_SCHEMA,
             codex_binary=s.codex_binary,
-            extra_args=codex_mod.wrapper_mcp_config_args(s.team_name, s.agent_name),
+            extra_args=codex_mod.wrapper_mcp_config_args(
+                s.team_name,
+                s.agent_name,
+                cwd=s.cwd,
+            ),
             wrapper_identity=(s.team_name, s.agent_name),
             model=s.model,
             effort=s.effort,
+            task_id=task.id,
         )
     except Exception as e:
         logger.error("plan.codex_crash", task_id=task.id, error=str(e))
@@ -536,6 +1183,20 @@ def _find_and_claim(state: LoopState):
                 active_form=f"Running codex on task #{t.id}",
             )
             state.in_flight_task = claimed.id
+            try:
+                pio.emit_coupling_conflict_if_needed(
+                    team=s.team_name,
+                    agent=s.agent_name,
+                    backend="codex_app_server" if s.app_server else "codex_exec",
+                    task=claimed,
+                    manifest=state.self_capability_manifest,
+                )
+            except Exception as e:
+                logger.warn(
+                    "task.coupling_conflict_visibility_failed",
+                    task_id=claimed.id,
+                    error=str(e),
+                )
             logger.info("task.claimed", task_id=claimed.id, subject=claimed.subject)
             return claimed
         except ValueError as e:
@@ -674,7 +1335,10 @@ def _invoke_codex_for_task(state: LoopState, task):
 
     if s.app_server:
         prompt = prompts_mod.v7_task_prompt(
-            task, agent_name=s.agent_name, team_name=s.team_name
+            task,
+            agent_name=s.agent_name,
+            team_name=s.team_name,
+            peer_prompt_fragments=_peer_prompt_fragments(state),
         )
         try:
             return _execute_task_app_server(state, task, prompt)
@@ -692,6 +1356,7 @@ def _invoke_codex_for_task(state: LoopState, task):
                 task,
                 agent_name=s.agent_name,
                 team_name=s.team_name,
+                peer_prompt_fragments=_peer_prompt_fragments(state),
             ) + "\n\n# Output contract (v7.2 resume)\n" + inline
             if attempt == 2:
                 prompt += (
@@ -707,12 +1372,15 @@ def _invoke_codex_for_task(state: LoopState, task):
                     schema=None,  # ignored on resume path; explicit for clarity
                     codex_binary=s.codex_binary,
                     extra_args=codex_mod.wrapper_mcp_config_args(
-                        s.team_name, s.agent_name
+                        s.team_name,
+                        s.agent_name,
+                        cwd=s.cwd,
                     ),
                     wrapper_identity=(s.team_name, s.agent_name),
                     resume_session_id=state.codex_session_id,
                     model=s.model,
                     effort=s.effort,
+                    task_id=task.id,
                 )
             except Exception as e:
                 logger.error(
@@ -768,7 +1436,10 @@ def _invoke_codex_for_task(state: LoopState, task):
     # v7 fresh-exec path (also: first task of an adapter's lifetime,
     # before we've captured a session id).
     prompt = prompts_mod.v7_task_prompt(
-        task, agent_name=s.agent_name, team_name=s.team_name
+        task,
+        agent_name=s.agent_name,
+        team_name=s.team_name,
+        peer_prompt_fragments=_peer_prompt_fragments(state),
     )
     try:
         return codex_mod.run(
@@ -776,10 +1447,15 @@ def _invoke_codex_for_task(state: LoopState, task):
             cwd=s.cwd,
             schema=codex_mod.TASK_COMPLETE_SCHEMA,
             codex_binary=s.codex_binary,
-            extra_args=codex_mod.wrapper_mcp_config_args(s.team_name, s.agent_name),
+            extra_args=codex_mod.wrapper_mcp_config_args(
+                s.team_name,
+                s.agent_name,
+                cwd=s.cwd,
+            ),
             wrapper_identity=(s.team_name, s.agent_name),
             model=s.model,
             effort=s.effort,
+            task_id=task.id,
         )
     except Exception as e:
         logger.error("task.codex_crash", task_id=task.id, error=str(e))
@@ -795,21 +1471,34 @@ def _execute_task_app_server(state: LoopState, task, prompt: str):
     Returns a `codex.CodexResult` in the same shape as the v7 exec path
     so the surrounding control flow in `_execute_task` is uniform.
     """
-    import json as _json
+    from . import schema_validation as _sv
 
     s = state.settings
 
     # Load the task-complete schema as a JSON dict (App Server wants it
     # inline in `turn/start` params, not as a file path).
-    with open(codex_mod.TASK_COMPLETE_SCHEMA) as f:
-        schema = _json.load(f)
+    schema = _sv.load_schema(codex_mod.TASK_COMPLETE_SCHEMA)
 
-    steer_queue = codex_mod.SteerQueue()
+    recipient_capabilities = effective_peer_steer_capabilities(
+        _backend_metadata(s).capabilities,
+        state.self_capability_manifest,
+    )
+    steer_queue = codex_mod.SteerQueue(
+        capabilities=recipient_capabilities,
+        # 09 R15-vis-followup: pass team + agent so SteerQueue.push can emit
+        # visibility_degraded(surface=peer_steer_rejected) per 08 CD-6 / 07 §6.5.
+        team=s.team_name,
+        agent=s.agent_name,
+    )
+    sampled_task_events = 0
+    deferred_prose_messages: list[Any] = []
 
     def _mid_turn_hook() -> None:
-        # Drain own inbox. Prose messages become steer fragments; shutdown
-        # requests are snapshotted for the outer loop to handle after the
-        # turn completes. Ignore everything else.
+        # Drain own inbox. Lead prose and peer prose explicitly accepted by
+        # this recipient become steer fragments; other peer prose is deferred
+        # to the normal conversational handler after the task turn completes.
+        # Shutdown requests are snapshotted for the outer loop to handle after
+        # the turn completes. Ignore everything else.
         try:
             messages = pio.read_own_inbox(s.team_name, s.agent_name, s.agent_name)
         except Exception:
@@ -819,14 +1508,70 @@ def _execute_task_app_server(state: LoopState, task, prompt: str):
                 "claude_anyteam.messages", fromlist=["parse_protocol_text"]
             ).parse_protocol_text(m.text)
             if payload is None:
-                steer_queue.push(
-                    f"mid-task message from {m.from_}: {m.text}"
+                sender = getattr(m, "from_", None)
+                # Phase4 #17 + matrix lift #5: honor the R3/#59
+                # messageKind discriminator as positive intent.  Peer prose is
+                # informational by default (including legacy peer_dm rows);
+                # only explicit kind=steer plus recipient authorization may
+                # interrupt an active turn.
+                message_kind = _message_kind(m)
+                if not _mid_turn_prose_should_be_steer(
+                    sender=sender,
+                    recipient_capabilities=recipient_capabilities,
+                    message_kind=message_kind,
+                ):
+                    deferred_prose_messages.append(m)
+                    logger.info(
+                        "task.mid_turn_prose_deferred",
+                        from_=sender,
+                        text_head=m.text[:120],
+                        message_kind=message_kind,
+                    )
+                    continue
+                accepted = steer_queue.push(
+                    f"mid-task message from {sender}: {m.text}",
+                    sender=sender,
                 )
-                logger.info(
-                    "task.steer_queued",
-                    from_=m.from_,
-                    text_head=m.text[:120],
+                if accepted:
+                    logger.info(
+                        "task.steer_queued",
+                        from_=sender,
+                        text_head=m.text[:120],
+                    )
+            elif isinstance(payload, SteerIn):
+                sender = getattr(m, "from_", None) or payload.from_
+                message_kind = _message_kind(m)
+                if (
+                    sender != "team-lead"
+                    and _normalized_message_kind(message_kind) != "steer"
+                ):
+                    deferred_prose_messages.append(m)
+                    logger.info(
+                        "task.mid_turn_steer_payload_deferred",
+                        from_=sender,
+                        text_head=m.text[:120],
+                        message_kind=message_kind,
+                    )
+                    continue
+                message = (
+                    payload.message.strip()
+                    if isinstance(payload.message, str)
+                    else ""
                 )
+                if not message:
+                    logger.warn(
+                        "app_server.steer.rejected",
+                        sender=sender,
+                        reason="empty_message",
+                    )
+                    continue
+                accepted = steer_queue.push(message, sender=sender)
+                if accepted:
+                    logger.info(
+                        "task.steer_queued",
+                        from_=sender,
+                        text_head=message[:120],
+                    )
             elif isinstance(payload, ShutdownRequestIn):
                 # Reuse the normal shutdown handler so mid-task requests get
                 # the same immediate reject+feedback response, idempotency,
@@ -836,7 +1581,96 @@ def _execute_task_app_server(state: LoopState, task, prompt: str):
                     "task.steer_saw_shutdown", request_id=payload.effective_request_id()
                 )
 
-    return codex_mod.app_server_invoke(
+    def _visibility_event_sink(event) -> None:
+        """R16 fan-out for Codex App Server events.
+
+        The event log is the canonical substrate. Mailbox/task-state updates
+        are low-volume projections driven by the envelope's `visibility`
+        flags (B9 §6.2-§6.4); backend-native names remain in payload fields.
+        """
+
+        nonlocal sampled_task_events
+        visibility = getattr(event, "visibility", None)
+        task_state_requested = getattr(visibility, "task_state", False)
+        payload = getattr(event, "payload", {}) or {}
+        if (
+            not task_state_requested
+            and getattr(event, "kind", None) == "tool_event"
+            and payload.get("category") == "host_tool"
+            and payload.get("phase") == "completed"
+            and payload.get("status", "success") == "success"
+        ):
+            sampled_task_events += 1
+            task_state_requested = (
+                sampled_task_events == 1
+                or sampled_task_events % APP_SERVER_TASK_STATE_SAMPLE_EVERY == 0
+            )
+
+        if task_state_requested and not getattr(visibility, "task_state", False):
+            event = event.model_copy(
+                update={
+                    "visibility": event.visibility.model_copy(
+                        update={"task_state": True}
+                    )
+                }
+            )
+            visibility = getattr(event, "visibility", None)
+
+        try:
+            pio.append_event(s.team_name, s.agent_name, event)
+        except Exception as e:
+            logger.warn(
+                "visibility.append_fail",
+                task_id=getattr(task, "id", None),
+                kind=getattr(event, "kind", None),
+                error=str(e),
+            )
+        if task_state_requested:
+            try:
+                active_form = event.summary[:120]
+                if (
+                    getattr(event, "kind", None) == "turn_progress"
+                    and payload.get("risk") == "timeout_possible"
+                    and payload.get("action_taken") == "turn_steer_sent"
+                ):
+                    active_form = f"running codex: {event.summary}"[:120]
+                pio.update_task(
+                    s.team_name,
+                    task.id,
+                    active_form=active_form,
+                    metadata={
+                        "visibility": {
+                            "last_event_id": event.event_id,
+                            "last_kind": event.kind,
+                            "last_summary": event.summary,
+                            "last_payload": event.payload,
+                        }
+                    },
+                )
+            except Exception as e:
+                logger.warn(
+                    "visibility.task_state_fail",
+                    task_id=getattr(task, "id", None),
+                    kind=getattr(event, "kind", None),
+                    error=str(e),
+                )
+        if getattr(visibility, "mailbox", False):
+            try:
+                pio.send_visibility_event_to_lead(
+                    s.team_name,
+                    s.agent_name,
+                    event,
+                    summary=event.summary[:120],
+                )
+            except Exception as e:
+                logger.warn(
+                    "visibility.mailbox_fail",
+                    task_id=getattr(task, "id", None),
+                    kind=getattr(event, "kind", None),
+                    error=str(e),
+                )
+
+    result = codex_mod.app_server_invoke(
         task_prompt=prompt,
         cwd=s.cwd,
         schema=schema,
@@ -848,8 +1682,22 @@ def _execute_task_app_server(state: LoopState, task, prompt: str):
         model=s.model,
         effort=s.effort,
         overall_timeout_s=s.turn_timeout_s,
+        non_progress_warn_s=s.non_progress_warn_s,
+        non_progress_interrupt_s=s.non_progress_interrupt_s,
         resume_thread_id=state.app_server_last_thread_id,
+        task_id=str(task.id),
+        event_sink=_visibility_event_sink,
     )
+    for msg in deferred_prose_messages:
+        try:
+            _handle_prose(state, msg)
+        except Exception as e:
+            logger.warn(
+                "task.mid_turn_prose_deferred_fail",
+                from_=getattr(msg, "from_", None),
+                error=str(e),
+            )
+    return result
 
 
 def _mark_blocked(state: LoopState, task, reason: str) -> None:

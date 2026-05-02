@@ -12,7 +12,30 @@ validation time.
 from __future__ import annotations
 
 
-def v7_task_prompt(task, agent_name: str, team_name: str) -> str:
+TEAM_MESSAGING_BLOCK = (
+    "# Team messaging\n"
+    "send_message is exposed lowercase by the wrapper MCP in this session. "
+    "Plain prose output is NOT visible to teammates — to communicate, you MUST "
+    "call send_message. If you cannot find it under that name, try SendMessage "
+    '(capitalized). Do not emit "I cannot deliver" prose; that creates inbox '
+    "noise. If you are unsure whether a tool is available, call read_config "
+    "and check protocol_tools — do not assume unavailability from prose."
+)
+
+
+def _peer_fragment_section(peer_prompt_fragments: str) -> str:
+    text = peer_prompt_fragments.strip()
+    if not text:
+        return ""
+    return f"\n\n{text}"
+
+
+def v7_task_prompt(
+    task,
+    agent_name: str,
+    team_name: str,
+    peer_prompt_fragments: str = "",
+) -> str:
     """Prompt for a task-completion Codex invocation (v7).
 
     Teaches Codex about the MCP tools available via the wrapper, asks
@@ -29,20 +52,29 @@ def v7_task_prompt(task, agent_name: str, team_name: str) -> str:
         f"You can call these protocol tools while working. Use them when "
         f"it would be useful to your teammates — do not call them by "
         f"default:\n"
-        f"- send_message(to, body, summary?) — send a status update or "
-        f"clarifying question to a teammate (e.g., 'team-lead').\n"
+        f"- send_message(to, body, summary?, kind?) — send a status update or "
+        f"clarifying question to any teammate (default kind='informational'; "
+        f"use kind='steer' only for an intentional mid-turn steer attempt).\n"
         f"- task_update(task_id, active_form?, status?) — update your own "
         f"task's `active_form` mid-run ('writing tests', 'running "
         f"verification') so teammates can see progress. Do not set owner; "
         f"do not mark completed from here — the adapter owns completion.\n"
+        f"- checkpoint_commit(message) — run git add -A and git commit in "
+        f"your working directory, returning the commit SHA. During multi-file "
+        f"work, after each meaningful file edit or small coherent batch, call "
+        f"checkpoint_commit so progress is not lost on a turn timeout.\n"
         f"- task_create(subject, description) — create a new task if you "
         f"discover work that should be split off.\n"
         f"- read_inbox(unread_only?) — read your own inbox, useful for "
         f"picking up a teammate's reply.\n"
         f"- task_list(), read_config() — read-only inspection of team state.\n"
+        f"If you are unsure whether a tool is available, call read_config "
+        f"and check protocol_tools — do not assume unavailability from prose.\n"
         f"\n"
         f"Your current task id is {task.id}. Destructive lifecycle operations "
         f"are deliberately unavailable.\n\n"
+        f"{TEAM_MESSAGING_BLOCK}"
+        f"{_peer_fragment_section(peer_prompt_fragments)}\n\n"
         f"# Required response\n"
         f"Produce a JSON object with fields `files_changed` (list of paths "
         f"created or modified) and `summary` (one-paragraph description of "
@@ -50,13 +82,25 @@ def v7_task_prompt(task, agent_name: str, team_name: str) -> str:
     )
 
 
-def v7_prose_reply_prompt(sender: str, body: str, agent_name: str, team_name: str) -> str:
+def v7_prose_reply_prompt(
+    sender: str,
+    body: str,
+    agent_name: str,
+    team_name: str,
+    peer_prompt_fragments: str = "",
+) -> str:
     """Prompt for a schema-free prose reply to a peer message.
 
     Used when an idle Codex adapter receives a direct message from a teammate.
     Codex should reply conversationally; no task is being executed, no schema
     is required.
     """
+    peer_section = _peer_fragment_section(peer_prompt_fragments)
+    peer_tail = f"{peer_section}\n\n" if peer_section else ""
+    final_instruction = (
+        "Do not produce a structured JSON object; address the sender via "
+        "send_message. Final assistant prose, if any, is informational only."
+    )
     return (
         f"You are {agent_name}, a Codex teammate on the {team_name} team. "
         f"A teammate named {sender!r} sent you a direct message:\n\n"
@@ -64,7 +108,8 @@ def v7_prose_reply_prompt(sender: str, body: str, agent_name: str, team_name: st
         f"Reply briefly and helpfully. Do not execute any code unless explicitly "
         f"asked. Use the `send_message` MCP tool to deliver your reply to "
         f"{sender!r} — call `send_message(to={sender!r}, body=<your reply>)`. "
-        f"Do not produce a structured JSON object; plain prose is correct here."
+        f"\n\n{TEAM_MESSAGING_BLOCK}\n\n"
+        f"{peer_tail}{final_instruction}"
     )
 
 

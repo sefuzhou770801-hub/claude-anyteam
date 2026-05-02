@@ -1,0 +1,13 @@
+{
+  "schema_version": 1,
+  "workload_id": "W4",
+  "name": "review-diff",
+  "description": "Review an injected diff and identify the bug without making a large code change.",
+  "lead_prompt_template": "In {repo}, review the injected diff and write a concise review note naming the bug, the affected file, and the minimal fix. Assigned reviewer: {assigned_to}.",
+  "tasks_per_run": 1,
+  "min_team_size": 1,
+  "success_check": {
+    "type": "manual",
+    "description": "Human analyst verifies the review output names the injected bug and affected file."
+  }
+}

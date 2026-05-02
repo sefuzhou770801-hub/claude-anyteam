@@ -1,0 +1,18 @@
+{
+  "schema_version": 1,
+  "workload_id": "W2",
+  "name": "add-mcp-tool",
+  "description": "Add a wrapper MCP tool named `mcp_anyteam_grep` and ensure it is listed by the wrapper's tool probe.",
+  "lead_prompt_template": "In {repo}, implement wrapper MCP tool `mcp_anyteam_grep` that accepts a regex and directory and returns line-matched results. Add or update tests proving the tool appears in the MCP probe. Assigned target: {assigned_to}.",
+  "tasks_per_run": 1,
+  "min_team_size": 1,
+  "success_check": {
+    "type": "mcp_tool_listed",
+    "args": {"tool_name": "mcp_anyteam_grep"}
+  },
+  "secondary_check": {
+    "type": "pytest_passes",
+    "args": ["tests"],
+    "cwd": "{sandbox}/repo"
+  }
+}

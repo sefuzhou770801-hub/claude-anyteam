@@ -26,6 +26,7 @@ def _clear_binary_env(monkeypatch) -> None:
 def _clear_route_env(monkeypatch) -> None:
     monkeypatch.delenv("CLAUDE_ANYTEAM_SHIM_MATCH", raising=False)
     monkeypatch.delenv("CODEX_TEAMMATE_SHIM_MATCH", raising=False)
+    monkeypatch.delenv("CLAUDE_ANYTEAM_CLAUDE_SHIM_MATCH", raising=False)
     monkeypatch.delenv("CLAUDE_ANYTEAM_GEMINI_SHIM_MATCH", raising=False)
     monkeypatch.delenv("CLAUDE_ANYTEAM_KIMI_SHIM_MATCH", raising=False)
 
@@ -76,13 +77,43 @@ def test_codex_dispatch(monkeypatch, capsys):
     }
 
 
-def test_native_passthrough_for_non_codex_agent(monkeypatch, capsys):
+def test_claude_prefix_passthrough_preserves_argv(monkeypatch, capsys):
     calls = _record_execv(monkeypatch)
     monkeypatch.delenv("CLAUDE_ANYTEAM_BINARY", raising=False)
+    _clear_route_env(monkeypatch)
     argv = [
         "/usr/local/bin/claude-anyteam-spawn-shim",
         "--agent-name",
         "claude-worker",
+        "--team-name",
+        "shim-build",
+        "--agent-id",
+        "agent-123",
+    ]
+    monkeypatch.setattr(sys, "argv", argv)
+    monkeypatch.setattr(
+        spawn_shim.shutil,
+        "which",
+        lambda name: {
+            "claude": "/usr/local/bin/claude",
+            "claude-anyteam": "/usr/local/bin/claude-anyteam",
+        }.get(name),
+    )
+
+    assert spawn_shim.main() == 0
+
+    assert calls == [("/usr/local/bin/claude", argv)]
+    stderr = capsys.readouterr().err.strip()
+    assert json.loads(stderr)["route"] == "claude"
+
+
+def test_non_matching_agent_native_passthrough_preserves_argv(monkeypatch, capsys):
+    calls = _record_execv(monkeypatch)
+    _clear_route_env(monkeypatch)
+    argv = [
+        "/usr/local/bin/claude-anyteam-spawn-shim",
+        "--agent-name",
+        "research-worker",
         "--team-name",
         "shim-build",
         "--agent-id",
@@ -184,6 +215,29 @@ def test_env_override_native_claude_binary(monkeypatch):
     assert spawn_shim.main() == 0
 
     assert calls == [("/custom/bin/claude-real", argv)]
+
+
+def test_native_claude_override_cannot_resolve_to_current_shim(monkeypatch):
+    monkeypatch.setenv("CLAUDE_ANYTEAM_NATIVE_CLAUDE", "claude")
+    monkeypatch.setattr(
+        spawn_shim,
+        "_resolve_current_invocation",
+        lambda argv0: "/shim/bin/claude",
+    )
+    monkeypatch.setattr(
+        spawn_shim.shutil,
+        "which",
+        lambda name: "/shim/bin/claude" if name == "claude" else None,
+    )
+    monkeypatch.setattr(spawn_shim.os, "get_exec_path", lambda: ["/shim/bin"])
+    monkeypatch.setattr(
+        spawn_shim.os.path,
+        "isfile",
+        lambda path: path == "/shim/bin/claude",
+    )
+    monkeypatch.setattr(spawn_shim.os, "access", lambda path, mode: True)
+
+    assert spawn_shim._resolve_native_claude("/shim/bin/claude") is None
 
 
 def test_plan_mode_flag_is_forwarded(monkeypatch):
@@ -362,6 +416,34 @@ def test_agent_config_forwards_model_and_effort(monkeypatch, tmp_path, capsys):
     assert log["agent_config"] == {"model": "gpt-5.5", "effort": "xhigh"}
 
 
+def test_agent_config_forwards_non_progress_watchdog_flags(monkeypatch, tmp_path, capsys):
+    _write_agent_config(
+        tmp_path,
+        "build",
+        "codex-alice",
+        {"non_progress_warn_s": 180, "non_progress_interrupt_s": 420},
+    )
+    calls, stderr = _codex_argv_for(monkeypatch, tmp_path, "build", "codex-alice", capsys)
+
+    _, argv = calls[0]
+    assert argv == [
+        "/usr/local/bin/claude-anyteam",
+        "--name",
+        "codex-alice",
+        "--team",
+        "build",
+        "--non-progress-warn-s",
+        "180",
+        "--non-progress-interrupt-s",
+        "420",
+    ]
+    log = json.loads(stderr.strip())
+    assert log["agent_config"] == {
+        "non_progress_warn_s": "180",
+        "non_progress_interrupt_s": "420",
+    }
+
+
 def test_agent_config_forwards_model_only(monkeypatch, tmp_path, capsys):
     _write_agent_config(tmp_path, "t", "codex-bob", {"model": "gpt-5.4-mini"})
     calls, _ = _codex_argv_for(monkeypatch, tmp_path, "t", "codex-bob", capsys)
@@ -495,6 +577,37 @@ def test_gemini_dispatch_forwards_model_and_effort(monkeypatch, tmp_path, capsys
         "--effort",
         "xhigh",
     ]
+
+
+def test_gemini_dispatch_does_not_forward_codex_watchdog_flags(monkeypatch, tmp_path, capsys):
+    _write_agent_config(
+        tmp_path,
+        "t",
+        "gemini-pro",
+        {"non_progress_warn_s": 180, "non_progress_interrupt_s": 420},
+    )
+    calls = _record_execv(monkeypatch)
+    monkeypatch.setenv("HOME", str(tmp_path))
+    monkeypatch.setenv("CLAUDE_ANYTEAM_GEMINI_BINARY", "/custom/gemini-anyteam")
+    monkeypatch.setattr(
+        sys,
+        "argv",
+        ["/shim", "--agent-name", "gemini-pro", "--team-name", "t"],
+    )
+    monkeypatch.setattr(
+        spawn_shim.shutil,
+        "which",
+        lambda name: {"/custom/gemini-anyteam": "/custom/gemini-anyteam"}.get(name),
+    )
+
+    assert spawn_shim.main() == 0
+    _, argv = calls[0]
+    assert "--non-progress-warn-s" not in argv
+    assert "--non-progress-interrupt-s" not in argv
+    assert json.loads(capsys.readouterr().err)["agent_config"] == {
+        "non_progress_warn_s": "180",
+        "non_progress_interrupt_s": "420",
+    }
 
 
 def test_kimi_dispatch_for_kimi_prefix(monkeypatch, capsys):

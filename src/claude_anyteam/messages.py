@@ -34,6 +34,7 @@ class TaskAssignmentIn(_Base):
     description: str
     assigned_by: str = Field(alias="assignedBy")
     timestamp: str
+    coupling: dict[str, Any] | None = None
 
 
 class ShutdownRequestIn(_Base):
@@ -55,11 +56,43 @@ class ShutdownRequestIn(_Base):
         return self.request_id
 
 
-class ShutdownResponseOut(_Base):
-    """Outbound shutdown_response.
+class ShutdownApprovedOut(_Base):
+    """Outbound host-catalog shutdown approval.
 
-    Emits both `request_id` (matching the SendMessage legacy docs) and
-    camelCase is handled transparently by clients via populate_by_name.
+    R6 aligns the adapter with the v2.1.119 host catalog: 09 R6 and
+    07 §5.1 split the legacy `shutdown_response` into distinct
+    `shutdown_approved` / `shutdown_rejected` payloads, matching the
+    03 §"Lifecycle" host-binary lifecycle/mailbox extract.
+    """
+
+    type: Literal["shutdown_approved"] = "shutdown_approved"
+    schema_version: Literal[1] = 1
+    request_id: str = Field(alias="requestId")
+    from_: str = Field(alias="from")
+    timestamp: str = Field(default_factory=now_iso)
+    pane_id: str | None = Field(default=None, alias="paneId")
+    backend_type: str | None = Field(default=None, alias="backendType")
+
+
+class ShutdownRejectedOut(_Base):
+    """Outbound host-catalog shutdown rejection."""
+
+    type: Literal["shutdown_rejected"] = "shutdown_rejected"
+    schema_version: Literal[1] = 1
+    request_id: str = Field(alias="requestId")
+    from_: str = Field(alias="from")
+    reason: str
+    timestamp: str = Field(default_factory=now_iso)
+
+
+class ShutdownResponseOut(_Base):
+    """Deprecated legacy shutdown_response alias.
+
+    Kept for one release so callers/receivers can still accept the old
+    `{type:"shutdown_response", request_id, approve, feedback?}` wire
+    shape. New outbound code should use `ShutdownApprovedOut` or
+    `ShutdownRejectedOut`; `to_host_catalog()` maps the legacy alias to the
+    host-canonical shape.
     """
 
     type: Literal["shutdown_response"] = "shutdown_response"
@@ -67,6 +100,20 @@ class ShutdownResponseOut(_Base):
     approve: bool
     feedback: str | None = None
     timestamp: str = Field(default_factory=now_iso)
+
+    def to_host_catalog(self, sender: str) -> ShutdownApprovedOut | ShutdownRejectedOut:
+        if self.approve:
+            return ShutdownApprovedOut(
+                request_id=self.request_id,
+                from_=sender,
+                timestamp=self.timestamp,
+            )
+        return ShutdownRejectedOut(
+            request_id=self.request_id,
+            from_=sender,
+            reason=self.feedback or "Shutdown rejected",
+            timestamp=self.timestamp,
+        )
 
 
 class PlanApprovalRequestIn(_Base):
@@ -96,6 +143,48 @@ class PlanApprovalResponseIn(_Base):
     request_id: str | None = Field(default=None, alias="requestId")
     approve: bool | None = None
     feedback: str | None = None
+
+
+class PlanApprovalResponseOut(_Base):
+    """Outbound typed plan-approval decision.
+
+    The lead/full-MCP surface historically sent plan decisions as either prose
+    summaries (``plan_approved`` / ``plan_rejected``) or a legacy
+    ``{"type":"plan_approval"}`` body. The adapter-side parser accepts the
+    canonical lifecycle variant so receivers do not need to infer decisions
+    from summary text.
+    """
+
+    type: Literal["plan_approval_response"] = "plan_approval_response"
+    schema_version: Literal[1] = 1
+    request_id: str = Field(alias="requestId")
+    approve: bool
+    feedback: str | None = None
+    timestamp: str = Field(default_factory=now_iso)
+
+
+class CapabilityManifestUpdatedIn(_Base):
+    """Inbound R12 manifest-cache invalidation event.
+
+    09 R12 uses this typed envelope (also stamped on InboxMessage.messageKind
+    by the sender) to tell peers to reload or prune one cached Agent Card.
+    """
+
+    type: Literal["capability_manifest_updated"] = "capability_manifest_updated"
+    agent_name: str = Field(alias="agentName")
+    capability_version: str | None = Field(default=None, alias="capabilityVersion")
+    manifest_path: str | None = Field(default=None, alias="manifestPath")
+    removed: bool = False
+    timestamp: str | None = None
+
+
+class CapabilityManifestUpdatedOut(_Base):
+    type: Literal["capability_manifest_updated"] = "capability_manifest_updated"
+    agent_name: str = Field(alias="agentName")
+    capability_version: str = Field(alias="capabilityVersion")
+    manifest_path: str | None = Field(default=None, alias="manifestPath")
+    removed: bool = False
+    timestamp: str = Field(default_factory=now_iso)
 
 
 class PermissionRequestOut(_Base):
@@ -134,6 +223,7 @@ class SteerIn(_Base):
 
 class IdleNotificationOut(_Base):
     type: Literal["idle_notification"] = "idle_notification"
+    schema_version: Literal[1] = 1
     from_: str = Field(alias="from")
     timestamp: str = Field(default_factory=now_iso)
     idle_reason: str = Field(default="available", alias="idleReason")
@@ -147,10 +237,136 @@ class TaskCompleteOut(_Base):
     """
 
     kind: Literal["task_complete"] = "task_complete"
+    schema_version: Literal[1] = 1
     task_id: str
     files_changed: list[str] = Field(default_factory=list)
     summary: str
     codex_exit_code: int
+
+
+class TaskBlockedOut(_Base):
+    """Typed lifecycle payload for a claimed task that could not proceed."""
+
+    kind: Literal["task_blocked"] = "task_blocked"
+    schema_version: Literal[1] = 1
+    task_id: str
+    reason: str
+    timestamp: str = Field(default_factory=now_iso)
+
+
+class PlanBlockedOut(_Base):
+    """Typed lifecycle payload for an unfulfillable plan-approval request."""
+
+    kind: Literal["plan_blocked"] = "plan_blocked"
+    schema_version: Literal[1] = 1
+    request_id: str
+    reason: str
+    task_id: str | None = None
+    timestamp: str = Field(default_factory=now_iso)
+
+
+LIFECYCLE_MESSAGE_KINDS = frozenset(
+    {
+        "idle_notification",
+        "task_assignment",
+        "task_complete",
+        "task_blocked",
+        "plan_blocked",
+        "plan_approval_request",
+        "plan_approval_response",
+        "permission_request",
+        "permission_response",
+        "shutdown_request",
+        "shutdown_approved",
+        "shutdown_rejected",
+        "shutdown_response",
+        "capability_manifest_updated",
+    }
+)
+
+
+class BatchSummaryChild(_Base):
+    """One delegated child task result included in a batch summary event."""
+
+    task_id: str = Field(alias="taskId")
+    status: str
+    session_id: str | None = Field(default=None, alias="sessionId")
+    stop_reason: str | None = Field(default=None, alias="stopReason")
+    summary: str | None = None
+
+
+class BatchSummaryPayload(_Base):
+    """Payload for the ``batch_summary`` visibility event.
+
+    The task model remains per-task, so this payload is the structured
+    visibility link that ties multiple delegated child task IDs to one parent
+    task and preserves per-child session status/stop-reason details.
+    """
+
+    parent_task_id: str = Field(alias="parentTaskId")
+    child_task_ids: list[str] = Field(alias="childTaskIds")
+    child_tasks: list[BatchSummaryChild] = Field(alias="childTasks")
+    summary: str
+
+
+VisibilityEventKind = Literal[
+    "agent_registered",
+    "turn_started",
+    "turn_progress",
+    "tool_event",
+    "artifact_event",
+    "turn_warning",
+    "turn_completed",
+    "turn_failed",
+    "visibility_degraded",
+    "steer_ack",
+    "capability_changed",
+    "capability_manifest_updated",
+    "batch_summary",
+]
+
+VisibilitySeverity = Literal["debug", "info", "warn", "error"]
+
+
+class VisibilityChannels(_Base):
+    """B9 §6.2/§6.4 fan-out flags for the v0.7.1 event log.
+
+    The envelope is intentionally a routing/visibility wrapper, not a
+    backend-tool flattener: backend-native names stay in payload fields such
+    as ``raw_backend_type`` per 07 §7.3. See 09 R16 and 08 PE-2/L17 for why
+    the append-only event log exists alongside mailbox/task-state/stderr.
+    """
+
+    mailbox: bool = False
+    task_state: bool = False
+    event_log: bool = True
+    stderr: bool = True
+
+
+class VisibilityEvent(_Base):
+    """Versioned B9 §6 visibility envelope.
+
+    This is the common substrate for Codex/Gemini/Kimi visibility without
+    erasing harness-specific event names (07 §7.3, 09 R16, 08 PE-2/L17).
+    ``payload`` is intentionally permissive by kind so new backend fields can
+    be preserved without a schema migration; the outer envelope remains
+    stable for filtering, fan-out, and de-duplication.
+    """
+
+    kind: VisibilityEventKind
+    schema_version: Literal[1] = 1
+    event_id: str
+    timestamp: str = Field(default_factory=now_iso)
+    team: str
+    agent: str
+    backend: str
+    task_id: str | None = None
+    turn_id: str | None = None
+    seq: int = Field(ge=0)
+    severity: VisibilitySeverity = "info"
+    summary: str
+    visibility: VisibilityChannels = Field(default_factory=VisibilityChannels)
+    payload: dict[str, Any] = Field(default_factory=dict)
 
 
 def parse_protocol_text(text: str) -> _Base | None:
@@ -175,14 +391,48 @@ def parse_protocol_text(text: str) -> _Base | None:
         return _safe_load(TaskAssignmentIn, raw)
     if t == "shutdown_request":
         return _safe_load(ShutdownRequestIn, raw)
+    if t == "shutdown_approved":
+        return _safe_load(ShutdownApprovedOut, raw)
+    if t == "shutdown_rejected":
+        return _safe_load(ShutdownRejectedOut, raw)
+    if t == "shutdown_response":
+        return _safe_load(ShutdownResponseOut, raw)
     if t == "plan_approval_request":
         return _safe_load(PlanApprovalRequestIn, raw)
     if t == "plan_approval_response":
         return _safe_load(PlanApprovalResponseIn, raw)
+    if t == "plan_blocked":
+        return _safe_load(PlanBlockedOut, raw)
+    if t == "permission_request":
+        return _safe_load(PermissionRequestOut, raw)
     if t == "permission_response":
         return _safe_load(PermissionResponseIn, raw)
+    if t == "capability_manifest_updated":
+        return _safe_load(CapabilityManifestUpdatedIn, raw)
     if t == "steer":
         return _safe_load(SteerIn, raw)
+    if t == "idle_notification":
+        return _safe_load(IdleNotificationOut, raw)
+    if t == "task_complete":
+        return _safe_load(TaskCompleteOut, raw)
+    if t == "task_blocked":
+        return _safe_load(TaskBlockedOut, raw)
+    if t in {
+        "agent_registered",
+        "turn_started",
+        "turn_progress",
+        "tool_event",
+        "artifact_event",
+        "turn_warning",
+        "turn_completed",
+        "turn_failed",
+        "visibility_degraded",
+        "steer_ack",
+        "capability_changed",
+        "capability_manifest_updated",
+        "batch_summary",
+    }:
+        return _safe_load(VisibilityEvent, raw)
     return None
 
 

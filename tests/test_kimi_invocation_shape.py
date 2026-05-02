@@ -12,6 +12,8 @@ import subprocess
 from pathlib import Path
 from typing import Any
 
+from claude_teams import messaging as cs_messaging  # type: ignore[import-untyped]
+
 from claude_anyteam.backends.kimi import invoke
 
 
@@ -20,7 +22,11 @@ def _capture_run(tmp_path: Path, monkeypatch, **kwargs: Any) -> tuple[list[str],
     work = tmp_path / "work"
     home = tmp_path / "home"
     work.mkdir()
+    known_session_id = kwargs.pop("known_session_id", None)
+    if known_session_id:
+        invoke._session_dir(home, work, str(known_session_id)).mkdir(parents=True)
     captured: dict[str, Any] = {}
+    monkeypatch.setattr(cs_messaging, "TEAMS_DIR", tmp_path / "teams")
 
     def fake_write_mcp_config(kimi_home: Path, **_kwargs: Any) -> Path:
         assert kimi_home == home
@@ -114,3 +120,24 @@ def test_prompt_is_positional_tail_so_flags_do_not_leak_into_prompt(tmp_path, mo
     assert prompt_idx == len(argv) - 2
     assert argv[prompt_idx + 1] == "hello from tests"
     assert all(token not in argv[prompt_idx + 1] for token in ("--print", "--model", "--no-thinking"))
+
+
+def test_known_resume_session_adds_session_flag(tmp_path, monkeypatch):
+    session_id = "known-session"
+
+    argv, _ = _capture_run(
+        tmp_path,
+        monkeypatch,
+        resume_session_id=session_id,
+        known_session_id=session_id,
+    )
+
+    assert "--session" in argv
+    assert argv[argv.index("--session") + 1] == session_id
+    assert argv.index("--session") < argv.index("-p")
+
+
+def test_default_invocation_preserves_kimi_native_skill_discovery(tmp_path, monkeypatch):
+    argv, _ = _capture_run(tmp_path, monkeypatch)
+
+    assert "--skills-dir" not in argv

@@ -29,12 +29,16 @@ import subprocess
 import tempfile
 import time
 from dataclasses import dataclass
+from importlib import resources
+from importlib.resources.abc import Traversable
 from pathlib import Path
-from typing import Any
+from typing import Any, Callable
 
 from . import logger
 from .env import (
+    CWD_ENV,
     DUMP_EVENTS_ENV,
+    LEGACY_CWD_ENV,
     LEGACY_DUMP_EVENTS_ENV,
     TEAM_ENV,
     LEGACY_TEAM_ENV,
@@ -43,10 +47,19 @@ from .env import (
     identity_env,
     env_first,
 )
+from .headless_visibility import HeadlessTurnVisibility, coerce_stream_text
+from .messages import VisibilityEvent
+from .prompts import TEAM_MESSAGING_BLOCK
+from .wrapper_mcp_diagnostics import append_wrapper_mcp_diagnostic
 
-SCHEMAS_DIR = Path(__file__).resolve().parent / "schemas"
+# R1 (09 §3.1): schema files are versioned wire
+# assets, so resolve them as package resources instead of walking relative to
+# this source file. This keeps fresh wheel installs from depending on a
+# repository checkout layout.
+SCHEMAS_DIR = resources.files("claude_anyteam.schemas")
 TASK_COMPLETE_SCHEMA = SCHEMAS_DIR / "task-complete.schema.json"
 PLAN_SCHEMA = SCHEMAS_DIR / "plan.schema.json"
+SchemaResource = Path | Traversable
 
 
 @dataclass(frozen=True)
@@ -85,6 +98,9 @@ _TOOL_CALL_TYPE_SUBSTRINGS = (
     "commandexecution",    # Codex App Server host shell
     "filechange",          # Codex App Server host file writes
     "websearch",           # Codex App Server web search
+    "imagegeneration",     # Codex App Server image generation
+    "imagegen",            # observed/possible abbreviated image tool spelling
+    "imageview",           # Codex App Server image view
 )
 
 # Tool names our wrapper MCP server advertises. If any event payload
@@ -93,11 +109,89 @@ _TOOL_CALL_TYPE_SUBSTRINGS = (
 _WRAPPER_TOOL_NAMES = frozenset({
     "send_message",
     "task_update",
+    "checkpoint_commit",
     "task_create",
     "read_inbox",
     "task_list",
     "read_config",
 })
+
+# Keep this diagnostic snapshot in sync with wrapper_server.EXPOSED_TOOLS.
+# Duplicated here intentionally so codex.py can log session-start state
+# without importing FastMCP/wrapper_server on the hot path.
+_WRAPPER_EXPECTED_TOOL_NAMES = (
+    "send_message",
+    "task_update",
+    "task_create",
+    "task_batch_summary",
+    "read_inbox",
+    "task_list",
+    "read_config",
+    "mcp_anyteam_capability_manifest",
+    "mcp_anyteam_shell",
+    "mcp_anyteam_read_file",
+    "mcp_anyteam_write_file",
+    "mcp_anyteam_list_directory",
+    "mcp_anyteam_edit_file",
+    "mcp_anyteam_search",
+    "mcp_anyteam_grep",
+    "mcp_anyteam_web_fetch",
+)
+
+
+
+def _bounded_preview(value: Any, *, limit: int = 1000) -> Any:
+    if value is None or isinstance(value, (bool, int, float)):
+        return value
+    if isinstance(value, str):
+        return value if len(value) <= limit else value[: limit - 1] + "…"
+    if isinstance(value, (list, tuple)):
+        return [_bounded_preview(item, limit=limit) for item in list(value)[:30]]
+    if isinstance(value, dict):
+        return {
+            str(k): _bounded_preview(v, limit=limit)
+            for k, v in list(value.items())[:50]
+        }
+    return _bounded_preview(repr(value), limit=limit)
+
+
+def _toolish_fields(value: Any, *, depth: int = 0, path: str = "") -> dict[str, Any]:
+    """Extract bounded tool/MCP-looking fields from App Server responses."""
+
+    if depth > 5:
+        return {}
+    found: dict[str, Any] = {}
+    if isinstance(value, dict):
+        for key, child in value.items():
+            child_path = f"{path}.{key}" if path else str(key)
+            key_l = str(key).lower()
+            if any(fragment in key_l for fragment in ("tool", "mcp", "server")):
+                found[child_path] = _bounded_preview(child)
+            found.update(_toolish_fields(child, depth=depth + 1, path=child_path))
+    elif isinstance(value, list):
+        for index, child in enumerate(value[:20]):
+            found.update(_toolish_fields(child, depth=depth + 1, path=f"{path}[{index}]"))
+    return found
+
+
+def _log_codex_tool_snapshot(
+    *,
+    team: str | None,
+    agent: str | None,
+    event: str,
+    payload: dict[str, Any],
+) -> None:
+    if not team or not agent:
+        return
+    append_wrapper_mcp_diagnostic(
+        team=team,
+        agent=agent,
+        event=event,
+        payload={
+            "expected_wrapper_tools": list(_WRAPPER_EXPECTED_TOOL_NAMES),
+            **payload,
+        },
+    )
 
 
 def _normalise(s: str) -> str:
@@ -106,13 +200,13 @@ def _normalise(s: str) -> str:
 
 def _event_mentions_wrapper_tool(ev: dict[str, Any]) -> bool:
     """True if the event carries (top-level or nested) a wrapper tool name."""
-    for key in ("name", "tool_name", "function_name"):
+    for key in ("name", "tool", "tool_name", "function_name"):
         val = ev.get(key)
         if isinstance(val, str) and val in _WRAPPER_TOOL_NAMES:
             return True
     item = ev.get("item")
     if isinstance(item, dict):
-        for key in ("name", "tool_name", "function_name"):
+        for key in ("name", "tool", "tool_name", "function_name"):
             val = item.get(key)
             if isinstance(val, str) and val in _WRAPPER_TOOL_NAMES:
                 return True
@@ -141,17 +235,70 @@ def _tool_name_from_event(ev: dict[str, Any]) -> str | None:
     Returns None if the event doesn't carry a recognizable tool name; the
     raw event is still logged by the caller so forensics aren't lost.
     """
-    for key in ("name", "tool_name", "function_name"):
+    for key in ("name", "tool", "tool_name", "function_name"):
         val = ev.get(key)
         if isinstance(val, str) and val:
             return val
     item = ev.get("item")
     if isinstance(item, dict):
-        for key in ("name", "tool_name", "function_name"):
+        for key in ("name", "tool", "tool_name", "function_name"):
             val = item.get(key)
             if isinstance(val, str) and val:
                 return val
     return None
+
+
+def _parse_exec_stdout(
+    stdout: str,
+    *,
+    dump_events: bool = False,
+) -> tuple[list[dict[str, Any]], int, str | None]:
+    """Parse Codex exec JSONL without flattening the raw event stream."""
+
+    events: list[dict[str, Any]] = []
+    tool_call_events = 0
+    captured_session_id: str | None = None
+    for line in stdout.splitlines():
+        line = line.strip()
+        if not line:
+            continue
+        try:
+            ev = json.loads(line)
+        except json.JSONDecodeError:
+            logger.debug("codex.nonjson_line", line=line[:200])
+            continue
+        events.append(ev)
+        ev_type = str(ev.get("type", ""))
+        if dump_events:
+            logger.debug("codex.event", event_type=ev_type, event=ev)
+        if ev_type == "thread.started" and captured_session_id is None:
+            tid = ev.get("thread_id")
+            if isinstance(tid, str) and tid:
+                captured_session_id = tid
+                logger.info("codex.session_captured", session_id=tid)
+        if _is_tool_call_event(ev_type, ev):
+            tool_call_events += 1
+            logger.info(
+                "codex.tool_call",
+                event_type=ev_type,
+                tool=_tool_name_from_event(ev),
+                event=ev,
+            )
+    return events, tool_call_events, captured_session_id
+
+
+def _last_message_is_task_complete_json(last_message: str) -> bool:
+    """Best-effort terminal-digest classification for resume-path output."""
+
+    try:
+        payload = json.loads(last_message)
+    except json.JSONDecodeError:
+        return False
+    return (
+        isinstance(payload, dict)
+        and "files_changed" in payload
+        and "summary" in payload
+    )
 
 
 def wrapper_mcp_config_args(
@@ -160,6 +307,7 @@ def wrapper_mcp_config_args(
     *,
     server_name: str = "claude_anyteam_wrapper",
     wrapper_binary: str = "claude-anyteam-wrapper",
+    cwd: str | Path | None = None,
 ) -> list[str]:
     """Build the `-c mcp_servers.<name>.*` overrides that point Codex at our
     narrowed wrapper MCP server for a single `codex exec` invocation.
@@ -187,9 +335,12 @@ def wrapper_mcp_config_args(
     """
     resolved = shutil.which(wrapper_binary) or wrapper_binary
     prefix = f"mcp_servers.{server_name}"
+    wrapper_args: list[str] = []
+    if cwd is not None:
+        wrapper_args += ["--cwd", str(cwd)]
     return [
         "-c", f'{prefix}.command="{resolved}"',
-        "-c", f"{prefix}.args=[]",
+        "-c", f"{prefix}.args={json.dumps(wrapper_args)}",
     ]
 
 
@@ -314,7 +465,7 @@ def run(
     prompt: str,
     *,
     cwd: Path,
-    schema: Path | None = None,
+    schema: SchemaResource | None = None,
     codex_binary: str = "codex",
     timeout_s: float = 600.0,
     extra_args: list[str] | None = None,
@@ -322,6 +473,7 @@ def run(
     resume_session_id: str | None = None,
     model: str | None = None,
     effort: str | None = None,
+    task_id: str | None = None,
 ) -> CodexResult:
     """Run `codex exec` with structured JSON output.
 
@@ -413,10 +565,15 @@ def run(
             args.extend(extra_args)
         args.append(prompt)
 
+    visibility_team, visibility_agent = wrapper_identity or ("default", "codex")
     sub_env = None
     if wrapper_identity is not None:
         team_name, agent_name = wrapper_identity
         sub_env = identity_env(os.environ, team=team_name, name=agent_name)
+        sub_env[CWD_ENV] = str(cwd)
+        sub_env[LEGACY_CWD_ENV] = str(cwd)
+        if task_id is not None:
+            sub_env["CLAUDE_ANYTEAM_TASK_ID"] = str(task_id)
 
     logger.info(
         "codex.invoke",
@@ -424,10 +581,42 @@ def run(
         schema=str(schema) if schema else None,
         mcp_wrapper=bool(wrapper_identity),
     )
+    _log_codex_tool_snapshot(
+        team=visibility_team,
+        agent=visibility_agent,
+        event="codex_exec_session_start",
+        payload={
+            "cwd": str(cwd),
+            "schema": str(schema) if schema else None,
+            "task_id": task_id,
+            "resume_session_id": resume_session_id,
+            "model": model,
+            "effort": effort,
+            "extra_args": list(extra_args or []),
+            "mcp_wrapper_configured": bool(wrapper_identity),
+        },
+    )
 
     events: list[dict[str, Any]] = []
     structured: dict[str, Any] | None = None
     error: str | None = None
+    # `CLAUDE_ANYTEAM_DUMP_EVENTS=1` logs every JSONL event at debug level.
+    # Useful while tuning the tool-call classifier against a new Codex
+    # release whose event-type names we haven't seen before.
+    dump_events = env_first(os.environ, DUMP_EVENTS_ENV, LEGACY_DUMP_EVENTS_ENV) == "1"
+    visibility = HeadlessTurnVisibility.start(
+        team=visibility_team,
+        agent=visibility_agent,
+        backend="codex_exec",
+        enabled=wrapper_identity is not None,
+        cwd=cwd,
+        schema=schema,
+        timeout_s=timeout_s,
+        model=model,
+        effort=effort,
+        resume_session_id=resume_session_id,
+        task_id=task_id,
+    )
 
     try:
         proc = subprocess.run(
@@ -448,13 +637,39 @@ def run(
     except subprocess.TimeoutExpired as e:
         error = f"codex exec timed out after {timeout_s}s"
         logger.error("codex.timeout", timeout_s=timeout_s)
-        last_msg_path.unlink(missing_ok=True)
+        events, tool_call_events, captured_session_id = _parse_exec_stdout(
+            coerce_stream_text(getattr(e, "stdout", None) or getattr(e, "output", None)),
+            dump_events=dump_events,
+        )
+        last_message = ""
+        if last_msg_path.exists():
+            try:
+                last_message = last_msg_path.read_text(encoding="utf-8").strip()
+            finally:
+                last_msg_path.unlink(missing_ok=True)
+        else:
+            last_msg_path.unlink(missing_ok=True)
+        visibility.terminal(
+            success=False,
+            exit_code=124,
+            error=error,
+            events=events,
+            tool_call_events=tool_call_events,
+            last_message=last_message,
+            structured=_last_message_is_task_complete_json(last_message),
+            partial_events_available=bool(events),
+            session_id=captured_session_id,
+            error_class="turn_timeout",
+            extra_payload={"tool_call_event_source": "codex exec JSONL classifier"},
+        )
         return CodexResult(
             exit_code=124,
             structured=None,
-            last_message="",
-            events=[],
+            last_message=last_message,
+            events=events,
             error=error,
+            tool_call_events=tool_call_events,
+            session_id=captured_session_id,
         )
 
     # Parse JSONL events; the last object that contains our schema fields is
@@ -467,42 +682,14 @@ def run(
     # version (`item.tool_call_begin`, `mcp_tool_call`, `function_call`,
     # `tool.use`, etc.), so we match a broad set and include the full event
     # in the log for forensics.
-    tool_call_events = 0
-    # `CLAUDE_ANYTEAM_DUMP_EVENTS=1` logs every JSONL event at debug level.
-    # Useful while tuning the tool-call classifier against a new Codex
-    # release whose event-type names we haven't seen before.
-    dump_events = env_first(os.environ, DUMP_EVENTS_ENV, LEGACY_DUMP_EVENTS_ENV) == "1"
     # v7.2: capture `thread_id` from the `thread.started` event so callers
     # can pass it as `resume_session_id` on subsequent tasks for the same
     # teammate identity. Observed shape on codex-cli 0.122.0:
     #   {"type":"thread.started","thread_id":"<uuid>"}
-    captured_session_id: str | None = None
-    for line in proc.stdout.splitlines():
-        line = line.strip()
-        if not line:
-            continue
-        try:
-            ev = json.loads(line)
-        except json.JSONDecodeError:
-            logger.debug("codex.nonjson_line", line=line[:200])
-            continue
-        events.append(ev)
-        ev_type = str(ev.get("type", ""))
-        if dump_events:
-            logger.debug("codex.event", event_type=ev_type, event=ev)
-        if ev_type == "thread.started" and captured_session_id is None:
-            tid = ev.get("thread_id")
-            if isinstance(tid, str) and tid:
-                captured_session_id = tid
-                logger.info("codex.session_captured", session_id=tid)
-        if _is_tool_call_event(ev_type, ev):
-            tool_call_events += 1
-            logger.info(
-                "codex.tool_call",
-                event_type=ev_type,
-                tool=_tool_name_from_event(ev),
-                event=ev,
-            )
+    events, tool_call_events, captured_session_id = _parse_exec_stdout(
+        proc.stdout,
+        dump_events=dump_events,
+    )
 
     last_message = ""
     if last_msg_path.exists():
@@ -521,14 +708,32 @@ def run(
     if proc.returncode != 0 and not error:
         error = f"codex exec exited {proc.returncode}; stderr: {proc.stderr[:500]}"
 
+    terminal_structured = structured is not None or _last_message_is_task_complete_json(
+        last_message
+    )
+
     logger.info(
         "codex.done",
         exit_code=proc.returncode,
         events=len(events),
-        structured=bool(structured),
+        structured=terminal_structured,
         tool_call_events=tool_call_events,
         session_id=captured_session_id,
         resumed=resume_session_id is not None,
+    )
+
+    success = proc.returncode == 0 and error is None
+    visibility.terminal(
+        success=success,
+        exit_code=proc.returncode,
+        error=error,
+        events=events,
+        tool_call_events=tool_call_events,
+        last_message=last_message,
+        structured=terminal_structured,
+        partial_events_available=bool(events),
+        session_id=captured_session_id,
+        extra_payload={"tool_call_event_source": "codex exec JSONL classifier"},
     )
 
     return CodexResult(
@@ -599,6 +804,466 @@ def _start_or_fork_thread(
     return new_thread_id
 
 
+def _json_preview(value: Any, *, limit: int = 1000) -> str:
+    """Bounded JSON preview for B9 §6 payload forensic fields."""
+
+    try:
+        text = json.dumps(value, default=str, sort_keys=True)
+    except Exception:
+        text = repr(value)
+    if len(text) > limit:
+        return text[:limit] + "…"
+    return text
+
+
+def _first_present(mapping: dict[str, Any], *keys: str) -> Any:
+    for key in keys:
+        value = mapping.get(key)
+        if value not in (None, ""):
+            return value
+    return None
+
+
+def _item_target(item: dict[str, Any]) -> str | None:
+    value = _first_present(
+        item,
+        "target",
+        "command",
+        "cmd",
+        "query",
+        "url",
+        "path",
+        "file",
+        "name",
+        "text",
+    )
+    if isinstance(value, list):
+        return " ".join(str(v) for v in value)
+    if isinstance(value, dict):
+        return _json_preview(value, limit=300)
+    if value is None:
+        return None
+    return str(value)
+
+
+def _jsonish_dict(value: Any) -> dict[str, Any] | None:
+    """Return a dict from native or JSON-encoded tool-call fields."""
+
+    if isinstance(value, dict):
+        return value
+    if isinstance(value, str) and value.strip():
+        try:
+            parsed = json.loads(value)
+        except (TypeError, ValueError):
+            return None
+        if isinstance(parsed, dict):
+            return parsed
+    return None
+
+
+def _app_server_tool_arguments(item: dict[str, Any]) -> dict[str, Any]:
+    """Best-effort argument map for Codex App Server tool-call items.
+
+    App Server mcpToolCall records have used a native ``arguments`` object in
+    recent runs, but older/backend-adapter shapes may surface JSON-encoded
+    arguments under ``args``/``input`` or under nested call/function objects.
+    Keep the extraction observational: malformed fields simply mean "unknown"
+    instead of causing visibility emission to fail.
+    """
+
+    for key in ("arguments", "args", "input", "parameters", "tool_input"):
+        parsed = _jsonish_dict(item.get(key))
+        if parsed is not None:
+            return parsed
+
+    for container_key in ("call", "function", "tool_call", "toolCall"):
+        container = _jsonish_dict(item.get(container_key))
+        if container is None:
+            continue
+        for key in ("arguments", "args", "input", "parameters", "tool_input"):
+            parsed = _jsonish_dict(container.get(key))
+            if parsed is not None:
+                return parsed
+    return {}
+
+
+def _app_server_structured_result(item: dict[str, Any]) -> dict[str, Any]:
+    """Best-effort structured result payload for App Server tool-call items."""
+
+    result = _jsonish_dict(item.get("result"))
+    if result is None:
+        return {}
+    for key in ("structuredContent", "structured_content"):
+        structured = _jsonish_dict(result.get(key))
+        if structured is not None:
+            return structured
+    return result
+
+
+def _send_message_recipient_from_app_server_item(item: dict[str, Any]) -> str | None:
+    """Extract the recipient from an App Server send_message tool-call item."""
+
+    for source in (_app_server_tool_arguments(item), _app_server_structured_result(item)):
+        for key in ("recipient", "to", "delivered_to"):
+            value = source.get(key)
+            if value not in (None, ""):
+                return str(value)
+    return None
+
+
+def _item_exit_code(item: dict[str, Any]) -> int | None:
+    value = _first_present(item, "exit_code", "exitCode", "returncode", "returnCode")
+    if value is None:
+        return None
+    try:
+        return int(value)
+    except (TypeError, ValueError):
+        return None
+
+
+def _item_status(item: dict[str, Any], *, exit_code: int | None) -> str | None:
+    value = _first_present(item, "status", "outcome", "state")
+    if isinstance(value, str) and value:
+        normalized = value.strip().lower()
+        if normalized in {"success", "succeeded", "ok", "complete", "completed"}:
+            return "success"
+        if normalized in {"error", "failed", "failure"}:
+            return "error"
+        return normalized
+    if exit_code is not None:
+        return "success" if exit_code == 0 else "error"
+    return None
+
+
+def _phase_from_method(method: str, item: dict[str, Any]) -> str:
+    explicit = _first_present(item, "phase")
+    if isinstance(explicit, str) and explicit in {"started", "completed", "failed"}:
+        return explicit
+    method_n = _normalise(method)
+    status = str(_first_present(item, "status", "outcome", "state") or "").lower()
+    if "fail" in method_n or status in {"failed", "error"}:
+        return "failed"
+    if "start" in method_n or status in {"running", "started"}:
+        return "started"
+    return "completed"
+
+
+def _artifact_action(item: dict[str, Any]) -> str:
+    value = str(
+        _first_present(item, "action", "operation", "status", "changeType") or "modified"
+    ).lower()
+    if value in {"create", "created", "add", "added", "new"}:
+        return "created"
+    if value in {"delete", "deleted", "remove", "removed"}:
+        return "deleted"
+    return "modified"
+
+
+def _visibility_for_app_server_item(
+    *,
+    method: str,
+    item: dict[str, Any],
+    make_event: Callable[..., VisibilityEvent],
+) -> VisibilityEvent | None:
+    """Normalize Codex App Server native items into B9 §6 envelopes.
+
+    This is intentionally *not* a flattener (07 §7.3): the backend-native
+    item type is preserved verbatim as `payload.raw_backend_type` while the
+    outer envelope gives the lead/event-log a stable routing shape.
+    """
+
+    raw_type = str(item.get("type", ""))
+    item_n = _normalise(raw_type)
+    raw_preview = _json_preview(item)
+
+    if "agentmessage" in item_n:
+        text = str(_first_present(item, "text", "message", "content") or "")
+        preview = text[:500] if text else None
+        summary = (
+            f"{raw_type}: {preview[:120]}"
+            if preview
+            else f"{raw_type}: message update"
+        )
+        payload = {
+            "raw_backend_type": raw_type,
+            "raw_event_preview": raw_preview,
+            "agent_message_bytes": len(text),
+            "message_preview": preview,
+        }
+        payload = {k: v for k, v in payload.items() if v is not None}
+        return make_event(
+            kind="turn_progress",
+            severity="info",
+            summary=summary[:200],
+            payload=payload,
+        )
+
+    if "filechange" in item_n:
+        path = _first_present(item, "path", "file", "filePath", "filename") or ""
+        action = _artifact_action(item)
+        payload: dict[str, Any] = {
+            "source": f"codex_app_server.{raw_type}",
+            "path": str(path),
+            "action": action,
+            "raw_backend_type": raw_type,
+            "raw_event_preview": raw_preview,
+        }
+        for out_key, *in_keys in (
+            ("bytes_delta", "bytes_delta", "bytesDelta"),
+            ("line_delta", "line_delta", "lineDelta"),
+            ("lines_added", "lines_added", "linesAdded"),
+            ("lines_removed", "lines_removed", "linesRemoved"),
+        ):
+            value = _first_present(item, *in_keys)
+            if value is not None:
+                payload[out_key] = value
+        summary = f"{raw_type}: {action} {path}".strip()
+        return make_event(
+            kind="artifact_event",
+            severity="info",
+            summary=summary,
+            visibility={
+                "mailbox": False,
+                "task_state": True,
+                "event_log": True,
+                "stderr": True,
+            },
+            payload=payload,
+        )
+
+    if "plan" in item_n:
+        return make_event(
+            kind="turn_progress",
+            severity="info",
+            summary=f"{raw_type}: plan updated",
+            visibility={
+                "mailbox": False,
+                "task_state": True,
+                "event_log": True,
+                "stderr": True,
+            },
+            payload={
+                "raw_backend_type": raw_type,
+                "raw_event_preview": raw_preview,
+                "plan": _first_present(item, "plan", "text", "content", "message"),
+            },
+        )
+
+    if "error" in item_n:
+        summary = str(
+            _first_present(item, "message", "error", "summary", "text")
+            or f"{raw_type}: backend error"
+        )
+        return make_event(
+            kind="turn_warning",
+            severity="error",
+            summary=summary[:200],
+            visibility={
+                "mailbox": True,
+                "task_state": True,
+                "event_log": True,
+                "stderr": True,
+            },
+            payload={
+                "raw_backend_type": raw_type,
+                "raw_event_preview": raw_preview,
+                "error": _first_present(item, "error", "message", "text"),
+            },
+        )
+
+    tool_like = any(
+        frag in item_n
+        for frag in (
+            "commandexecution",
+            "websearch",
+            "mcptoolcall",
+            "toolcall",
+            "tooluse",
+            "imagegeneration",
+            "imagegen",
+            "imageview",
+        )
+    )
+    if not tool_like:
+        return None
+
+    fake_ev = {
+        "type": raw_type,
+        "item": item,
+        **{k: v for k, v in item.items() if k != "type"},
+    }
+    exit_code = _item_exit_code(item)
+    status = _item_status(item, exit_code=exit_code)
+    phase = _phase_from_method(method, item)
+    tool_name = raw_type
+    if "mcp" in item_n or "toolcall" in item_n or "tooluse" in item_n:
+        tool_name = _tool_name_from_event(fake_ev) or raw_type
+    payload = {
+        "category": "mcp_tool" if "mcp" in item_n else "host_tool",
+        "tool_name": tool_name,
+        "phase": phase,
+        "target": _item_target(item),
+        "status": status,
+        "exit_code": exit_code,
+        "duration_ms": _first_present(item, "duration_ms", "durationMs", "elapsedMs"),
+        "stdout_preview": _first_present(item, "stdout_preview", "stdoutPreview"),
+        "stderr_preview": _first_present(item, "stderr_preview", "stderrPreview"),
+        "raw_backend_type": raw_type,
+        "raw_event_preview": raw_preview,
+    }
+    if tool_name == "send_message":
+        recipient = _send_message_recipient_from_app_server_item(item)
+        if recipient:
+            payload["recipient"] = recipient
+            payload["to"] = recipient
+            payload["target"] = f"to={recipient!r}"
+    payload = {k: v for k, v in payload.items() if v is not None}
+    target = payload.get("target")
+    summary = f"{raw_type}: {target}" if target else raw_type
+    failed = phase == "failed" or status == "error"
+    return make_event(
+        kind="tool_event",
+        severity="error" if failed else "info",
+        summary=summary[:200],
+        visibility={
+            "mailbox": failed,
+            "task_state": failed,
+            "event_log": True,
+            "stderr": True,
+        },
+        payload=payload,
+    )
+
+
+def _app_server_transport_alive(client: Any) -> bool:
+    checker = getattr(client, "is_transport_alive", None)
+    if callable(checker):
+        try:
+            return bool(checker())
+        except Exception as e:
+            logger.debug("app_server.transport_health_check_failed", error=str(e))
+            return True
+    # Test doubles / older clients that do not expose a health hook are
+    # presumed healthy so the existing empty-queue polling behavior is
+    # preserved.
+    return True
+
+
+def _app_server_transport_status(client: Any) -> dict[str, Any]:
+    status = getattr(client, "transport_status", None)
+    if callable(status):
+        try:
+            value = status()
+            if isinstance(value, dict):
+                return value
+        except Exception as e:
+            logger.debug("app_server.transport_status_failed", error=str(e))
+    return {}
+
+
+def _thread_id_from_app_server_payload(payload: Any) -> str | None:
+    if not isinstance(payload, dict):
+        return None
+    thread = payload.get("thread")
+    if isinstance(thread, dict):
+        tid = thread.get("id")
+        if isinstance(tid, str) and tid:
+            return tid
+    tid = payload.get("threadId")
+    if isinstance(tid, str) and tid:
+        return tid
+    return None
+
+
+def _thread_turns_from_app_server_payload(payload: Any) -> list[dict[str, Any]]:
+    if not isinstance(payload, dict):
+        return []
+    thread = payload.get("thread")
+    turns = thread.get("turns") if isinstance(thread, dict) else payload.get("turns")
+    if not isinstance(turns, list):
+        return []
+    return [turn for turn in turns if isinstance(turn, dict)]
+
+
+def _turn_error_summary(turn: dict[str, Any]) -> str | None:
+    err = turn.get("error")
+    if isinstance(err, dict):
+        message = _first_present(err, "message", "error", "summary")
+        if isinstance(message, str) and message:
+            return message
+        return _json_preview(err, limit=500)
+    if isinstance(err, str) and err:
+        return err
+    return None
+
+
+def _latest_agent_message(turn: dict[str, Any]) -> str | None:
+    items = turn.get("items")
+    if not isinstance(items, list):
+        return None
+    for item in reversed(items):
+        if not isinstance(item, dict):
+            continue
+        if item.get("type") != "agentMessage":
+            continue
+        text = item.get("text")
+        if isinstance(text, str) and text:
+            return text
+    return None
+
+
+def _resume_turn_snapshot(
+    payload: Any,
+    *,
+    preferred_turn_id: str | None,
+) -> tuple[str | None, str | None, str | None, str | None]:
+    """Return (turn_id, status, last_agent_message, error_summary).
+
+    `thread/resume` responses populate `thread.turns[*].items`; during
+    transport recovery this lets us salvage a final agentMessage if the turn
+    completed while our stdio/WebSocket pipe was down.
+    """
+
+    turns = _thread_turns_from_app_server_payload(payload)
+    if not turns:
+        return None, None, None, None
+    selected: dict[str, Any] | None = None
+    if preferred_turn_id:
+        for turn in turns:
+            if turn.get("id") == preferred_turn_id:
+                selected = turn
+                break
+    if selected is None:
+        selected = turns[-1]
+    turn_id = selected.get("id")
+    status = selected.get("status")
+    return (
+        turn_id if isinstance(turn_id, str) else None,
+        status if isinstance(status, str) else None,
+        _latest_agent_message(selected),
+        _turn_error_summary(selected),
+    )
+
+
+def _app_server_recovery_prompt(task_prompt: str, *, schema: dict[str, Any] | None) -> str:
+    contract = (
+        "Finish by returning exactly the requested JSON object for the output "
+        "schema. No markdown fences and no prose outside the JSON."
+        if schema is not None
+        else "Finish by replying to the user normally."
+    )
+    return (
+        "Transport recovery: the adapter reconnected to Codex App Server after "
+        "the previous transport died mid-turn. Continue the same request from "
+        "the current repository and conversation state. Preserve any durable "
+        "work that is already done, avoid repeating expensive work unless you "
+        "need to verify it, and complete the original request.\n\n"
+        f"{contract}\n\n"
+        "# Original request\n"
+        f"{task_prompt}"
+    )
+
+
 def app_server_invoke(
     *,
     task_prompt: str,
@@ -609,11 +1274,14 @@ def app_server_invoke(
     codex_binary: str = "codex",
     overall_timeout_s: float = 900.0,
     non_progress_warn_s: float = 300.0,
+    non_progress_interrupt_s: float | None = None,
     steer_queue: "_SteerQueue | None" = None,
     mid_turn_hook: "Any | None" = None,
     resume_thread_id: str | None = None,
     model: str | None = None,
     effort: str | None = None,
+    task_id: str | None = None,
+    event_sink: Callable[[VisibilityEvent], None] | None = None,
 ) -> CodexResult:
     """Run a task against Codex App Server. Returns a CodexResult in the
     same shape as `run()` so the control loop can use a single code path
@@ -654,6 +1322,74 @@ def app_server_invoke(
     last_message = ""
     error: str | None = None
     exit_code = 0
+    thread_id: str | None = None
+    current_turn_id: str | None = None
+    turn_started_at: float | None = None
+    visibility_seq = 0
+
+    def _emit_visibility_event(
+        *,
+        kind: str,
+        severity: str,
+        summary: str,
+        payload: dict[str, Any],
+        visibility: dict[str, bool] | None = None,
+    ) -> VisibilityEvent:
+        nonlocal visibility_seq
+        visibility_seq += 1
+        turn_ref = current_turn_id or thread_id or "unknown-turn"
+        event = VisibilityEvent.model_validate(
+            {
+                "kind": kind,
+                "event_id": f"{settings_agent}:{turn_ref}:{visibility_seq:06d}",
+                "team": settings_team,
+                "agent": settings_agent,
+                "backend": "codex_app_server",
+                "task_id": task_id,
+                "turn_id": current_turn_id,
+                "seq": visibility_seq,
+                "severity": severity,
+                "summary": summary,
+                "visibility": visibility
+                or {
+                    "mailbox": False,
+                    "task_state": False,
+                    "event_log": True,
+                    "stderr": True,
+                },
+                "payload": payload,
+            }
+        )
+        if event.visibility.stderr:
+            log_payload = {
+                "kind": event.kind,
+                "event_id": event.event_id,
+                "seq": event.seq,
+                "severity": event.severity,
+                "summary": event.summary,
+                "visibility_event": event.model_dump(
+                    by_alias=True, exclude_none=True
+                ),
+            }
+            if event.severity == "error":
+                logger.error("visibility.event", **log_payload)
+            elif event.severity == "warn":
+                logger.warn("visibility.event", **log_payload)
+            elif event.severity == "debug":
+                logger.debug("visibility.event", **log_payload)
+            else:
+                logger.info("visibility.event", **log_payload)
+        if event_sink is not None:
+            try:
+                event_sink(event)
+            except Exception as e:
+                logger.warn(
+                    "visibility.event_sink_failed",
+                    kind=event.kind,
+                    event_id=event.event_id,
+                    error=str(e),
+                )
+        return event
 
     def _record(ev: dict[str, Any]) -> None:
         nonlocal tool_call_events
@@ -675,6 +1411,11 @@ def app_server_invoke(
                     tool=_tool_name_from_event(fake_ev),
                     event={"item": item},
                 )
+            _visibility_for_app_server_item(
+                method=method,
+                item=item,
+                make_event=_emit_visibility_event,
+            )
 
     # MCP config for the wrapper — same shape as the exec path, injected via
     # Codex's config override mechanism on thread start. App Server accepts
@@ -686,21 +1427,44 @@ def app_server_invoke(
     # "connection closed: initialize response"). CLI args sidestep the
     # env-forwarding question entirely; the wrapper's `_identity()` resolves
     # CLI flags first, then env as fallback for backward compat.
+    wrapper_args = [
+        "--team",
+        settings_team,
+        "--name",
+        settings_agent,
+        "--cwd",
+        str(cwd),
+    ]
+    if task_id is not None:
+        wrapper_args += ["--task-id", str(task_id)]
+
     mcp_config = {
         "mcp_servers": {
             "claude_anyteam_wrapper": {
                 "command": wrapper_binary,
-                "args": ["--team", settings_team, "--name", settings_agent],
+                "args": wrapper_args,
             }
         }
     }
+    _log_codex_tool_snapshot(
+        team=settings_team,
+        agent=settings_agent,
+        event="codex_app_server_mcp_config_prepared",
+        payload={
+            "task_id": task_id,
+            "wrapper_binary": wrapper_binary,
+            "wrapper_args": wrapper_args,
+            "mcp_config": mcp_config,
+        },
+    )
 
     # Common thread-start kwargs shared between fresh-start and fork paths.
     thread_kwargs: dict[str, Any] = {
         "cwd": str(cwd),
         "base_instructions": (
             f"You are {settings_agent}, a Codex teammate on the "
-            f"{settings_team} team. Execute the task below."
+            f"{settings_team} team. Execute the task below.\n\n"
+            f"{TEAM_MESSAGING_BLOCK}"
         ),
         "developer_instructions": task_prompt,
         "sandbox": "danger-full-access",
@@ -715,7 +1479,6 @@ def app_server_invoke(
     if model is not None:
         thread_kwargs["model"] = model
 
-    thread_id: str | None = None
     try:
         client.start()
         client.initialize()
@@ -724,6 +1487,21 @@ def app_server_invoke(
             client,
             resume_thread_id=resume_thread_id,
             thread_kwargs=thread_kwargs,
+        )
+        thread_snapshot = getattr(client, "last_thread_result", None)
+        _log_codex_tool_snapshot(
+            team=settings_team,
+            agent=settings_agent,
+            event="codex_app_server_session_start",
+            payload={
+                "thread_id": thread_id,
+                "resume_thread_id": resume_thread_id,
+                "task_id": task_id,
+                "model": model,
+                "effort": effort,
+                "mcp_config": mcp_config,
+                "thread_response_toolish_fields": _toolish_fields(thread_snapshot),
+            },
         )
 
         current_turn_id = client.turn_start(
@@ -734,26 +1512,306 @@ def app_server_invoke(
             effort=effort,
         )
         logger.info("app_server.turn_started", turn_id=current_turn_id)
+        _emit_visibility_event(
+            kind="turn_started",
+            severity="info",
+            summary="Codex App Server turn started",
+            visibility={
+                "mailbox": False,
+                "task_state": True,
+                "event_log": True,
+                "stderr": True,
+            },
+            payload={
+                "mode": "task" if task_id is not None else "prose",
+                "prompt_kind": "task_complete" if schema is not None else "prose_reply",
+                "timeout_s": overall_timeout_s,
+                "non_progress_soft_s": non_progress_warn_s,
+                "non_progress_interrupt_s": non_progress_interrupt_s,
+                "cwd": str(cwd),
+                "model": model,
+                "effort": effort,
+            },
+        )
 
         # Event loop: drain notifications, watch for turn/completed, deliver
         # queued steers. Polling with a short timeout lets us interleave
         # steer injection with notification consumption.
         deadline = time.monotonic() + overall_timeout_s
-        # Soft non-progress watchdog (v0.6.0): if we see no observable
+        # Soft non-progress watchdog (v0.6.0/R20): if we see no observable
         # output for `non_progress_warn_s`, log a warning + send a single
-        # `turn/steer` checkpoint prompt to the model. We do NOT kill the
-        # turn — the wall-clock cap (`overall_timeout_s`) is the only
-        # interrupt. Only warn once per turn so we don't spam the lead or
-        # the model. "Observable output" = an agentMessage delta or a
-        # tool_call_event (post-v0.5.1 substring fix this includes host
-        # commandExecution / fileChange events from Codex App Server).
-        # See bug-triage/B9-visibility-parity-investigation.md §5.
+        # `turn/steer` checkpoint prompt to the model. By default we do NOT
+        # kill the turn — the wall-clock cap (`overall_timeout_s`) remains
+        # the only interrupt. R20 adds an opt-in hard early interrupt via
+        # `non_progress_interrupt_s`; it only fires after the soft watchdog
+        # has fired and no later checkpoint appears. Only warn once per turn
+        # so we don't spam the lead or the model. "Observable output" = an
+        # agentMessage delta or a tool_call_event (post-v0.5.1 substring fix
+        # this includes host commandExecution / fileChange events from Codex
+        # App Server). See bug-triage/B9-visibility-parity-investigation.md §5.
         turn_started_at = time.monotonic()
         last_progress_at = turn_started_at
         last_tool_count = 0
         last_message_len = 0
         non_progress_warned = False
+        non_progress_warned_at: float | None = None
+        non_progress_interrupted = False
+        transport_reconnect_attempts = 0
         done = False
+
+        def _resume_kwargs() -> dict[str, Any]:
+            """Map thread/start kwargs to the subset accepted by thread/resume."""
+
+            return {
+                "cwd": thread_kwargs.get("cwd"),
+                "base_instructions": thread_kwargs.get("base_instructions"),
+                "developer_instructions": thread_kwargs.get("developer_instructions"),
+                "sandbox": thread_kwargs.get("sandbox", "danger-full-access"),
+                "approval_policy": thread_kwargs.get("approval_policy", "never"),
+                "config": thread_kwargs.get("config"),
+                "model": thread_kwargs.get("model"),
+            }
+
+        def _mark_transport_recovery_failed(
+            *,
+            summary: str,
+            payload: dict[str, Any],
+        ) -> None:
+            nonlocal done, error, exit_code
+            error = summary
+            exit_code = 1
+            logger.error(
+                "app_server.transport_recovery_failed",
+                turn_id=current_turn_id,
+                thread_id=thread_id,
+                error=summary,
+                payload=payload,
+            )
+            _emit_visibility_event(
+                kind="visibility_degraded",
+                severity="error",
+                summary=summary[:200],
+                visibility={
+                    "mailbox": True,
+                    "task_state": True,
+                    "event_log": True,
+                    "stderr": True,
+                },
+                payload={
+                    "surface": "codex_app_server_transport",
+                    "reason": "reconnect_failed",
+                    **payload,
+                },
+            )
+            done = True
+
+        def _attempt_transport_recovery(reason: str) -> None:
+            nonlocal transport_reconnect_attempts, thread_id, current_turn_id
+            nonlocal last_message, last_progress_at, last_tool_count, last_message_len
+            nonlocal non_progress_warned, non_progress_warned_at, done
+
+            if done:
+                return
+            if thread_id is None or current_turn_id is None:
+                _mark_transport_recovery_failed(
+                    summary=(
+                        "Codex App Server transport died before a resumable "
+                        "thread/turn id was available"
+                    ),
+                    payload={
+                        "action": "abort",
+                        "reason_detail": reason,
+                        "thread_id": thread_id,
+                        "turn_id": current_turn_id,
+                        "transport_status": _app_server_transport_status(client),
+                    },
+                )
+                return
+            if transport_reconnect_attempts >= 1:
+                _mark_transport_recovery_failed(
+                    summary=(
+                        "Codex App Server transport died again after one "
+                        "reconnect attempt"
+                    ),
+                    payload={
+                        "action": "abort",
+                        "reason_detail": reason,
+                        "thread_id": thread_id,
+                        "turn_id": current_turn_id,
+                        "attempts": transport_reconnect_attempts,
+                        "transport_status": _app_server_transport_status(client),
+                    },
+                )
+                return
+
+            transport_reconnect_attempts += 1
+            previous_turn_id = current_turn_id
+            status_before = _app_server_transport_status(client)
+            logger.warn(
+                "app_server.transport_lost",
+                thread_id=thread_id,
+                turn_id=previous_turn_id,
+                reason=reason,
+                attempt=transport_reconnect_attempts,
+                transport_status=status_before,
+            )
+            _emit_visibility_event(
+                kind="turn_warning",
+                severity="warn",
+                summary="Codex App Server transport disconnected; attempting reconnect/resume",
+                visibility={
+                    "mailbox": True,
+                    "task_state": True,
+                    "event_log": True,
+                    "stderr": True,
+                },
+                payload={
+                    "surface": "codex_app_server_transport",
+                    "reason": reason,
+                    "action": "reconnect_and_resume",
+                    "attempt": transport_reconnect_attempts,
+                    "thread_id": thread_id,
+                    "turn_id": previous_turn_id,
+                    "transport_status": status_before,
+                },
+            )
+
+            try:
+                reconnect_and_resume = getattr(client, "reconnect_and_resume", None)
+                if callable(reconnect_and_resume):
+                    resume_payload = reconnect_and_resume(
+                        thread_id=thread_id,
+                        **_resume_kwargs(),
+                    )
+                else:
+                    client.close()
+                    client.start()
+                    client.initialize()
+                    resume_payload = client.thread_resume(
+                        thread_id=thread_id,
+                        **_resume_kwargs(),
+                    )
+            except AppServerError as e:
+                _mark_transport_recovery_failed(
+                    summary=f"Codex App Server reconnect/resume failed: {e}",
+                    payload={
+                        "action": "abort",
+                        "reason_detail": reason,
+                        "thread_id": thread_id,
+                        "turn_id": previous_turn_id,
+                        "attempt": transport_reconnect_attempts,
+                        "transport_status": status_before,
+                    },
+                )
+                return
+
+            resumed_thread_id = _thread_id_from_app_server_payload(resume_payload)
+            if resumed_thread_id:
+                thread_id = resumed_thread_id
+
+            (
+                resumed_turn_id,
+                resumed_status,
+                resumed_last_message,
+                resumed_error,
+            ) = _resume_turn_snapshot(
+                resume_payload,
+                preferred_turn_id=previous_turn_id,
+            )
+            if resumed_last_message:
+                last_message = resumed_last_message
+
+            if resumed_status in {"completed", "interrupted"} and resumed_last_message:
+                logger.info(
+                    "app_server.transport_recovered_terminal_turn",
+                    thread_id=thread_id,
+                    turn_id=resumed_turn_id or previous_turn_id,
+                    status=resumed_status,
+                )
+                _emit_visibility_event(
+                    kind="turn_progress",
+                    severity="info",
+                    summary=(
+                        "Codex App Server reconnected; recovered completed "
+                        "turn output from resumed thread"
+                    ),
+                    visibility={
+                        "mailbox": False,
+                        "task_state": True,
+                        "event_log": True,
+                        "stderr": True,
+                    },
+                    payload={
+                        "surface": "codex_app_server_transport",
+                        "action": "resume_recovered_terminal_turn",
+                        "thread_id": thread_id,
+                        "turn_id": resumed_turn_id or previous_turn_id,
+                        "resumed_status": resumed_status,
+                    },
+                )
+                done = True
+                return
+
+            try:
+                current_turn_id = client.turn_start(
+                    thread_id=thread_id,
+                    text=_app_server_recovery_prompt(task_prompt, schema=schema),
+                    output_schema=schema,
+                    model=model,
+                    effort=effort,
+                )
+            except AppServerError as e:
+                _mark_transport_recovery_failed(
+                    summary=f"Codex App Server recovery turn/start failed: {e}",
+                    payload={
+                        "action": "abort",
+                        "reason_detail": reason,
+                        "thread_id": thread_id,
+                        "previous_turn_id": previous_turn_id,
+                        "resumed_turn_id": resumed_turn_id,
+                        "resumed_status": resumed_status,
+                        "resumed_error": resumed_error,
+                        "attempt": transport_reconnect_attempts,
+                    },
+                )
+                return
+
+            now = time.monotonic()
+            last_progress_at = now
+            last_tool_count = tool_call_events
+            last_message_len = len(last_message)
+            non_progress_warned = False
+            non_progress_warned_at = None
+            logger.info(
+                "app_server.transport_recovered",
+                thread_id=thread_id,
+                previous_turn_id=previous_turn_id,
+                recovery_turn_id=current_turn_id,
+                resumed_status=resumed_status,
+            )
+            _emit_visibility_event(
+                kind="turn_progress",
+                severity="info",
+                summary="Codex App Server reconnected; continuation turn started",
+                visibility={
+                    "mailbox": False,
+                    "task_state": True,
+                    "event_log": True,
+                    "stderr": True,
+                },
+                payload={
+                    "surface": "codex_app_server_transport",
+                    "action": "recovery_turn_started",
+                    "thread_id": thread_id,
+                    "previous_turn_id": previous_turn_id,
+                    "turn_id": current_turn_id,
+                    "resumed_turn_id": resumed_turn_id,
+                    "resumed_status": resumed_status,
+                    "resumed_error": resumed_error,
+                    "attempt": transport_reconnect_attempts,
+                },
+            )
+
         while not done and time.monotonic() < deadline:
             # 1. Deliver any pending steers. Non-blocking pop.
             if steer_queue is not None:
@@ -795,34 +1853,61 @@ def app_server_invoke(
             try:
                 notif = client.notifications.get(timeout=0.5)
             except Exception:
+                if not _app_server_transport_alive(client):
+                    _attempt_transport_recovery("notification_transport_closed")
+                    continue
                 # No notification this iteration — check the soft watchdog.
                 # Triggers at most once per turn; doesn't kill, just warns
-                # the lead and nudges the model.
+                # the lead and nudges the model. The optional hard interrupt
+                # is checked separately below and is disabled by default.
+                now = time.monotonic()
                 if (
                     not non_progress_warned
-                    and (time.monotonic() - last_progress_at) >= non_progress_warn_s
+                    and (now - last_progress_at) >= non_progress_warn_s
                 ):
-                    elapsed_s = time.monotonic() - turn_started_at
+                    elapsed_s = now - turn_started_at
+                    non_progress_s = now - last_progress_at
+                    warn_threshold_s = int(non_progress_warn_s)
                     logger.warn(
                         "app_server.non_progress",
                         turn_id=current_turn_id,
                         elapsed_s=int(elapsed_s),
-                        non_progress_s=int(time.monotonic() - last_progress_at),
+                        non_progress_s=int(non_progress_s),
                         tool_call_events=tool_call_events,
                         last_message_len=len(last_message),
+                    )
+                    _emit_visibility_event(
+                        kind="turn_progress",
+                        severity="warn",
+                        summary=(
+                            f"no visible checkpoint for {warn_threshold_s}s; "
+                            "checkpoint steer sent"
+                        ),
+                        visibility={
+                            "mailbox": True,
+                            "task_state": True,
+                            "event_log": True,
+                            "stderr": True,
+                        },
+                        payload={
+                            "elapsed_s": int(elapsed_s),
+                            "timeout_s": overall_timeout_s,
+                            "risk": "timeout_possible",
+                            "action_taken": "turn_steer_sent",
+                        },
                     )
                     try:
                         client.turn_steer(
                             thread_id=thread_id,
                             expected_turn_id=current_turn_id,
                             text=(
-                                "Checkpoint: you have produced no observable "
-                                "output for several minutes. Summarize current "
-                                "state in a brief assistant message and end the "
-                                "turn now if you don't have a concrete next "
-                                "tool call. Hidden reasoning that doesn't reach "
-                                "a tool call or file edit is not durable across "
-                                "turn boundaries."
+                                "You have produced no externally visible "
+                                f"checkpoint for {warn_threshold_s} seconds. "
+                                "If you have useful findings or partial work, "
+                                "summarize them now and either write a small "
+                                "durable artifact or finish in the requested "
+                                "output format. Do not continue hidden "
+                                "reasoning without a visible checkpoint."
                             ),
                         )
                     except AppServerError as e:
@@ -832,6 +1917,42 @@ def app_server_invoke(
                             error=str(e),
                         )
                     non_progress_warned = True
+                    non_progress_warned_at = now
+                elif (
+                    non_progress_interrupt_s is not None
+                    and non_progress_warned
+                    and not non_progress_interrupted
+                    and non_progress_warned_at is not None
+                    and last_progress_at <= non_progress_warned_at
+                    and (now - turn_started_at) >= non_progress_interrupt_s
+                ):
+                    elapsed_s = now - turn_started_at
+                    non_progress_interrupted = True
+                    logger.warn(
+                        "app_server.non_progress_interrupt",
+                        turn_id=current_turn_id,
+                        elapsed_s=int(elapsed_s),
+                        non_progress_interrupt_s=non_progress_interrupt_s,
+                    )
+                    try:
+                        client.turn_interrupt(
+                            thread_id=thread_id,
+                            turn_id=current_turn_id,
+                        )
+                    except AppServerError as e:
+                        logger.warn(
+                            "app_server.non_progress_interrupt_failed",
+                            turn_id=current_turn_id,
+                            error=str(e),
+                        )
+                    else:
+                        error = (
+                            "app_server turn interrupted after "
+                            f"{int(elapsed_s)}s with no visible checkpoint"
+                        )
+                        exit_code = 124
+                        done = True
+                        break
                 continue
             _record(notif)
             method = str(notif.get("method", ""))
@@ -886,6 +2007,62 @@ def app_server_invoke(
     finally:
         client.close()
 
+    elapsed_s = (
+        time.monotonic() - turn_started_at
+        if turn_started_at is not None
+        else None
+    )
+    last_message_preview = last_message[:500]
+    delivered_via_send_message_tool = False
+    if schema is None and task_id is None:
+        from types import SimpleNamespace
+        from . import protocol_io as pio
+
+        delivered_via_send_message_tool = pio.should_skip_prose_fallback(
+            SimpleNamespace(
+                exit_code=exit_code,
+                events=events,
+                tool_call_events=tool_call_events,
+            )
+        )
+        if delivered_via_send_message_tool:
+            last_message_preview = ""
+
+    terminal_payload = {
+        "exit_code": exit_code,
+        "error": error,
+        "elapsed_s": int(elapsed_s) if elapsed_s is not None else None,
+        "structured": bool(structured),
+        "events": len(events),
+        "tool_call_events": tool_call_events,
+        "last_message_preview": last_message_preview,
+    }
+    if last_message and not last_message_preview:
+        terminal_payload["last_message_suppressed_reason"] = "delivered_via_send_message_tool"
+    if delivered_via_send_message_tool:
+        terminal_payload["delivered_via_send_message_tool"] = True
+    terminal_payload = {k: v for k, v in terminal_payload.items() if v is not None}
+    if error or exit_code != 0:
+        _emit_visibility_event(
+            kind="turn_failed",
+            severity="error",
+            summary=(error or f"Codex App Server exited {exit_code}")[:200],
+            visibility={
+                "mailbox": True,
+                "task_state": True,
+                "event_log": True,
+                "stderr": True,
+            },
+            payload=terminal_payload,
+        )
+    else:
+        _emit_visibility_event(
+            kind="turn_completed",
+            severity="info",
+            summary="Codex App Server turn completed",
+            payload=terminal_payload,
+        )
+
     logger.info(
         "app_server.done",
         exit_code=exit_code,
@@ -917,12 +2094,49 @@ class _SteerQueue:
     delivered (same failure mode as a race-lost SendMessage).
     """
 
-    def __init__(self) -> None:
+    def __init__(
+        self,
+        *,
+        capabilities: list[str] | None = None,
+        team: str | None = None,
+        agent: str | None = None,
+    ) -> None:
         import queue as _queue
+        self.capabilities = list(capabilities or [])
+        # 09 R15-vis-followup: stash team + agent for visibility_degraded
+        # envelope on rejection. Optional + None-default preserves existing
+        # callers (tests construct SteerQueue() without context).
+        self._team = team
+        self._agent = agent
         self._q: _queue.Queue[str] = _queue.Queue()
 
-    def push(self, text: str) -> None:
+    def push(self, text: str, *, sender: str | None = "team-lead") -> bool:
+        if sender != "team-lead" and "accepts_peer_steer" not in self.capabilities:
+            logger.warn(
+                "app_server.steer.rejected",
+                sender=sender,
+                reason="not_team_lead_and_capability_not_declared",
+            )
+            # 09 R15-vis-followup (08 CD-6 / 07 §6.5): emit visibility_degraded
+            # to lead's mailbox + event log when team+agent context is set.
+            # Non-fatal: visibility emission failures shouldn't shadow the gate.
+            if self._team and self._agent and sender:
+                try:
+                    from . import protocol_io as pio
+                    pio.emit_peer_steer_rejection(
+                        team=self._team,
+                        agent=self._agent,
+                        backend="codex",
+                        sender=sender,
+                    )
+                except Exception as e:
+                    logger.debug(
+                        "app_server.steer.rejection_event_emit_failed",
+                        error=str(e),
+                    )
+            return False
         self._q.put(text)
+        return True
 
     def pop_nowait(self) -> str | None:
         import queue as _queue

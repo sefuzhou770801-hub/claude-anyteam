@@ -7,13 +7,19 @@ import pytest
 from claude_teams.models import (
     COLOR_PALETTE,
     IdleNotification,
+    InboxAttachment,
     InboxMessage,
     LeadMember,
+    PermissionRequest,
+    PlanApprovalResponse,
+    PlanBlocked,
     SendMessageResult,
     ShutdownApproved,
     ShutdownRequest,
     SpawnResult,
     TaskAssignment,
+    TaskBlocked,
+    TaskCompleted,
     TaskFile,
     TeamConfig,
     TeamCreateResult,
@@ -80,12 +86,12 @@ class TestLeadMember:
         lead = LeadMember(
             agent_id="team-lead@t",
             name="team-lead",
-            agent_type="team-lead",
             model="sonnet",
             joined_at=0,
             cwd="/tmp",
         )
         assert lead.tmux_pane_id == ""
+        assert lead.agent_type == "team-lead"
 
 
 class TestTeammateMember:
@@ -103,6 +109,7 @@ class TestTeammateMember:
             cwd="/tmp/work",
             backend_type="claude",
             is_active=False,
+            capabilities=["structured_output"],
         )
         data = mate.model_dump(by_alias=True)
         assert data["agentId"] == "worker@my-team"
@@ -110,6 +117,7 @@ class TestTeammateMember:
         assert data["tmuxPaneId"] == "%34"
         assert data["backendType"] == "claude"
         assert data["isActive"] is False
+        assert data["capabilities"] == ["structured_output"]
 
     def test_defaults(self):
         mate = TeammateMember(
@@ -127,6 +135,38 @@ class TestTeammateMember:
         assert mate.backend_type == "claude"
         assert mate.is_active is False
         assert mate.subscriptions == []
+        assert mate.capabilities == []
+
+    def test_capabilities_default_missing_config_row(self):
+        raw = {
+            "agentId": "w@t",
+            "name": "w",
+            "agentType": "claude-anyteam",
+            "model": "codex-cli",
+            "prompt": "p",
+            "color": "blue",
+            "joinedAt": 0,
+            "tmuxPaneId": "in-process",
+            "cwd": "/tmp",
+        }
+        mate = TeammateMember.model_validate(raw)
+        assert mate.capabilities == []
+
+    def test_capabilities_loads_from_config_row(self):
+        raw = {
+            "agentId": "w@t",
+            "name": "w",
+            "agentType": "claude-anyteam",
+            "model": "codex-cli",
+            "prompt": "p",
+            "color": "blue",
+            "joinedAt": 0,
+            "tmuxPaneId": "in-process",
+            "cwd": "/tmp",
+            "capabilities": ["turn_steer", "thread_fork"],
+        }
+        mate = TeammateMember.model_validate(raw)
+        assert mate.capabilities == ["turn_steer", "thread_fork"]
 
     def test_backend_type_defaults_to_claude(self):
         mate = TeammateMember(
@@ -143,6 +183,20 @@ class TestTeammateMember:
         assert mate.backend_type == "claude"
         data = mate.model_dump(by_alias=True)
         assert data["backendType"] == "claude"
+
+    def test_agent_type_defaults_to_claude_anyteam_for_legacy_rows(self):
+        mate = TeammateMember(
+            agent_id="w@t",
+            name="w",
+            model="sonnet",
+            prompt="p",
+            color="blue",
+            joined_at=0,
+            tmux_pane_id="",
+            cwd="/tmp",
+        )
+        assert mate.agent_type == "claude-anyteam"
+        assert mate.model_dump(by_alias=True)["agentType"] == "claude-anyteam"
 
 class TestTeamConfig:
     def test_round_trip_with_lead_only(self):
@@ -207,6 +261,47 @@ class TestTeamConfig:
         assert len(config.members) == 2
         assert isinstance(config.members[0], LeadMember)
         assert isinstance(config.members[1], TeammateMember)
+        assert config.members[1].capabilities == []
+
+    def test_deserializes_legacy_members_missing_agent_type(self):
+        raw = {
+            "name": "test",
+            "description": "",
+            "createdAt": 100,
+            "leadAgentId": "team-lead@test",
+            "leadSessionId": "sid",
+            "members": [
+                {
+                    "agentId": "team-lead@test",
+                    "name": "team-lead",
+                    "model": "opus",
+                    "joinedAt": 100,
+                    "tmuxPaneId": "",
+                    "cwd": "/tmp",
+                    "subscriptions": [],
+                },
+                {
+                    "agentId": "worker@test",
+                    "name": "worker",
+                    "model": "sonnet",
+                    "prompt": "do stuff",
+                    "color": "blue",
+                    "planModeRequired": False,
+                    "joinedAt": 200,
+                    "tmuxPaneId": "%5",
+                    "cwd": "/tmp",
+                    "subscriptions": [],
+                    "backendType": "claude",
+                    "isActive": False,
+                },
+            ],
+        }
+        config = TeamConfig.model_validate(raw)
+        assert isinstance(config.members[0], LeadMember)
+        assert config.members[0].agent_type == "team-lead"
+        assert isinstance(config.members[1], TeammateMember)
+        assert config.members[1].agent_type == "claude-anyteam"
+
 
 
 class TestTaskFile:
@@ -215,6 +310,7 @@ class TestTaskFile:
         data = task.model_dump(by_alias=True, exclude_none=True)
         assert "owner" not in data
         assert "metadata" not in data
+        assert "parentTaskId" not in data
         assert data["id"] == "1"
         assert data["status"] == "pending"
         assert data["blockedBy"] == []
@@ -223,6 +319,18 @@ class TestTaskFile:
         task = TaskFile(id="2", subject="s", description="d", owner="worker")
         data = task.model_dump(by_alias=True, exclude_none=True)
         assert data["owner"] == "worker"
+
+    def test_task_with_parent_id_uses_camel_alias(self):
+        task = TaskFile(
+            id="2",
+            subject="child",
+            description="delegated",
+            parent_task_id="1",
+        )
+        data = task.model_dump(by_alias=True, exclude_none=True)
+        assert data["parentTaskId"] == "1"
+        round_trip = TaskFile.model_validate(data)
+        assert round_trip.parent_task_id == "1"
 
     def test_id_is_string(self):
         task = TaskFile(id="1", subject="s", description="d")
@@ -263,6 +371,30 @@ class TestInboxMessage:
         )
         data = msg.model_dump(by_alias=True, exclude_none=True)
         assert data["color"] == "blue"
+
+    def test_with_attachment_metadata(self):
+        msg = InboxMessage(
+            from_="worker",
+            text="preview",
+            timestamp="ts",
+            attachment=InboxAttachment(
+                path="/tmp/full.txt",
+                relativePath="artifacts/inbox/full.txt",
+                charCount=5000,
+                previewCharCount=4096,
+                sha256="abc123",
+            ),
+        )
+        data = msg.model_dump(by_alias=True, exclude_none=True)
+        assert data["attachment"] == {
+            "kind": "artifact",
+            "path": "/tmp/full.txt",
+            "relativePath": "artifacts/inbox/full.txt",
+            "mimeType": "text/plain",
+            "charCount": 5000,
+            "previewCharCount": 4096,
+            "sha256": "abc123",
+        }
 
 
 class TestStructuredMessages:
@@ -365,3 +497,125 @@ class TestToolReturnModels:
         data = r.model_dump(exclude_none=True)
         assert "routing" not in data
         assert "request_id" not in data
+
+
+class TestInboxMessageKindRoundTrip:
+    """09 R3 Q1 option (b): message_kind survives the substrate's
+    read_inbox(mark_as_read=True) rewrite path. Regression test for the
+    Pydantic-strip hazard flagged by opus-arch-impl post-546b72c."""
+
+    def test_message_kind_default_peer_dm(self):
+        m = InboxMessage(
+            **{"from": "alice", "text": "hi", "timestamp": "2026-04-27T00:00:00Z"}
+        )
+        assert m.message_kind == "peer_dm"
+
+    def test_message_kind_explicit_camel_case_alias_round_trip(self):
+        # write a raw inbox entry with messageKind (camelCase)
+        raw_in = {
+            "from": "alice",
+            "text": "watching tool call",
+            "timestamp": "2026-04-27T00:00:00Z",
+            "messageKind": "turn_progress",
+        }
+        m = InboxMessage.model_validate(raw_in)
+        assert m.message_kind == "turn_progress"
+        # round-trip through model_dump(by_alias=True, exclude_none=True) — the
+        # exact serialization the substrate uses in read_inbox(mark_as_read=True)
+        # at claude_teams/messaging.py:53-68.
+        raw_out = m.model_dump(by_alias=True, exclude_none=True)
+        assert raw_out["messageKind"] == "turn_progress"
+        assert "message_kind" not in raw_out  # alias-only on the wire
+
+    def test_legacy_inbox_row_without_message_kind_loads_with_default(self):
+        # CRITICAL §3 invariant: legacy v0.6.x rows without messageKind must
+        # load cleanly with default="peer_dm". Otherwise R2's pydantic-default
+        # protection regression returns.
+        legacy = {"from": "lead", "text": "go", "timestamp": "2026-04-27T00:00:00Z"}
+        m = InboxMessage.model_validate(legacy)
+        assert m.message_kind == "peer_dm"
+        # And on rewrite, the default appears on disk so future readers see it
+        # rather than another silent strip.
+        raw_out = m.model_dump(by_alias=True, exclude_none=True)
+        assert raw_out["messageKind"] == "peer_dm"
+
+    def test_substrate_mark_as_read_preserves_message_kind(self, tmp_path, monkeypatch):
+        """End-to-end: write inbox file with messageKind, call substrate's
+        read_inbox(mark_as_read=True), assert raw file still has messageKind
+        on the now-marked-read entry. Catches the post-546b72c strip
+        regression where InboxMessage didn't declare the field."""
+        from claude_teams import messaging
+
+        team = "kind-roundtrip"
+        agent = "alice"
+        monkeypatch.setattr(messaging, "TEAMS_DIR", tmp_path / "teams")
+        inbox_file = messaging.ensure_inbox(team, agent)
+        # Two entries: one turn-progress event, one peer DM. Both must survive
+        # the actual substrate mark-as-read rewrite path.
+        entries = [
+            {
+                "from": "lead",
+                "text": '{"kind":"turn_progress","payload":{}}',
+                "timestamp": "2026-04-27T00:00:00Z",
+                "read": False,
+                "messageKind": "turn_progress",
+            },
+            {
+                "from": "alice-2",
+                "text": "hello",
+                "timestamp": "2026-04-27T00:00:01Z",
+                "read": False,
+                "messageKind": "peer_dm",
+            },
+        ]
+        inbox_file.write_text(json.dumps(entries), encoding="utf-8")
+
+        returned = messaging.read_inbox(team, agent, unread_only=True, mark_as_read=True)
+
+        assert [m.message_kind for m in returned] == ["turn_progress", "peer_dm"]
+        rewritten = json.loads(inbox_file.read_text(encoding="utf-8"))
+        assert [r["messageKind"] for r in rewritten] == ["turn_progress", "peer_dm"]
+        assert all(r["read"] is True for r in rewritten)
+
+
+class TestLifecyclePayloadModels:
+    def test_task_completed_and_blocked_models_round_trip(self):
+        completed = TaskCompleted(
+            task_id="7",
+            files_changed=["src/foo.py"],
+            summary="done",
+            codex_exit_code=0,
+        )
+        blocked = TaskBlocked(task_id="8", reason="needs approval", timestamp="ts")
+
+        assert completed.model_dump(by_alias=True)["kind"] == "task_complete"
+        assert completed.model_dump(by_alias=True)["schema_version"] == 1
+        assert blocked.model_dump(by_alias=True)["kind"] == "task_blocked"
+        assert blocked.model_dump(by_alias=True)["schema_version"] == 1
+
+    def test_plan_and_permission_models_round_trip(self):
+        plan_blocked = PlanBlocked(
+            request_id="p1",
+            reason="no claimable task",
+            timestamp="ts",
+        )
+        plan_response = PlanApprovalResponse(
+            requestId="p2",
+            approve=False,
+            feedback="revise",
+            timestamp="ts",
+        )
+        permission = PermissionRequest(
+            request_id="perm-1",
+            tool_name="Bash",
+            tool_args={"cmd": "pytest"},
+            task_id="7",
+            teammate_name="worker",
+            trust_mode="default",
+            timestamp="ts",
+        )
+
+        assert plan_blocked.model_dump(by_alias=True)["kind"] == "plan_blocked"
+        assert plan_response.model_dump(by_alias=True)["type"] == "plan_approval_response"
+        assert plan_response.model_dump(by_alias=True)["requestId"] == "p2"
+        assert permission.model_dump(by_alias=True)["type"] == "permission_request"

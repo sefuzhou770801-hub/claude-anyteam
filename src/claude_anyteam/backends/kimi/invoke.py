@@ -18,11 +18,19 @@ import tempfile
 import uuid
 from datetime import datetime, timezone
 from pathlib import Path
+from collections.abc import Callable
 from typing import Any
 
 from claude_anyteam import logger
+from claude_anyteam.auth_preflight import (
+    AuthPreflightFailure,
+    classify_auth_error,
+    subprocess_diagnostic,
+)
 from claude_anyteam.codex import CodexResult, PLAN_SCHEMA, TASK_COMPLETE_SCHEMA
 from claude_anyteam.env import identity_env
+from claude_anyteam.headless_visibility import HeadlessTurnVisibility, coerce_stream_text
+from claude_anyteam.messages import VisibilityEvent
 from claude_anyteam.schema_validation import inline_schema_prompt_fragment, load_schema, parse_and_validate
 
 WRAPPER_SERVER_ALIAS = "anyteam"
@@ -262,6 +270,111 @@ def feature_test(kimi_binary: str = "kimi") -> None:
     )
 
 
+def credential_preflight(
+    *,
+    kimi_binary: str = "kimi",
+    cwd: Path,
+    team: str,
+    agent_name: str,
+    model: str | None = None,
+    effort: str | None = None,
+    kimi_home: Path | None = None,
+    thinking: str = "auto",
+    timeout_s: float = 45.0,
+) -> None:
+    """Run a cheap Kimi API probe in the adapter's isolated HOME.
+
+    Kimi's local ``info``/``--help`` checks do not validate MOONSHOT_API_KEY or
+    OAuth token freshness.  This tiny ``--print`` call fails spawn before
+    registration when the remote API returns 401/quota errors.
+    """
+
+    real_home = os.environ.get("HOME")
+    home = kimi_home or default_kimi_home(team, agent_name)
+    mcp_config = write_mcp_config(home, team=team, agent_name=agent_name, real_home=real_home)
+    args = [
+        kimi_binary,
+        "--print",
+        "--output-format=stream-json",
+        "--work-dir",
+        str(cwd),
+        "--mcp-config-file",
+        str(mcp_config),
+        *(_thinking_args(thinking=thinking, effort=effort)),
+    ]
+    if model:
+        args.extend(["--model", model])
+    args.extend(["-p", "ping"])
+
+    sub_env = dict(os.environ)
+    sub_env["HOME"] = str(home)
+    sub_env.setdefault("KIMI_CLI_NO_AUTO_UPDATE", "1")
+    if real_home:
+        sub_env["CLAUDE_ANYTEAM_REAL_HOME"] = real_home
+    sub_env = identity_env(sub_env, team=team, name=agent_name)
+
+    # Kimi headless emits "Unknown error: [Errno 2] No such file or directory"
+    # for cwd if the work-dir doesn't exist yet. Stress harnesses create the
+    # sandbox lazily, so ensure the dir exists before invoking kimi.
+    try:
+        cwd.mkdir(parents=True, exist_ok=True)
+    except OSError:
+        pass
+
+    logger.info(
+        "kimi.auth_preflight.start",
+        cwd=str(cwd),
+        kimi_home=str(home),
+        model=model,
+        effort=effort,
+        thinking=thinking,
+    )
+    try:
+        proc = subprocess.run(
+            args,
+            cwd=str(cwd),
+            capture_output=True,
+            text=True,
+            timeout=timeout_s,
+            check=False,
+            env=sub_env,
+            stdin=subprocess.DEVNULL,
+        )
+    except subprocess.TimeoutExpired as exc:
+        detail = subprocess_diagnostic(
+            args,
+            returncode=None,
+            stdout=coerce_stream_text(getattr(exc, "stdout", None) or getattr(exc, "output", None)),
+            stderr=coerce_stream_text(getattr(exc, "stderr", None)),
+        )
+        raise RuntimeError(f"Kimi auth preflight timed out after {timeout_s}s\n{detail}") from exc
+    except (subprocess.SubprocessError, OSError) as exc:
+        raise RuntimeError(f"could not run Kimi auth preflight {kimi_binary!r}: {exc}") from exc
+
+    diagnostic = subprocess_diagnostic(
+        args,
+        returncode=proc.returncode,
+        stdout=proc.stdout,
+        stderr=proc.stderr,
+    )
+    if proc.returncode != 0:
+        classified = classify_auth_error(diagnostic)
+        if classified is not None:
+            error_class, reset_after = classified
+            raise AuthPreflightFailure(
+                backend="kimi",
+                error_class=error_class,
+                error_message=diagnostic,
+                reset_after_seconds=reset_after,
+                cmd=args,
+                returncode=proc.returncode,
+                stdout=proc.stdout,
+                stderr=proc.stderr,
+            )
+        raise RuntimeError(f"Kimi auth preflight exited {proc.returncode}\n{diagnostic}")
+    logger.info("kimi.auth_preflight.ok", model=model, thinking=thinking)
+
+
 def _loads_json_line(line: str) -> dict[str, Any] | None:
     try:
         value = json.loads(line)
@@ -352,6 +465,10 @@ def _parse_stdout(stdout: str) -> tuple[list[dict[str, Any]], str, int]:
     return events, last_message.strip(), tool_call_events
 
 
+def _has_json_events(events: list[dict[str, Any]]) -> bool:
+    return any(ev.get("type") != "non_json_stdout" for ev in events)
+
+
 def _extract_json_candidate(text: str) -> str:
     stripped = text.strip()
     if stripped.startswith("```"):
@@ -412,6 +529,8 @@ def _run_once(
     effort: str | None,
     kimi_home: Path | None,
     thinking: str,
+    task_id: str | None,
+    event_sink: Callable[[VisibilityEvent], None] | None = None,
     retry_error: str | None = None,
 ) -> CodexResult:
     team, agent = wrapper_identity or ("default", "kimi")
@@ -457,6 +576,21 @@ def _run_once(
         effort=effort,
         thinking=thinking,
     )
+    visibility = HeadlessTurnVisibility.start(
+        team=team,
+        agent=agent,
+        backend="kimi_headless",
+        enabled=wrapper_identity is not None,
+        cwd=cwd,
+        schema=schema_path,
+        timeout_s=timeout_s,
+        model=model,
+        effort=effort,
+        resume_session_id=resume_session_id,
+        task_id=task_id,
+        extra_payload={"thinking": thinking},
+        event_sink=event_sink,
+    )
     try:
         proc = subprocess.run(
             args,
@@ -468,8 +602,36 @@ def _run_once(
             env=sub_env,
             stdin=subprocess.DEVNULL,
         )
-    except subprocess.TimeoutExpired:
-        return CodexResult(exit_code=124, structured=None, last_message="", events=[], error=f"kimi timed out after {timeout_s}s")
+    except subprocess.TimeoutExpired as exc:
+        timeout_stdout = coerce_stream_text(getattr(exc, "stdout", None) or getattr(exc, "output", None))
+        timeout_stderr = coerce_stream_text(getattr(exc, "stderr", None))
+        events, last_message, tool_call_events = _parse_stdout(timeout_stdout)
+        captured_session_id = _extract_session_id(timeout_stderr)
+        error = f"kimi timed out after {timeout_s}s"
+        if captured_session_id:
+            write_adapter_state(home, backend="headless", headless_session_id=captured_session_id)
+        visibility.terminal(
+            success=False,
+            exit_code=124,
+            error=error,
+            events=events,
+            tool_call_events=tool_call_events,
+            last_message=last_message,
+            structured=False,
+            partial_events_available=_has_json_events(events),
+            session_id=captured_session_id,
+            error_class="turn_timeout",
+            extra_payload={"tool_call_event_source": "kimi assistant.tool_calls[]"},
+        )
+        return CodexResult(
+            exit_code=124,
+            structured=None,
+            last_message=last_message,
+            events=events,
+            error=error,
+            tool_call_events=tool_call_events,
+            session_id=captured_session_id,
+        )
 
     events, last_message, tool_call_events = _parse_stdout(proc.stdout)
     captured_session_id = _extract_session_id(proc.stderr)
@@ -488,6 +650,20 @@ def _run_once(
 
     if captured_session_id:
         write_adapter_state(home, backend="headless", headless_session_id=captured_session_id)
+
+    success = proc.returncode == 0 and error is None
+    visibility.terminal(
+        success=success,
+        exit_code=proc.returncode,
+        error=error,
+        events=events,
+        tool_call_events=tool_call_events,
+        last_message=last_message,
+        structured=structured is not None,
+        partial_events_available=_has_json_events(events),
+        session_id=captured_session_id,
+        extra_payload={"tool_call_event_source": "kimi assistant.tool_calls[]"},
+    )
 
     return CodexResult(
         exit_code=proc.returncode,
@@ -513,6 +689,8 @@ def run(
     effort: str | None = None,
     kimi_home: Path | None = None,
     thinking: str = "auto",
+    task_id: str | None = None,
+    event_sink: Callable[[VisibilityEvent], None] | None = None,
 ) -> CodexResult:
     """Single Kimi invocation.
 
@@ -537,4 +715,6 @@ def run(
         effort=effort,
         kimi_home=kimi_home,
         thinking=thinking,
+        task_id=task_id,
+        event_sink=event_sink,
     )

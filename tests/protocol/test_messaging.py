@@ -18,6 +18,7 @@ from claude_teams.messaging import (
     ensure_inbox,
     inbox_path,
     now_iso,
+    read_attachment_text,
     read_inbox,
     read_inbox_filtered,
     send_plain_message,
@@ -115,6 +116,49 @@ def test_send_plain_message_with_color(tmp_claude_dir):
     send_plain_message("test-team", "lead", "gina", "colorful", summary="c", color="blue", base_dir=tmp_claude_dir)
     msgs = read_inbox("test-team", "gina", mark_as_read=False, base_dir=tmp_claude_dir)
     assert msgs[0].color == "blue"
+
+
+def test_send_plain_message_spills_long_body_to_attachment(tmp_claude_dir, monkeypatch):
+    monkeypatch.setenv("CLAUDE_ANYTEAM_INBOX_SPILL_CHARS", "32")
+    full = "0123456789" * 8
+
+    send_plain_message(
+        "test-team",
+        "lead",
+        "long-reader",
+        full,
+        summary="long",
+        base_dir=tmp_claude_dir,
+    )
+
+    raw = json.loads(
+        inbox_path("test-team", "long-reader", base_dir=tmp_claude_dir).read_text()
+    )
+    assert len(raw) == 1
+    row = raw[0]
+    assert row["text"].startswith(full[:32])
+    assert full[32:] not in row["text"]
+    assert "Full message (80 chars)" in row["text"]
+    attachment = row["attachment"]
+    assert attachment["charCount"] == 80
+    assert attachment["previewCharCount"] == 32
+    assert attachment["relativePath"].startswith("artifacts/inbox/")
+    assert Path(attachment["path"]).read_text(encoding="utf-8") == full
+
+    msg = read_inbox(
+        "test-team",
+        "long-reader",
+        mark_as_read=True,
+        base_dir=tmp_claude_dir,
+    )[0]
+    assert msg.attachment is not None
+    assert read_attachment_text("test-team", msg.attachment, base_dir=tmp_claude_dir) == full
+
+    rewritten = json.loads(
+        inbox_path("test-team", "long-reader", base_dir=tmp_claude_dir).read_text()
+    )
+    assert rewritten[0]["read"] is True
+    assert rewritten[0]["attachment"]["relativePath"] == attachment["relativePath"]
 
 
 def test_send_structured_message_serializes_json_in_text(tmp_claude_dir):
@@ -272,3 +316,136 @@ def test_read_inbox_filtered_no_mark(tmp_claude_dir):
 def test_read_inbox_filtered_nonexistent_inbox(tmp_claude_dir):
     msgs = read_inbox_filtered("test-team", "nobody", sender_filter="alice", base_dir=tmp_claude_dir)
     assert msgs == []
+
+
+# ===========================================================================
+# Phase4 #35: append_messages_batch + BatchedSender
+# ===========================================================================
+
+from claude_teams.messaging import (  # noqa: E402
+    BatchedSender,
+    DEFAULT_DEBOUNCE_S,
+    append_messages_batch,
+)
+
+
+def test_append_messages_batch_writes_all_under_one_lock(tmp_claude_dir):
+    msgs = [
+        InboxMessage(from_="alice", text=f"msg-{i}", timestamp=now_iso(), read=False, summary=f"s{i}")
+        for i in range(5)
+    ]
+    stored = append_messages_batch("test-team", "lead", msgs, base_dir=tmp_claude_dir)
+    assert len(stored) == 5
+
+    written = read_inbox("test-team", "lead", mark_as_read=False, base_dir=tmp_claude_dir)
+    assert [m.text for m in written] == [f"msg-{i}" for i in range(5)]
+
+
+def test_append_messages_batch_empty_is_noop(tmp_claude_dir):
+    # No messages → no inbox file even created (no lock held).
+    stored = append_messages_batch("test-team", "lead", [], base_dir=tmp_claude_dir)
+    assert stored == []
+
+
+def test_append_messages_batch_appends_to_existing(tmp_claude_dir):
+    pre = InboxMessage(from_="alice", text="pre", timestamp=now_iso(), read=False, summary="pre")
+    append_message("test-team", "lead", pre, base_dir=tmp_claude_dir)
+
+    batch = [
+        InboxMessage(from_="alice", text=f"batch-{i}", timestamp=now_iso(), read=False, summary=f"b{i}")
+        for i in range(3)
+    ]
+    append_messages_batch("test-team", "lead", batch, base_dir=tmp_claude_dir)
+
+    written = read_inbox("test-team", "lead", mark_as_read=False, base_dir=tmp_claude_dir)
+    assert [m.text for m in written] == ["pre", "batch-0", "batch-1", "batch-2"]
+
+
+def test_batched_sender_debounces_writes(tmp_claude_dir):
+    # Use a long debounce so we can observe the buffer state before the flush
+    # fires. Test asserts: no inbox-file write happens before flush()/window.
+    sender = BatchedSender(debounce_s=10.0, base_dir=tmp_claude_dir)
+    try:
+        for i in range(5):
+            msg = InboxMessage(
+                from_="alice", text=f"q-{i}", timestamp=now_iso(), read=False, summary=f"s{i}"
+            )
+            sender.send("test-team", "lead", msg)
+
+        # Inbox file may or may not exist (depends on ensure_inbox). The
+        # critical assertion: no messages have been WRITTEN yet.
+        written = read_inbox("test-team", "lead", mark_as_read=False, base_dir=tmp_claude_dir)
+        assert written == []
+
+        # Force flush — now they all land atomically.
+        sender.flush()
+        written = read_inbox("test-team", "lead", mark_as_read=False, base_dir=tmp_claude_dir)
+        assert [m.text for m in written] == [f"q-{i}" for i in range(5)]
+    finally:
+        sender.close()
+
+
+def test_batched_sender_per_target_independent(tmp_claude_dir):
+    sender = BatchedSender(debounce_s=10.0, base_dir=tmp_claude_dir)
+    try:
+        for i in range(3):
+            msg = InboxMessage(
+                from_="alice", text=f"to-bob-{i}", timestamp=now_iso(), read=False, summary="b"
+            )
+            sender.send("test-team", "bob", msg)
+        for i in range(2):
+            msg = InboxMessage(
+                from_="alice", text=f"to-carol-{i}", timestamp=now_iso(), read=False, summary="c"
+            )
+            sender.send("test-team", "carol", msg)
+
+        # Flushing only bob should not flush carol.
+        sender.flush(team_name="test-team", recipient="bob")
+        bob_msgs = read_inbox("test-team", "bob", mark_as_read=False, base_dir=tmp_claude_dir)
+        carol_msgs = read_inbox("test-team", "carol", mark_as_read=False, base_dir=tmp_claude_dir)
+        assert [m.text for m in bob_msgs] == [f"to-bob-{i}" for i in range(3)]
+        assert carol_msgs == []
+
+        sender.flush()
+        carol_msgs = read_inbox("test-team", "carol", mark_as_read=False, base_dir=tmp_claude_dir)
+        assert [m.text for m in carol_msgs] == [f"to-carol-{i}" for i in range(2)]
+    finally:
+        sender.close()
+
+
+def test_batched_sender_close_drains_pending(tmp_claude_dir):
+    sender = BatchedSender(debounce_s=10.0, base_dir=tmp_claude_dir)
+    msg = InboxMessage(
+        from_="alice", text="drain-me", timestamp=now_iso(), read=False, summary="s"
+    )
+    sender.send("test-team", "lead", msg)
+    sender.close()
+
+    written = read_inbox("test-team", "lead", mark_as_read=False, base_dir=tmp_claude_dir)
+    assert [m.text for m in written] == ["drain-me"]
+
+    # After close, send must raise — caller should switch to append_message.
+    with pytest.raises(RuntimeError, match="closed"):
+        sender.send("test-team", "lead", msg)
+
+
+def test_batched_sender_zero_debounce_synchronous(tmp_claude_dir):
+    # debounce_s=0 → flush inline; useful for tests / paths that need
+    # synchronous semantics without losing the batched-write opt-in shape.
+    sender = BatchedSender(debounce_s=0.0, base_dir=tmp_claude_dir)
+    try:
+        msg = InboxMessage(from_="alice", text="sync", timestamp=now_iso(), read=False, summary="s")
+        sender.send("test-team", "lead", msg)
+
+        # Without an explicit flush() — message already on disk because
+        # debounce_s=0 routes through immediate flush.
+        written = read_inbox("test-team", "lead", mark_as_read=False, base_dir=tmp_claude_dir)
+        assert [m.text for m in written] == ["sync"]
+    finally:
+        sender.close()
+
+
+def test_batched_sender_default_debounce_is_50ms():
+    # Documents the chosen constant — keeps it discoverable and asserts the
+    # value matches aproto-codex-bridge MessageRouter.
+    assert DEFAULT_DEBOUNCE_S == 0.05

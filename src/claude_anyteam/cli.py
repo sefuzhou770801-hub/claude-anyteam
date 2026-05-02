@@ -165,13 +165,14 @@ def _build_run_parser() -> argparse.ArgumentParser:
             "Management commands:\n"
             "  claude-anyteam install      Persist the claude-anyteam shim in ~/.claude/settings.json\n"
             "  claude-anyteam uninstall    Remove the installed Codex/Gemini teammate shim settings\n"
-            "  claude-anyteam team-agent   Write per-teammate model/effort/turn-timeout to ~/.claude/teams/<team>/agents/<agent>.json\n"
+            "  claude-anyteam team-agent   Write per-teammate model/effort/watchdog/turn-timeout to ~/.claude/teams/<team>/agents/<agent>.json\n"
             "  claude-anyteam team-patch   Patch agentType post-spawn so wrapper MCP validation passes\n"
             "  claude-anyteam team-roster  Print one-line-per-member team summary (flags ghosts and dead-pane members)\n"
             "  claude-anyteam team-config  Print resolved spawn-time config for a teammate (host model + adapter overrides)\n"
             "  claude-anyteam team-prune-dead  Remove members whose backing tmux pane is gone (use --yes to apply)\n"
-            "  claude-anyteam diagnose     Inspect adapter incident artifacts under ~/.claude/teams/<team>/diagnostics/\n"
-            "  claude-anyteam status       One-screen team snapshot — roster, adapter overrides, incidents, last activity"
+            "  claude-anyteam diagnose     Inspect substrate state: roster, manifests, visibility, wrapper MCP diagnostics\n"
+            "  claude-anyteam status       One-screen team snapshot — roster, adapter overrides, incidents, last activity\n"
+            "  claude-anyteam visibility-tail  Follow the live VisibilityEvent JSONL stream"
         ),
         formatter_class=argparse.RawDescriptionHelpFormatter,
     )
@@ -231,9 +232,29 @@ def _build_run_parser() -> argparse.ArgumentParser:
             "CLAUDE_ANYTEAM_TURN_TIMEOUT_S. Raise this for teammates that "
             "run long pytest/build invocations; tighten for short-loop "
             "executor roles. Currently affects Codex App Server only — "
-            "Gemini and Kimi have their own subprocess-level timeouts; the "
-            "v0.7.0 backend-neutral watchdog work (see docs/roadmap.md) "
-            "will unify these."
+            "Gemini and Kimi have their own subprocess-level timeouts."
+        ),
+    )
+    p.add_argument(
+        "--non-progress-warn-s",
+        type=float,
+        help=(
+            "Codex App Server-only soft non-progress watchdog threshold in "
+            "seconds. Range [60, 900], default 300. Overrides "
+            "CLAUDE_ANYTEAM_NON_PROGRESS_WARN_S. When tripped, the adapter "
+            "emits a turn_progress warning envelope and sends one checkpoint "
+            "turn/steer; it does not interrupt the turn."
+        ),
+    )
+    p.add_argument(
+        "--non-progress-interrupt-s",
+        type=float,
+        help=(
+            "Codex App Server-only opt-in hard non-progress interrupt "
+            "threshold in seconds. Default unset/disabled; overrides "
+            "CLAUDE_ANYTEAM_NON_PROGRESS_INTERRUPT_S. Only considered after "
+            "the soft watchdog has fired and no later visible checkpoint was "
+            "observed."
         ),
     )
     return p
@@ -1059,6 +1080,9 @@ def main(argv: list[str] | None = None) -> int:
         if command == "status":
             from . import status_cli
             return status_cli.main(argv[1:])
+        if command == "visibility-tail":
+            from . import visibility_tail
+            return visibility_tail.main(argv[1:])
 
     args = _parse_args(argv)
 
@@ -1088,6 +1112,10 @@ def main(argv: list[str] | None = None) -> int:
         overrides["effort"] = args.effort
     if args.turn_timeout_s is not None:
         overrides["turn_timeout_s"] = args.turn_timeout_s
+    if args.non_progress_warn_s is not None:
+        overrides["non_progress_warn_s"] = args.non_progress_warn_s
+    if args.non_progress_interrupt_s is not None:
+        overrides["non_progress_interrupt_s"] = args.non_progress_interrupt_s
 
     try:
         settings = from_env(overrides=overrides)
@@ -1104,6 +1132,9 @@ def main(argv: list[str] | None = None) -> int:
         app_server=settings.app_server,
         model=settings.model,
         effort=settings.effort,
+        turn_timeout_s=settings.turn_timeout_s,
+        non_progress_warn_s=settings.non_progress_warn_s,
+        non_progress_interrupt_s=settings.non_progress_interrupt_s,
     )
     return run(settings)
 

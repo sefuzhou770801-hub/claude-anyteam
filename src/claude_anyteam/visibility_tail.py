@@ -1,0 +1,1086 @@
+"""Live pretty-printer for the VisibilityEvent JSONL stream.
+
+``claude-anyteam visibility-tail`` is intentionally a small filesystem-tail
+projector over the existing visibility substrate.  The optional WebSocket
+projection still tails the same per-team aggregate JSONL file; it gives leads
+one optional structured feed that can be attached mid-run.
+"""
+
+from __future__ import annotations
+
+import argparse
+import asyncio
+import json
+import ipaddress
+import sys
+import textwrap
+import time
+from dataclasses import dataclass
+from datetime import datetime, timedelta, timezone
+from pathlib import Path
+from typing import Any, AsyncIterator, Iterable, TextIO
+
+from pydantic import ValidationError
+
+from .messages import VisibilityEvent
+from . import protocol_io as pio
+
+
+@dataclass(frozen=True)
+class _ServeAddress:
+    host: str
+    port: int
+
+
+@dataclass(frozen=True)
+class _Subscription:
+    agent: str | None = None
+    filter_kinds: frozenset[str] | None = None
+    since: datetime | None = None
+
+    def matches(self, event: VisibilityEvent) -> bool:
+        return _event_matches(
+            event,
+            agent=self.agent,
+            filter_kinds=set(self.filter_kinds) if self.filter_kinds is not None else None,
+            since=self.since,
+        )
+
+    def as_wire_filter(self) -> dict[str, Any]:
+        payload: dict[str, Any] = {}
+        if self.agent is not None:
+            payload["agent"] = self.agent
+        if self.filter_kinds is not None:
+            payload["kind"] = sorted(self.filter_kinds)
+        if self.since is not None:
+            payload["since"] = _format_wire_timestamp(self.since)
+        return payload
+
+
+class _SubscriptionError(ValueError):
+    pass
+
+
+_ANSI_RESET = "\033[0m"
+_SEVERITY_COLORS: dict[str, str] = {
+    "debug": "\033[2m",
+    "info": "\033[36m",
+    "warn": "\033[33m",
+    "error": "\033[31m",
+}
+_RELATIVE_SINCE_UNITS: dict[str, float] = {
+    "s": 1,
+    "sec": 1,
+    "secs": 1,
+    "second": 1,
+    "seconds": 1,
+    "m": 60,
+    "min": 60,
+    "mins": 60,
+    "minute": 60,
+    "minutes": 60,
+    "h": 60 * 60,
+    "hr": 60 * 60,
+    "hrs": 60 * 60,
+    "hour": 60 * 60,
+    "hours": 60 * 60,
+    "d": 24 * 60 * 60,
+    "day": 24 * 60 * 60,
+    "days": 24 * 60 * 60,
+}
+_CARD_INLINE_VALUE_LIMIT = 220
+_CARD_MULTILINE_VALUE_LIMIT = 120
+_CARD_MULTILINE_MAX_CHARS = 2000
+_CARD_MULTILINE_MAX_LINES = 20
+_CARD_MULTILINE_WRAP_WIDTH = 100
+
+
+def _build_parser() -> argparse.ArgumentParser:
+    p = argparse.ArgumentParser(
+        prog="claude-anyteam visibility-tail",
+        description=(
+            "Follow the per-team VisibilityEvent JSONL stream and print a "
+            "structured live feed. By default the command attaches at EOF, "
+            "so old rows are not replayed unless --from-start is passed."
+        ),
+        formatter_class=argparse.RawDescriptionHelpFormatter,
+    )
+    p.add_argument("--team", required=True, type=_validate_name, help="Team name")
+    p.add_argument(
+        "--agent",
+        type=_validate_name,
+        help="Optional teammate name filter (defaults to all agents)",
+    )
+    p.add_argument(
+        "--from-start",
+        action="store_true",
+        help="Replay existing rows before following (default: attach at current EOF)",
+    )
+    p.add_argument(
+        "--no-follow",
+        dest="follow",
+        action="store_false",
+        default=True,
+        help="Print currently available rows and exit",
+    )
+    p.add_argument(
+        "--no-color",
+        action="store_true",
+        help="Disable ANSI color even when stdout is a terminal",
+    )
+    p.add_argument(
+        "--json",
+        action="store_true",
+        help="Emit matching VisibilityEvent envelopes as JSON Lines",
+    )
+    p.add_argument(
+        "--serve",
+        type=_parse_serve_address,
+        metavar="BIND:PORT",
+        help=(
+            "Serve matching VisibilityEvent envelopes as JSON over WebSocket "
+            "from BIND:PORT instead of printing to stdout. Non-loopback binds "
+            "are rejected unless --allow-remote is passed."
+        ),
+    )
+    p.add_argument(
+        "--allow-remote",
+        action="store_true",
+        help="Allow --serve to bind to a non-loopback interface.",
+    )
+    p.add_argument(
+        "--filter-kind",
+        action="append",
+        default=[],
+        metavar="KIND[,KIND...]",
+        help="Only print events whose kind matches one of the provided values",
+    )
+    p.add_argument(
+        "--since",
+        type=_parse_since_arg,
+        metavar="WHEN",
+        help=(
+            "Only print events at or after WHEN. Accepts ISO-8601 timestamps "
+            "(for example 2026-04-27T15:30:00Z) or relative durations such "
+            "as 10m, 2h, or 1d."
+        ),
+    )
+    p.add_argument(
+        "--max-events",
+        type=int,
+        default=None,
+        help="Stop after printing N matching events (useful for tests/scripts)",
+    )
+    p.add_argument(
+        "--poll-s",
+        type=float,
+        default=0.2,
+        help=argparse.SUPPRESS,
+    )
+    return p
+
+
+def _validate_name(value: str) -> str:
+    if not value or any(ch in value for ch in ("/", "\\", "\x00")):
+        raise argparse.ArgumentTypeError(
+            f"invalid name {value!r}: must be non-empty and contain no path separators"
+        )
+    if value in {".", ".."}:
+        raise argparse.ArgumentTypeError(f"invalid name {value!r}")
+    return value
+
+
+def _parse_serve_address(value: str) -> _ServeAddress:
+    text = value.strip()
+    if not text or ":" not in text:
+        raise argparse.ArgumentTypeError("expected BIND:PORT")
+    host, port_text = text.rsplit(":", 1)
+    host = host.strip() or "127.0.0.1"
+    if host.startswith("[") and host.endswith("]"):
+        host = host[1:-1]
+    try:
+        port = int(port_text)
+    except ValueError as exc:
+        raise argparse.ArgumentTypeError(f"invalid port {port_text!r}") from exc
+    if port <= 0 or port > 65535:
+        raise argparse.ArgumentTypeError(f"invalid port {port!r}")
+    return _ServeAddress(host=host, port=port)
+
+
+def _is_loopback_host(host: str) -> bool:
+    if host.lower() == "localhost":
+        return True
+    try:
+        return ipaddress.ip_address(host).is_loopback
+    except ValueError:
+        return False
+
+
+def _parse_timestamp(value: str) -> datetime | None:
+    text = value.strip()
+    if not text:
+        return None
+    if text.endswith("Z"):
+        text = text[:-1] + "+00:00"
+    try:
+        parsed = datetime.fromisoformat(text)
+    except ValueError:
+        return None
+    if parsed.tzinfo is None:
+        parsed = parsed.replace(tzinfo=timezone.utc)
+    return parsed.astimezone(timezone.utc)
+
+
+def _format_wire_timestamp(value: datetime) -> str:
+    return value.astimezone(timezone.utc).isoformat().replace("+00:00", "Z")
+
+
+def _parse_since_arg(value: str) -> datetime:
+    parsed = _parse_timestamp(value)
+    if parsed is not None:
+        return parsed
+
+    text = value.strip().lower()
+    number = ""
+    unit = ""
+    for ch in text:
+        if ch.isdigit() or ch == ".":
+            if unit:
+                raise argparse.ArgumentTypeError(
+                    f"invalid --since value {value!r}: expected ISO timestamp or duration"
+                )
+            number += ch
+        elif ch.isalpha():
+            unit += ch
+        elif ch.isspace():
+            continue
+        else:
+            raise argparse.ArgumentTypeError(
+                f"invalid --since value {value!r}: expected ISO timestamp or duration"
+            )
+    if not number or not unit or unit not in _RELATIVE_SINCE_UNITS:
+        raise argparse.ArgumentTypeError(
+            f"invalid --since value {value!r}: expected ISO timestamp or duration"
+        )
+    try:
+        amount = float(number)
+    except ValueError as exc:
+        raise argparse.ArgumentTypeError(
+            f"invalid --since duration {value!r}"
+        ) from exc
+    if amount < 0:
+        raise argparse.ArgumentTypeError(f"invalid --since duration {value!r}")
+    return datetime.now(timezone.utc) - timedelta(
+        seconds=amount * _RELATIVE_SINCE_UNITS[unit]
+    )
+
+
+def _split_filter_kinds(values: Iterable[str]) -> set[str] | None:
+    kinds = {
+        item.strip()
+        for value in values
+        for item in value.split(",")
+        if item.strip()
+    }
+    return kinds or None
+
+
+def _coerce_wire_kinds(value: Any) -> frozenset[str] | None:
+    if value is None:
+        return None
+    if isinstance(value, str):
+        return frozenset(
+            item.strip()
+            for item in value.split(",")
+            if item.strip()
+        ) or None
+    if isinstance(value, list):
+        kinds: set[str] = set()
+        for item in value:
+            if not isinstance(item, str):
+                raise _SubscriptionError("kind entries must be strings")
+            kinds.update(part.strip() for part in item.split(",") if part.strip())
+        return frozenset(kinds) or None
+    raise _SubscriptionError("kind must be a string or list of strings")
+
+
+def _base_subscription(
+    *,
+    agent: str | None,
+    filter_kinds: set[str] | None,
+    since: datetime | None,
+) -> _Subscription:
+    return _Subscription(
+        agent=agent,
+        filter_kinds=frozenset(filter_kinds) if filter_kinds is not None else None,
+        since=since,
+    )
+
+
+def _subscription_from_wire(
+    message: str | bytes,
+    *,
+    base: _Subscription,
+) -> _Subscription:
+    if isinstance(message, bytes):
+        try:
+            message = message.decode("utf-8")
+        except UnicodeDecodeError as exc:
+            raise _SubscriptionError("subscription message must be UTF-8 JSON") from exc
+    try:
+        raw = json.loads(message)
+    except json.JSONDecodeError as exc:
+        raise _SubscriptionError("subscription message must be JSON") from exc
+    if not isinstance(raw, dict):
+        raise _SubscriptionError("subscription message must be a JSON object")
+    message_type = raw.get("type", "subscribe")
+    if message_type != "subscribe":
+        raise _SubscriptionError(f"unsupported message type {message_type!r}")
+
+    filter_payload = raw.get("filter")
+    if filter_payload is None:
+        filter_payload = raw
+    if not isinstance(filter_payload, dict):
+        raise _SubscriptionError("filter must be a JSON object")
+
+    agent = base.agent
+    if "agent" in filter_payload:
+        value = filter_payload["agent"]
+        if value is None or value == "":
+            agent = None
+        elif isinstance(value, str):
+            try:
+                agent = _validate_name(value)
+            except argparse.ArgumentTypeError as exc:
+                raise _SubscriptionError(str(exc)) from exc
+        else:
+            raise _SubscriptionError("agent must be a string")
+
+    kind_value = None
+    kind_seen = False
+    for key in ("kind", "kinds", "filter_kind", "filterKinds"):
+        if key in filter_payload:
+            kind_value = filter_payload[key]
+            kind_seen = True
+            break
+    filter_kinds = base.filter_kinds
+    if kind_seen:
+        filter_kinds = _coerce_wire_kinds(kind_value)
+
+    since = base.since
+    if "since" in filter_payload:
+        value = filter_payload["since"]
+        if value is None or value == "":
+            since = None
+        elif isinstance(value, str):
+            try:
+                since = _parse_since_arg(value)
+            except argparse.ArgumentTypeError as exc:
+                raise _SubscriptionError(str(exc)) from exc
+        else:
+            raise _SubscriptionError("since must be a string")
+
+    return _Subscription(agent=agent, filter_kinds=filter_kinds, since=since)
+
+
+def _truncate(text: str, *, limit: int = _CARD_INLINE_VALUE_LIMIT) -> str:
+    return text if len(text) <= limit else text[: max(0, limit - 1)] + "…"
+
+
+def _value_text(value: Any) -> str:
+    if isinstance(value, bool):
+        return "true" if value else "false"
+    if isinstance(value, (int, float)) and not isinstance(value, bool):
+        return str(value)
+    if value is None:
+        return "null"
+    if isinstance(value, str):
+        if value == "":
+            return '""'
+        if any(ch.isspace() for ch in value) or any(ch in value for ch in "[]{}=::"):
+            return _truncate(json.dumps(value, ensure_ascii=False))
+        return _truncate(value)
+    try:
+        return _truncate(
+            json.dumps(value, ensure_ascii=False, sort_keys=True, separators=(",", ":"))
+        )
+    except (TypeError, ValueError):
+        return _truncate(repr(value))
+
+
+def _kv_pairs(pairs: Iterable[tuple[str, Any]]) -> str:
+    rendered = [
+        f"{key}={_value_text(value)}"
+        for key, value in pairs
+        if value is not None
+    ]
+    return " ".join(rendered) if rendered else "-"
+
+
+def _full_value_text(value: Any) -> str:
+    if isinstance(value, str):
+        return value if value else '""'
+    try:
+        return json.dumps(value, ensure_ascii=False, indent=2, sort_keys=True)
+    except (TypeError, ValueError):
+        return repr(value)
+
+
+def _needs_multiline_value(value: Any) -> bool:
+    if value is None:
+        return False
+    text = _full_value_text(value)
+    return "\n" in text or len(text) > _CARD_MULTILINE_VALUE_LIMIT
+
+
+def _wrap_preserving_indent(line: str) -> list[str]:
+    if len(line) <= _CARD_MULTILINE_WRAP_WIDTH:
+        return [line]
+    indent = line[: len(line) - len(line.lstrip())]
+    wrapped = textwrap.wrap(
+        line,
+        width=_CARD_MULTILINE_WRAP_WIDTH,
+        subsequent_indent=indent,
+        break_long_words=True,
+        break_on_hyphens=False,
+        replace_whitespace=False,
+        drop_whitespace=False,
+    )
+    return wrapped or [line]
+
+
+def _multiline_value_lines(value: Any) -> list[str]:
+    text = _full_value_text(value)
+    truncated = False
+    if len(text) > _CARD_MULTILINE_MAX_CHARS:
+        text = text[:_CARD_MULTILINE_MAX_CHARS].rstrip()
+        truncated = True
+
+    raw_lines = text.splitlines() or [""]
+    lines: list[str] = []
+    for line in raw_lines:
+        lines.extend(_wrap_preserving_indent(line))
+
+    if len(lines) > _CARD_MULTILINE_MAX_LINES:
+        remaining = len(lines) - _CARD_MULTILINE_MAX_LINES
+        lines = lines[:_CARD_MULTILINE_MAX_LINES]
+        lines.append(f"… ({remaining} lines more)")
+    if truncated:
+        lines.append("… (truncated)")
+    return lines
+
+
+def _card(label: str, pairs: Iterable[tuple[str, Any]]) -> str:
+    fields = [(key, value) for key, value in pairs if value is not None]
+    if not fields:
+        return f"[{label}] -"
+    if not any(_needs_multiline_value(value) for _, value in fields):
+        return f"[{label}] {_kv_pairs(fields)}"
+
+    lines = [f"[{label}]"]
+    for key, value in fields:
+        if _needs_multiline_value(value):
+            lines.append(f"  {key}:")
+            lines.extend(f"    {line}" for line in _multiline_value_lines(value))
+        else:
+            lines.append(f"  {key}: {_value_text(value)}")
+    return "\n".join(lines)
+
+
+def _first_present(payload: dict[str, Any], *keys: str) -> Any:
+    for key in keys:
+        value = payload.get(key)
+        if value is not None:
+            return value
+    return None
+
+
+def _args_card(event: VisibilityEvent) -> str:
+    payload = event.payload or {}
+    if event.kind == "tool_event":
+        args = _first_present(
+            payload,
+            "tool_args",
+            "args",
+            "arguments",
+            "input",
+            "target",
+            "command",
+            "query",
+            "path",
+        )
+        fields = (
+            ("tool", payload.get("tool_name") or payload.get("raw_backend_type")),
+            ("category", payload.get("category")),
+            ("phase", payload.get("phase")),
+            ("args", args),
+        )
+    elif event.kind == "turn_started":
+        fields = (
+            ("mode", payload.get("mode")),
+            ("prompt", payload.get("prompt_kind")),
+            ("cwd", payload.get("cwd")),
+            ("timeout_s", payload.get("timeout_s")),
+            ("model", payload.get("model") or payload.get("effective_model")),
+            ("effort", payload.get("effort")),
+        )
+    elif event.kind == "artifact_event":
+        fields = (
+            ("path", payload.get("path")),
+            ("action", payload.get("action")),
+            ("source", payload.get("source")),
+        )
+    elif event.kind in {"visibility_degraded", "turn_warning"}:
+        fields = (
+            ("surface", payload.get("surface")),
+            ("phase", payload.get("phase")),
+            ("task_id", payload.get("task_id") or event.task_id),
+        )
+    else:
+        fields = (
+            ("task_id", event.task_id),
+            ("turn_id", event.turn_id),
+            ("surface", payload.get("surface")),
+            ("phase", payload.get("phase")),
+        )
+    return _card("ARGS", fields)
+
+
+def _result_card(event: VisibilityEvent) -> str:
+    payload = event.payload or {}
+    if event.kind == "tool_event":
+        fields = (
+            ("status", payload.get("status")),
+            ("exit_code", payload.get("exit_code")),
+            ("duration_ms", payload.get("duration_ms")),
+            ("stdout", payload.get("stdout_preview")),
+        )
+        if not any(value is not None for _, value in fields):
+            fields = (("phase", payload.get("phase") or "observed"),)
+        return _card("RESULT", fields)
+    if event.kind in {"turn_completed", "turn_failed"}:
+        fields = (
+            ("exit_code", payload.get("exit_code")),
+            ("elapsed_s", payload.get("elapsed_s")),
+            ("structured", payload.get("structured")),
+            ("events", payload.get("event_count")),
+            ("tool_calls", payload.get("tool_call_events")),
+        )
+        return _card("RESULT", fields)
+    if event.kind == "turn_started":
+        return "[RESULT] started"
+    if event.kind == "artifact_event":
+        return _card("RESULT", (("action", payload.get("action")),))
+    if event.kind == "agent_registered":
+        return "[RESULT] registered"
+    return _card("RESULT", (("severity", event.severity),))
+
+
+def _error_card(event: VisibilityEvent) -> str | None:
+    payload = event.payload or {}
+    error = _first_present(
+        payload,
+        "error",
+        "error_message",
+        "message",
+        "stderr_preview",
+    )
+    error_class = _first_present(payload, "error_class", "error_type", "class")
+    failed_status = payload.get("status") in {"error", "failed", "failure"}
+    if error is None and event.severity == "error":
+        error = event.summary
+    if error is None and error_class is None and not failed_status:
+        return None
+    fields = (
+        ("class", error_class),
+        ("status", payload.get("status") if failed_status else None),
+        ("error", error),
+    )
+    return _card("ERROR", fields)
+
+
+def format_event(event: VisibilityEvent, *, color: bool = True) -> str:
+    """Render one VisibilityEvent as a tri-card row or expanded card block."""
+
+    kind = event.kind
+    severity = event.severity.upper()
+    if color:
+        severity_color = _SEVERITY_COLORS.get(event.severity, "")
+        if severity_color:
+            severity = f"{severity_color}{severity}{_ANSI_RESET}"
+            kind = f"{severity_color}{event.kind}{_ANSI_RESET}"
+    prefix = (
+        f"{event.timestamp} seq={event.seq} {event.agent} "
+        f"{event.backend} {severity} {kind}"
+    )
+    cards = [_args_card(event), _result_card(event)]
+    error = _error_card(event)
+    if error:
+        cards.append(error)
+    if not any("\n" in card for card in cards):
+        return " ".join([prefix, *cards, f":: {event.summary}"])
+
+    lines = [f"{prefix} :: {event.summary}"]
+    for card in cards:
+        lines.extend(f"  {line}" for line in card.splitlines())
+    return "\n".join(lines)
+
+
+@dataclass
+class _TailState:
+    path: Path
+    offset: int = 0
+    buffer: str = ""
+
+    @classmethod
+    def create(cls, path: Path, *, from_start: bool, initial: bool) -> "_TailState":
+        offset = 0
+        if initial and not from_start:
+            try:
+                offset = path.stat().st_size
+            except FileNotFoundError:
+                offset = 0
+        return cls(path=path, offset=offset)
+
+    def read_lines(self) -> list[str]:
+        try:
+            size = self.path.stat().st_size
+        except FileNotFoundError:
+            return []
+        if size < self.offset:
+            # Log rotation/truncation: start over rather than seeking past EOF.
+            self.offset = 0
+            self.buffer = ""
+        try:
+            with self.path.open("r", encoding="utf-8", errors="replace") as f:
+                f.seek(self.offset)
+                chunk = f.read()
+                self.offset = f.tell()
+        except FileNotFoundError:
+            return []
+        if not chunk:
+            return []
+        data = self.buffer + chunk
+        pieces = data.splitlines(keepends=True)
+        complete: list[str] = []
+        self.buffer = ""
+        for piece in pieces:
+            if piece.endswith(("\n", "\r")):
+                complete.append(piece.rstrip("\r\n"))
+            else:
+                self.buffer = piece
+        return complete
+
+
+def _events_dir_for_team(team: str) -> Path:
+    return pio.team_visibility_event_path(team).parent / "events"
+
+
+def _discover_paths(team: str, agent: str | None) -> list[Path]:
+    paths = [pio.team_visibility_event_path(team)]
+    if agent:
+        paths.append(pio.visibility_event_path(team, agent))
+        return list(dict.fromkeys(paths))
+
+    events_dir = _events_dir_for_team(team)
+    try:
+        agent_paths = sorted(
+            path
+            for path in events_dir.glob("*.jsonl")
+            if path.is_file() and not path.name.startswith(".")
+        )
+    except OSError:
+        agent_paths = []
+    paths.extend(agent_paths)
+    return list(dict.fromkeys(paths))
+
+
+def _event_from_visibility_line(
+    line: str,
+    *,
+    path: Path,
+    stderr: TextIO,
+) -> VisibilityEvent | None:
+    if not line.strip():
+        return None
+    try:
+        raw = json.loads(line)
+        return VisibilityEvent.model_validate(raw)
+    except (json.JSONDecodeError, ValidationError, TypeError) as exc:
+        stderr.write(f"warning: skipped malformed visibility row in {path}: {exc}\n")
+        stderr.flush()
+        return None
+
+
+def _event_matches(
+    event: VisibilityEvent,
+    *,
+    agent: str | None = None,
+    filter_kinds: set[str] | None = None,
+    since: datetime | None = None,
+) -> bool:
+    if agent and event.agent != agent:
+        return False
+    if filter_kinds is not None and event.kind not in filter_kinds:
+        return False
+    if since is not None:
+        event_time = _parse_timestamp(event.timestamp)
+        if event_time is None or event_time < since:
+            return False
+    return True
+
+
+def tail_events(
+    *,
+    team: str,
+    agent: str | None = None,
+    filter_kinds: set[str] | None = None,
+    since: datetime | None = None,
+    from_start: bool = False,
+    follow: bool = True,
+    poll_s: float = 0.2,
+    max_events: int | None = None,
+    stderr: TextIO | None = None,
+) -> Iterable[VisibilityEvent]:
+    """Yield VisibilityEvents from the live aggregate stream plus fallback logs.
+
+    The aggregate ``visibility.jsonl`` is the intended attach point.  Per-agent
+    ``events/<agent>.jsonl`` files are also watched as a backwards-compatible
+    fallback and to discover streams created before this CLI existed.  Events
+    are de-duplicated by ``event_id`` when both surfaces contain the same row.
+    """
+
+    if max_events is not None and max_events <= 0:
+        return
+
+    err = stderr if stderr is not None else sys.stderr
+    states: dict[Path, _TailState] = {}
+    seen: set[str] = set()
+    emitted = 0
+    initial_discovery = True
+
+    while True:
+        for path in _discover_paths(team, agent):
+            if path not in states:
+                states[path] = _TailState.create(
+                    path,
+                    from_start=from_start,
+                    initial=initial_discovery,
+                )
+        initial_discovery = False
+
+        for path in sorted(states):
+            for line in states[path].read_lines():
+                event = _event_from_visibility_line(line, path=path, stderr=err)
+                if event is None:
+                    continue
+                if not _event_matches(
+                    event,
+                    agent=agent,
+                    filter_kinds=filter_kinds,
+                    since=since,
+                ):
+                    continue
+                if event.event_id in seen:
+                    continue
+                seen.add(event.event_id)
+                yield event
+                emitted += 1
+                if max_events is not None and emitted >= max_events:
+                    return
+
+        if not follow:
+            return
+        time.sleep(max(0.01, poll_s))
+
+
+async def _tail_aggregate_events_async(
+    *,
+    team: str,
+    agent: str | None = None,
+    filter_kinds: set[str] | None = None,
+    since: datetime | None = None,
+    from_start: bool = False,
+    poll_s: float = 0.2,
+    stderr: TextIO | None = None,
+) -> AsyncIterator[VisibilityEvent]:
+    """Yield events from the per-team aggregate visibility stream."""
+
+    err = stderr if stderr is not None else sys.stderr
+    path = pio.team_visibility_event_path(team)
+    state = _TailState.create(path, from_start=from_start, initial=True)
+    seen: set[str] = set()
+    while True:
+        for line in state.read_lines():
+            event = _event_from_visibility_line(line, path=path, stderr=err)
+            if event is None:
+                continue
+            if not _event_matches(
+                event,
+                agent=agent,
+                filter_kinds=filter_kinds,
+                since=since,
+            ):
+                continue
+            if event.event_id in seen:
+                continue
+            seen.add(event.event_id)
+            yield event
+        await asyncio.sleep(max(0.01, poll_s))
+
+
+class _VisibilityClient:
+    def __init__(self, *, subscription: _Subscription) -> None:
+        self.subscription = subscription
+        self.queue: asyncio.Queue[str | None] = asyncio.Queue()
+
+    def enqueue_event(self, event: VisibilityEvent) -> None:
+        if self.subscription.matches(event):
+            self.queue.put_nowait(event.model_dump_json(by_alias=True, exclude_none=True))
+
+    def enqueue_control(self, payload: dict[str, Any]) -> None:
+        self.queue.put_nowait(json.dumps(payload, sort_keys=True, separators=(",", ":")))
+
+    def close(self) -> None:
+        self.queue.put_nowait(None)
+
+
+class _VisibilityFanoutHub:
+    def __init__(
+        self,
+        *,
+        team: str,
+        from_start: bool,
+        poll_s: float,
+        stderr: TextIO,
+    ) -> None:
+        self.team = team
+        self.from_start = from_start
+        self.poll_s = poll_s
+        self.stderr = stderr
+        self._clients: set[_VisibilityClient] = set()
+        self._task: asyncio.Task[None] | None = None
+
+    async def start(self) -> None:
+        if self._task is None:
+            self._task = asyncio.create_task(self._run(), name="visibility-tail-fanout")
+
+    async def stop(self) -> None:
+        if self._task is None:
+            return
+        self._task.cancel()
+        try:
+            await self._task
+        except asyncio.CancelledError:
+            pass
+        self._task = None
+
+    def add(self, client: _VisibilityClient) -> None:
+        self._clients.add(client)
+
+    def remove(self, client: _VisibilityClient) -> None:
+        self._clients.discard(client)
+        client.close()
+
+    async def _run(self) -> None:
+        async for event in _tail_aggregate_events_async(
+            team=self.team,
+            from_start=self.from_start,
+            poll_s=self.poll_s,
+            stderr=self.stderr,
+        ):
+            for client in tuple(self._clients):
+                client.enqueue_event(event)
+
+
+async def _visibility_ws_handler(
+    websocket: Any,
+    *,
+    hub: _VisibilityFanoutHub,
+    subscription: _Subscription,
+    allow_remote: bool,
+) -> None:
+    from websockets.exceptions import ConnectionClosed
+
+    remote_address = getattr(websocket, "remote_address", None)
+    if not allow_remote and remote_address:
+        remote_host = remote_address[0] if isinstance(remote_address, tuple) else None
+        if remote_host is not None and not _is_loopback_host(remote_host):
+            await websocket.close(code=1008, reason="visibility-tail is localhost-only")
+            return
+
+    client = _VisibilityClient(subscription=subscription)
+    hub.add(client)
+
+    async def sender() -> None:
+        try:
+            while True:
+                payload = await client.queue.get()
+                if payload is None:
+                    return
+                await websocket.send(payload)
+        except ConnectionClosed:
+            return
+
+    async def receiver() -> None:
+        try:
+            async for message in websocket:
+                try:
+                    client.subscription = _subscription_from_wire(
+                        message,
+                        base=client.subscription,
+                    )
+                except _SubscriptionError as exc:
+                    client.enqueue_control({"type": "error", "error": str(exc)})
+                    continue
+                client.enqueue_control(
+                    {
+                        "type": "subscribed",
+                        "filter": client.subscription.as_wire_filter(),
+                    }
+                )
+        except ConnectionClosed:
+            return
+
+    sender_task = asyncio.create_task(sender())
+    receiver_task = asyncio.create_task(receiver())
+    try:
+        done, pending = await asyncio.wait(
+            {sender_task, receiver_task},
+            return_when=asyncio.FIRST_COMPLETED,
+        )
+        for task in done:
+            task.result()
+        for task in pending:
+            task.cancel()
+    finally:
+        hub.remove(client)
+        for task in (sender_task, receiver_task):
+            if not task.done():
+                task.cancel()
+            try:
+                await task
+            except asyncio.CancelledError:
+                pass
+
+
+async def _serve_visibility_tail(
+    *,
+    bind: _ServeAddress,
+    team: str,
+    agent: str | None,
+    filter_kinds: set[str] | None,
+    since: datetime | None,
+    from_start: bool,
+    poll_s: float,
+    allow_remote: bool,
+    stdout: TextIO,
+    stderr: TextIO,
+) -> int:
+    if not allow_remote and not _is_loopback_host(bind.host):
+        stderr.write(
+            f"error: refusing to bind non-loopback host {bind.host!r}; "
+            "pass --allow-remote to expose the visibility stream\n"
+        )
+        stderr.flush()
+        return 2
+    try:
+        from websockets.asyncio.server import serve
+    except ModuleNotFoundError:
+        stderr.write(
+            "error: visibility-tail --serve requires the 'websockets' package\n"
+        )
+        stderr.flush()
+        return 2
+
+    async def handler(websocket: Any) -> None:
+        await _visibility_ws_handler(
+            websocket,
+            hub=hub,
+            subscription=_base_subscription(
+                agent=agent,
+                filter_kinds=filter_kinds,
+                since=since,
+            ),
+            allow_remote=allow_remote,
+        )
+
+    hub = _VisibilityFanoutHub(
+        team=team,
+        from_start=from_start,
+        poll_s=poll_s,
+        stderr=stderr,
+    )
+    await hub.start()
+    try:
+        async with serve(handler, bind.host, bind.port):
+            stdout.write(
+                f"visibility-tail websocket listening on ws://{bind.host}:{bind.port}\n"
+            )
+            stdout.flush()
+            await asyncio.Future()
+    finally:
+        await hub.stop()
+    return 0
+
+
+def main(
+    argv: list[str] | None = None,
+    *,
+    stdout: TextIO | None = None,
+    stderr: TextIO | None = None,
+) -> int:
+    args = _build_parser().parse_args(argv)
+    out = stdout if stdout is not None else sys.stdout
+    err = stderr if stderr is not None else sys.stderr
+    filter_kinds = _split_filter_kinds(args.filter_kind)
+    if args.serve is not None:
+        try:
+            return asyncio.run(
+                _serve_visibility_tail(
+                    bind=args.serve,
+                    team=args.team,
+                    agent=args.agent,
+                    filter_kinds=filter_kinds,
+                    since=args.since,
+                    from_start=args.from_start,
+                    poll_s=args.poll_s,
+                    allow_remote=args.allow_remote,
+                    stdout=out,
+                    stderr=err,
+                )
+            )
+        except KeyboardInterrupt:
+            return 130
+    color = (
+        not args.json
+        and not args.no_color
+        and hasattr(out, "isatty")
+        and bool(out.isatty())
+    )
+    try:
+        for event in tail_events(
+            team=args.team,
+            agent=args.agent,
+            filter_kinds=filter_kinds,
+            since=args.since,
+            from_start=args.from_start,
+            follow=args.follow,
+            poll_s=args.poll_s,
+            max_events=args.max_events,
+            stderr=err,
+        ):
+            if args.json:
+                out.write(event.model_dump_json(by_alias=True, exclude_none=True) + "\n")
+            else:
+                out.write(format_event(event, color=color) + "\n")
+            out.flush()
+    except KeyboardInterrupt:
+        return 130
+    except BrokenPipeError:
+        return 1
+    return 0
+
+
+if __name__ == "__main__":  # pragma: no cover
+    raise SystemExit(main())

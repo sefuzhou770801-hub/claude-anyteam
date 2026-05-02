@@ -1,6 +1,14 @@
 from __future__ import annotations
 
+from pathlib import Path
+from types import SimpleNamespace
+from unittest.mock import patch
+
+import pytest
+
 from claude_anyteam.backends.gemini import loop
+from claude_anyteam.backends.gemini.config import GeminiSettings
+from claude_anyteam.backends.gemini.loop import GeminiLoopState
 from claude_anyteam.codex import CodexResult
 
 
@@ -12,12 +20,141 @@ def test_hard_cancel_failures_drop_session_policy():
     assert loop._should_drop_session_after_failure(cancelled)
     assert not loop._should_drop_session_after_failure(other)
 
-from pathlib import Path
-from types import SimpleNamespace
-from unittest.mock import patch
 
-from claude_anyteam.backends.gemini.config import GeminiSettings
-from claude_anyteam.backends.gemini.loop import GeminiLoopState
+def _settings(tmp_path: Path, backend: str) -> GeminiSettings:
+    return GeminiSettings(
+        team_name="t",
+        agent_name="gemini-peer",
+        cwd=tmp_path,
+        poll_interval_s=0.01,
+        color="cyan",
+        plan_mode_required=False,
+        gemini_home=tmp_path / f"gemini-{backend}",
+        backend=backend,  # type: ignore[arg-type]
+    )
+
+
+def _prose_result(
+    text: str = "",
+    *,
+    exit_code: int = 0,
+    tool_call_events: int = 0,
+) -> CodexResult:
+    return CodexResult(
+        exit_code=exit_code,
+        structured=None,
+        last_message=text,
+        events=[],
+        tool_call_events=tool_call_events,
+        error=None if exit_code == 0 else "failed",
+    )
+
+
+@pytest.mark.parametrize("backend", ["acp", "headless"])
+def test_handle_prose_skips_fallback_when_model_used_send_message_tool(tmp_path: Path, monkeypatch, backend: str):
+    """09 R22 / W7: Gemini matches Codex PR #12 and Kimi PR #11.
+
+    When Gemini delivers a prose reply via the wrapper send_message tool, the
+    CLI may leave last_message empty. The loop must not add a second canned
+    fallback reply on top of the tool-delivered peer DM.
+    """
+
+    state = loop.GeminiLoopState(settings=_settings(tmp_path, backend))
+    msg = SimpleNamespace(from_="codex-peer", text="ack", summary="prose")
+    fake_result = CodexResult(
+        exit_code=0,
+        structured=None,
+        last_message="",
+        events=[],
+        tool_call_events=1,
+    )
+    monkeypatch.setattr(loop, "_backend_run", lambda *a, **k: fake_result)
+
+    send_prose_calls: list = []
+    monkeypatch.setattr(loop.pio, "send_prose", lambda *a, **k: send_prose_calls.append((a, k)))
+
+    loop._handle_prose(state, msg)
+
+    assert send_prose_calls == []
+
+
+@pytest.mark.parametrize("backend", ["acp", "headless"])
+def test_handle_prose_batch_collapses_idle_peer_dms_to_one_gemini_invocation(tmp_path: Path, monkeypatch, backend: str):
+    state = loop.GeminiLoopState(settings=_settings(tmp_path, backend))
+    messages = [
+        SimpleNamespace(from_=f"peer-{idx}", text=f"hello {idx}", summary="dm")
+        for idx in range(5)
+    ]
+    invocations: list[dict] = []
+
+    def fake_backend_run(_state, prompt: str, **kwargs):
+        invocations.append({"prompt": prompt, **kwargs})
+        return _prose_result(tool_call_events=5)
+
+    monkeypatch.setattr(loop, "_backend_run", fake_backend_run)
+    monkeypatch.setattr(loop.pio, "send_prose", lambda *a, **k: None)
+
+    loop._handle_prose_batch(state, messages)
+
+    assert len(invocations) == 1
+    assert invocations[0]["ephemeral"] is True
+    assert callable(invocations[0]["event_sink"])
+    assert invocations[0]["prompt"].count("[from peer-") == 5
+    assert "# Team messaging" in invocations[0]["prompt"]
+    assert "Plain prose output is NOT visible to teammates" in invocations[0]["prompt"]
+    assert "call mcp_anyteam_send_message" in invocations[0]["prompt"]
+    assert "underlying wrapper tool is send_message" in invocations[0]["prompt"]
+
+
+@pytest.mark.parametrize("backend", ["acp", "headless"])
+def test_handle_prose_batch_preserves_gemini_per_sender_fallback_on_crash(tmp_path: Path, monkeypatch, backend: str):
+    state = loop.GeminiLoopState(settings=_settings(tmp_path, backend))
+    messages = [
+        SimpleNamespace(from_="peer-a", text="hi", summary="dm"),
+        SimpleNamespace(from_="peer-b", text="yo", summary="dm"),
+        SimpleNamespace(from_="peer-c", text="?", summary="dm"),
+    ]
+    sent: list[tuple[str, str]] = []
+
+    def crashing_backend_run(*_args, **_kwargs):
+        raise RuntimeError("gemini crashed")
+
+    monkeypatch.setattr(loop, "_backend_run", crashing_backend_run)
+    monkeypatch.setattr(
+        loop.pio,
+        "send_prose",
+        lambda team, sender, to, text, summary: sent.append((to, text)),
+    )
+
+    loop._handle_prose_batch(state, messages)
+
+    assert sorted(to for to, _ in sent) == ["peer-a", "peer-b", "peer-c"]
+    for _, text in sent:
+        assert "incident=" in text
+        assert "adapter=gemini" in text
+
+
+@pytest.mark.parametrize("backend", ["acp", "headless"])
+def test_handle_prose_skips_prose_text_after_send_message_tool(tmp_path: Path, monkeypatch, backend: str):
+    """Gemini parity for the M13 guard ordering: tool delivery wins over text."""
+
+    state = loop.GeminiLoopState(settings=_settings(tmp_path, backend))
+    msg = SimpleNamespace(from_="codex-peer", text="ack", summary="prose")
+    fake_result = CodexResult(
+        exit_code=0,
+        structured=None,
+        last_message="Already sent the answer with mcp_anyteam_send_message.",
+        events=[{"type": "tool_use", "tool_name": "mcp_anyteam_send_message"}],
+        tool_call_events=1,
+    )
+    monkeypatch.setattr(loop, "_backend_run", lambda *a, **k: fake_result)
+
+    send_prose_calls: list = []
+    monkeypatch.setattr(loop.pio, "send_prose", lambda *a, **k: send_prose_calls.append((a, k)))
+
+    loop._handle_prose(state, msg)
+
+    assert send_prose_calls == []
 
 
 def test_loop_surfaces_permission_block_with_details():

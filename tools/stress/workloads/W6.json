@@ -1,0 +1,14 @@
+{
+  "schema_version": 1,
+  "workload_id": "W6",
+  "name": "explain-code-to-peer",
+  "description": "One teammate explains a code path to a peer; the recipient paraphrases the behavior back to demonstrate shared understanding.",
+  "lead_prompt_template": "In {repo}, {assigned_to_a} should explain the relevant event-recording path to {assigned_to_b} using peer-DM. {assigned_to_b} must paraphrase the explanation back with the key data flow and failure modes. Do not pivot through the lead unless blocked.",
+  "tasks_per_run": 1,
+  "min_team_size": 2,
+  "success_check": {
+    "type": "paraphrase_check",
+    "recipient": "{assigned_to_b}",
+    "min_accuracy": 0.8
+  }
+}

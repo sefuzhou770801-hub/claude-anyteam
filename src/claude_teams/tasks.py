@@ -49,6 +49,41 @@ def _would_create_cycle(
     return False
 
 
+def _validate_parent_task_id(
+    team_dir: Path,
+    task_id: str,
+    parent_task_id: str | None,
+) -> None:
+    """Validate a child→parent link before persisting it.
+
+    Parent links are independent from dependency edges: dependencies express
+    scheduling constraints, while ``parentTaskId`` groups delegated sub-tasks
+    for later batch summaries.  Still, the parent must exist and the parent
+    chain must remain acyclic so a batch summary always has one clear root.
+    """
+
+    if parent_task_id is None:
+        return
+    if not parent_task_id.strip():
+        raise ValueError("Parent task ID must not be empty")
+    if parent_task_id == task_id:
+        raise ValueError(f"Task {task_id} cannot be its own parent")
+
+    visited = {task_id}
+    current: str | None = parent_task_id
+    while current is not None:
+        if current in visited:
+            raise ValueError(
+                f"Setting parent task {parent_task_id!r} would create a circular parent task chain"
+            )
+        visited.add(current)
+        parent_path = team_dir / f"{current}.json"
+        if not parent_path.exists():
+            raise ValueError(f"Referenced parent task {current!r} does not exist")
+        parent = TaskFile(**json.loads(parent_path.read_text()))
+        current = parent.parent_task_id
+
+
 def next_task_id(team_name: str, base_dir: Path | None = None) -> str:
     team_dir = _tasks_dir(base_dir) / team_name
     ids: list[int] = []
@@ -66,7 +101,9 @@ def create_task(
     description: str,
     active_form: str = "",
     metadata: dict | None = None,
+    coupling: dict | str | None = None,
     base_dir: Path | None = None,
+    parent_task_id: str | None = None,
 ) -> TaskFile:
     if not subject or not subject.strip():
         raise ValueError("Task subject must not be empty")
@@ -78,13 +115,16 @@ def create_task(
 
     with file_lock(lock_path):
         task_id = next_task_id(team_name, base_dir)
+        _validate_parent_task_id(team_dir, task_id, parent_task_id)
         task = TaskFile(
             id=task_id,
             subject=subject,
             description=description,
             active_form=active_form,
             status="pending",
+            parent_task_id=parent_task_id,
             metadata=metadata,
+            coupling=coupling,
         )
         fpath = team_dir / f"{task_id}.json"
         fpath.write_text(json.dumps(task.model_dump(by_alias=True, exclude_none=True)))
@@ -113,6 +153,8 @@ def update_task(
     add_blocks: list[str] | None = None,
     add_blocked_by: list[str] | None = None,
     metadata: dict | None = None,
+    coupling: dict | str | None = None,
+    parent_task_id: str | None = None,
     base_dir: Path | None = None,
 ) -> TaskFile:
     team_dir = _tasks_dir(base_dir) / team_name
@@ -158,6 +200,9 @@ def update_task(
                         f"Adding dependency {task_id} blocked_by {b} would create a circular dependency"
                     )
 
+        if parent_task_id is not None:
+            _validate_parent_task_id(team_dir, task_id, parent_task_id)
+
         if status is not None and status != "deleted":
             cur_order = _STATUS_ORDER[task.status]
             new_order = _STATUS_ORDER.get(status)
@@ -192,6 +237,15 @@ def update_task(
             task.active_form = active_form
         if owner is not None:
             task.owner = owner
+        if coupling is not None:
+            task.coupling = TaskFile(
+                id=task.id,
+                subject=task.subject,
+                description=task.description,
+                coupling=coupling,
+            ).coupling
+        if parent_task_id is not None:
+            task.parent_task_id = parent_task_id
 
         if add_blocks:
             existing = set(task.blocks)
@@ -269,6 +323,9 @@ def update_task(
                     changed = True
                 if task_id in other.blocks:
                     other.blocks.remove(task_id)
+                    changed = True
+                if other.parent_task_id == task_id:
+                    other.parent_task_id = None
                     changed = True
                 if changed:
                     pending_writes[f] = other

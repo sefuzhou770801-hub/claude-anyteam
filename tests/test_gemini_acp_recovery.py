@@ -2,9 +2,18 @@ from __future__ import annotations
 
 import json
 import os
+from pathlib import Path
+
+import pytest
+from claude_teams import messaging as cs_messaging  # type: ignore[import-untyped]
 
 from claude_anyteam.backends.gemini import acp, invoke
 from claude_anyteam.backends.gemini.acp_client import GeminiAcpError, GeminiAcpTimeoutError
+
+
+@pytest.fixture(autouse=True)
+def isolated_visibility_events(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+    monkeypatch.setattr(cs_messaging, "TEAMS_DIR", tmp_path / "teams")
 
 
 class RecoveringClient:

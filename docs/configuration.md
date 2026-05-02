@@ -150,6 +150,18 @@ Three subcommands of `claude-anyteam` cover the routine team-management writes t
 
 All three commands fail with exit 1 (or 2 for argparse errors) on missing teams, missing members, or malformed input — never silently. They are safe to run from automation and idempotent on no-op runs.
 
+## Diagnostic skill
+
+The `/claude-anyteam:diagnose` skill is a read-only substrate inspector for coordinating leads. It tells the lead to run:
+
+```bash
+claude-anyteam diagnose --team <team-name>
+```
+
+The report combines `team-roster --json`, the rich manifest cache under `~/.claude/teams/<team>/manifests/`, recent `visibility_degraded` events, #51 SendMessage flap-repair evidence, wrapper MCP tool-discovery snapshots from `diagnostics/wrapper-mcp-tools.jsonl`, and a green/yellow/red health checklist. Use `--agent <name>` to scope the report and `--since <iso-time>` to filter event/log rows.
+
+`claude-anyteam diagnose` is read-only by default. The only mutating option is `--instrument-spawn`, which writes `env.CLAUDE_ANYTEAM_WRAPPER_MCP_DIAGNOSTICS=1` to `~/.claude/settings.json` so the next teammate spawn captures wrapper MCP diagnostics; use it only when the user explicitly asks to enable instrumentation.
+
 ## Shim configuration
 
 | Variable | Purpose |

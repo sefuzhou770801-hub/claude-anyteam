@@ -6,17 +6,27 @@ surfaces the same ``CodexResult`` shape the Kimi loop consumes.
 """
 from __future__ import annotations
 
+import json
 import subprocess
 from pathlib import Path
 from typing import Any
 
 import pytest
+from claude_teams import messaging as cs_messaging  # type: ignore[import-untyped]
 
+from claude_anyteam import protocol_io as pio
 from claude_anyteam.codex import TASK_COMPLETE_SCHEMA
 from claude_anyteam.backends.kimi import invoke
 
 FIXTURES = Path(__file__).parent / "fixtures" / "kimi"
 PROBES = FIXTURES / "_research_probes"
+
+
+@pytest.fixture
+def events_root(tmp_path: Path, monkeypatch):
+    base = tmp_path / "home" / ".claude" / "teams"
+    monkeypatch.setattr(cs_messaging, "TEAMS_DIR", base)
+    return base
 
 
 def _read(name: str, root: Path = FIXTURES) -> str:
@@ -297,6 +307,117 @@ def test_run_exit_one_failure_keeps_parsed_events_and_error(tmp_path, monkeypatc
     assert result.error.startswith("kimi exited 1; output:")
     assert result.tool_call_events == 2
     assert any(ev.get("type") == "non_json_stdout" for ev in result.events)
+
+
+def test_headless_completed_payload_preserves_kimi_tool_calls(events_root, tmp_path, monkeypatch):
+    tool_calls = [
+        {"type": "function", "id": f"tool_{idx}", "function": {"name": "Shell", "arguments": "{}"}}
+        for idx in range(5)
+    ]
+    stdout = "\n".join([
+        json.dumps({"role": "assistant", "content": [], "tool_calls": tool_calls}),
+        json.dumps({"role": "assistant", "content": "KIMI_DONE"}),
+    ])
+    _patch_kimi_run(
+        monkeypatch,
+        tmp_path,
+        [{"stdout": stdout, "stderr": "", "returncode": 0}],
+    )
+
+    result = invoke.run(
+        "prompt",
+        cwd=tmp_path,
+        kimi_home=tmp_path / "home",
+        wrapper_identity=("team-x", "kimi-a"),
+    )
+
+    assert result.exit_code == 0
+    assert result.tool_call_events == 5
+    events = pio.read_visibility_events("team-x", "kimi-a")
+    assert [event.kind for event in events] == [
+        "turn_started",
+        "tool_event",
+        "tool_event",
+        "tool_event",
+        "tool_event",
+        "tool_event",
+        "turn_completed",
+    ]
+    assert [event.payload["tool_name"] for event in events[1:6]] == ["Shell"] * 5
+    payload = events[-1].payload
+    assert payload["tool_call_events"] == 5
+    assert payload["tool_call_event_source"] == "kimi assistant.tool_calls[]"
+    assert payload["events"][0]["tool_calls"] == tool_calls
+
+
+def test_headless_prose_visibility_can_emit_through_event_sink(tmp_path, monkeypatch):
+    stdout = json.dumps({"role": "assistant", "content": "prose reply"})
+    _patch_kimi_run(
+        monkeypatch,
+        tmp_path,
+        [{"stdout": stdout, "stderr": "", "returncode": 0}],
+    )
+    emitted = []
+
+    result = invoke.run(
+        "prompt",
+        cwd=tmp_path,
+        kimi_home=tmp_path / "home",
+        wrapper_identity=("team-x", "kimi-prose"),
+        event_sink=emitted.append,
+    )
+
+    assert result.exit_code == 0
+    assert [event.kind for event in emitted] == ["turn_started", "turn_completed"]
+    assert [event.backend for event in emitted] == ["kimi_headless", "kimi_headless"]
+    assert emitted[0].payload["mode"] == "prose"
+    assert emitted[0].payload["prompt_kind"] == "prose_reply"
+    assert emitted[1].payload["exit_code"] == 0
+    assert emitted[1].payload["last_message_preview"] == "prose reply"
+
+
+def test_headless_prose_send_message_suppresses_terminal_preview(events_root, tmp_path, monkeypatch):
+    stdout = "\n".join([
+        json.dumps({
+            "role": "assistant",
+            "content": [],
+            "tool_calls": [
+                {
+                    "type": "function",
+                    "id": "tool_send",
+                    "function": {"name": "send_message", "arguments": "{}"},
+                }
+            ],
+        }),
+        json.dumps({
+            "role": "assistant",
+            "content": "This final prose would be an M13 collision if the adapter re-sent it.",
+        }),
+    ])
+    _patch_kimi_run(
+        monkeypatch,
+        tmp_path,
+        [{"stdout": stdout, "stderr": "", "returncode": 0}],
+    )
+
+    result = invoke.run(
+        "prompt",
+        cwd=tmp_path,
+        kimi_home=tmp_path / "home",
+        wrapper_identity=("team-x", "kimi-a"),
+    )
+
+    assert result.exit_code == 0
+    assert result.last_message.startswith("This final prose")
+    events = pio.read_visibility_events("team-x", "kimi-a")
+    # Post #16 (kimi cascade-fix mirror of #18): tool_event envelopes emitted
+    # separately AND tool_call_events count restored on terminal payload.
+    tool_call_envelopes = [e for e in events if e.kind == "tool_event"]
+    assert len(tool_call_envelopes) == 1
+    payload = events[-1].payload
+    assert payload["tool_call_events"] == 1
+    assert payload["last_message_preview"] == ""
+    assert payload["last_message_suppressed_reason"] == "delivered_via_send_message_tool"
 
 
 def test_schema_validation_failure_returns_one_invocation_for_loop_to_retry(tmp_path, monkeypatch):

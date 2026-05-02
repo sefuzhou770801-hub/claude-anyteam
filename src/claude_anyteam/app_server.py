@@ -4,6 +4,7 @@ from __future__ import annotations
 
 from typing import Any
 
+from . import logger
 from .jsonrpc_stdio import JsonRpcStdioClient, JsonRpcStdioError
 
 
@@ -28,6 +29,113 @@ class AppServerClient(JsonRpcStdioClient):
             stderr_log_prefix="app_server.stderr",
         )
         self._error_cls = AppServerError
+        self.last_thread_result: dict[str, Any] | None = None
+
+    # ---- transport health / restart ---------------------------------------
+
+    def is_transport_alive(self) -> bool:
+        """Return whether the current App Server transport still looks usable.
+
+        The App Server is hosted as a child process behind JSON-RPC stdio.
+        During a long turn the process can disappear without any more
+        notifications being queued.  Polling this cheap predicate lets the
+        caller distinguish "no event yet" from "transport is gone" and decide
+        whether to reconnect instead of waiting for the wall-clock timeout.
+        """
+
+        proc = self._proc
+        if proc is None:
+            return False
+        if proc.poll() is not None:
+            return False
+        reader = self._reader
+        if reader is not None and not reader.is_alive() and not self._stopping.is_set():
+            return False
+        return True
+
+    def transport_status(self) -> dict[str, Any]:
+        """Best-effort diagnostic details for visibility/log payloads."""
+
+        proc = self._proc
+        return {
+            "pid": getattr(proc, "pid", None) if proc is not None else None,
+            "returncode": proc.poll() if proc is not None else None,
+            "reader_alive": bool(self._reader and self._reader.is_alive()),
+            "stderr_reader_alive": bool(
+                self._stderr_reader and self._stderr_reader.is_alive()
+            ),
+        }
+
+    def restart(
+        self,
+        *,
+        initialize: bool = True,
+        client_info: dict[str, Any] | None = None,
+        close_timeout: float = 5.0,
+    ) -> Any:
+        """Restart the child App Server process and optionally initialize it.
+
+        This is intentionally a local transport restart, not a thread-level
+        semantic operation.  Callers that need conversational continuity should
+        follow it with `thread_resume()` (or use `reconnect_and_resume()`).
+        """
+
+        old_status = self.transport_status()
+        logger.warn("app_server.restart_start", old_status=old_status)
+        self.close(timeout=close_timeout)
+        self.start()
+        result = self.initialize(client_info=client_info) if initialize else None
+        logger.info("app_server.restart_complete", status=self.transport_status())
+        return result
+
+    def reconnect_and_resume(
+        self,
+        *,
+        thread_id: str,
+        cwd: str | None = None,
+        base_instructions: str | None = None,
+        developer_instructions: str | None = None,
+        sandbox: str = "danger-full-access",
+        approval_policy: str = "never",
+        config: dict[str, Any] | None = None,
+        model: str | None = None,
+        client_info: dict[str, Any] | None = None,
+        close_timeout: float = 5.0,
+    ) -> dict[str, Any]:
+        """Restart the App Server transport, then load an existing thread.
+
+        Returns the raw `thread/resume` response so higher layers can inspect
+        populated turns and decide whether the previous turn already completed
+        or whether they should start a recovery continuation turn.
+        """
+
+        logger.warn(
+            "app_server.reconnect_resume_start",
+            thread_id=thread_id,
+            status=self.transport_status(),
+        )
+        self.restart(
+            initialize=True,
+            client_info=client_info,
+            close_timeout=close_timeout,
+        )
+        result = self.thread_resume(
+            thread_id=thread_id,
+            cwd=cwd,
+            base_instructions=base_instructions,
+            developer_instructions=developer_instructions,
+            sandbox=sandbox,
+            approval_policy=approval_policy,
+            config=config,
+            model=model,
+        )
+        resumed_thread_id = _thread_id_from_result(result) or thread_id
+        logger.info(
+            "app_server.reconnect_resume_complete",
+            thread_id=thread_id,
+            resumed_thread_id=resumed_thread_id,
+        )
+        return result
 
     # ---- helpers for well-known methods -----------------------------------
 
@@ -71,6 +179,7 @@ class AppServerClient(JsonRpcStdioClient):
         if model is not None:
             params["model"] = model
         result = self.request("thread/start", params)
+        self.last_thread_result = result if isinstance(result, dict) else None
         return result["thread"]["id"] if isinstance(result.get("thread"), dict) else result["threadId"]
 
     def turn_start(
@@ -166,6 +275,7 @@ class AppServerClient(JsonRpcStdioClient):
             params["model"] = model
         try:
             result = self.request("thread/fork", params)
+            self.last_thread_result = result if isinstance(result, dict) else None
         except AppServerError as e:
             msg = str(e).lower()
             if "no rollout found" in msg or "not materialized" in msg:
@@ -203,6 +313,48 @@ class AppServerClient(JsonRpcStdioClient):
             {"threadId": thread_id, "includeTurns": include_turns},
         )
 
+    def thread_resume(
+        self,
+        *,
+        thread_id: str,
+        cwd: str | None = None,
+        base_instructions: str | None = None,
+        developer_instructions: str | None = None,
+        sandbox: str = "danger-full-access",
+        approval_policy: str = "never",
+        config: dict[str, Any] | None = None,
+        model: str | None = None,
+    ) -> dict[str, Any]:
+        """Load a persisted thread into this App Server process.
+
+        Codex returns populated `thread.turns` on `thread/resume`, which the
+        adapter uses during transport crash recovery to recover a final
+        agentMessage if the turn completed while the transport was down.
+        """
+
+        params: dict[str, Any] = {
+            "threadId": thread_id,
+            "sandbox": sandbox,
+            "approvalPolicy": approval_policy,
+        }
+        if cwd is not None:
+            params["cwd"] = cwd
+        if base_instructions is not None:
+            params["baseInstructions"] = base_instructions
+        if developer_instructions is not None:
+            params["developerInstructions"] = developer_instructions
+        if config is not None:
+            params["config"] = config
+        if model is not None:
+            params["model"] = model
+        result = self.request("thread/resume", params)
+        self.last_thread_result = result if isinstance(result, dict) else None
+        if not isinstance(result, dict):
+            raise AppServerError(f"thread/resume response was not an object: {result}")
+        if _thread_id_from_result(result) is None:
+            raise AppServerError(f"thread/resume response missing thread id: {result}")
+        return result
+
     def is_thread_materialized(self, thread_id: str) -> bool:
         """True if the thread is materialized (has a rollout file on disk
         Codex can load). False if App Server reports
@@ -232,3 +384,15 @@ class AppServerClient(JsonRpcStdioClient):
             # Something else went wrong — e.g. thread doesn't exist at all,
             # transport failure. Let the caller see it.
             raise
+
+
+def _thread_id_from_result(result: dict[str, Any]) -> str | None:
+    thread = result.get("thread") if isinstance(result, dict) else None
+    if isinstance(thread, dict):
+        tid = thread.get("id")
+        if isinstance(tid, str) and tid:
+            return tid
+    tid = result.get("threadId") if isinstance(result, dict) else None
+    if isinstance(tid, str) and tid:
+        return tid
+    return None

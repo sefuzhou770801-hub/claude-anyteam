@@ -6,6 +6,7 @@ from unittest.mock import patch
 
 from claude_anyteam.backends.kimi import loop
 from claude_anyteam.backends.kimi.config import KimiSettings
+from claude_anyteam.codex import CodexResult
 
 
 def _settings(tmp_path: Path) -> KimiSettings:
@@ -17,6 +18,22 @@ def _settings(tmp_path: Path) -> KimiSettings:
         color="cyan",
         plan_mode_required=False,
         kimi_binary="kimi",
+    )
+
+
+def _prose_result(
+    text: str = "",
+    *,
+    exit_code: int = 0,
+    tool_call_events: int = 0,
+) -> CodexResult:
+    return CodexResult(
+        exit_code=exit_code,
+        structured=None,
+        last_message=text,
+        events=[],
+        tool_call_events=tool_call_events,
+        error=None if exit_code == 0 else "failed",
     )
 
 
@@ -37,6 +54,239 @@ def test_backend_run_drops_resume_session_for_ephemeral_invocations(tmp_path: Pa
     assert calls[1]["resume_session_id"] == "durable-session"
 
 
+def test_main_loop_batches_five_idle_peer_dms_into_one_kimi_invocation(tmp_path: Path, monkeypatch):
+    """5 peer prose DMs in one idle inbox drain -> one Kimi invocation."""
+    state = loop.KimiLoopState(settings=_settings(tmp_path))
+    messages = [
+        SimpleNamespace(from_=f"peer-{idx}", text=f"hello {idx}", summary="dm")
+        for idx in range(5)
+    ]
+    invocations: list[dict] = []
+
+    def fake_backend_run(_state, prompt: str, **kwargs):
+        invocations.append({"prompt": prompt, **kwargs})
+        _state.approved_shutdown = True
+        return _prose_result(tool_call_events=5)
+
+    monkeypatch.setattr(loop.pio, "read_own_inbox", lambda *a: messages)
+    monkeypatch.setattr(loop, "_backend_run", fake_backend_run)
+    monkeypatch.setattr(loop.pio, "send_prose", lambda *a, **k: None)
+
+    loop._main_loop(state)
+
+    assert len(invocations) == 1
+    prompt = invocations[0]["prompt"]
+    assert prompt.count("[from peer-") == 5
+    assert "# Team messaging" in prompt
+    assert "Plain prose output is NOT visible to teammates" in prompt
+    assert "call send_message" in prompt
+    assert "try SendMessage (capitalized)" in prompt
+    assert invocations[0]["ephemeral"] is True
+
+
+def test_handle_prose_batch_preserves_per_sender_fallback_on_crash(tmp_path: Path, monkeypatch):
+    state = loop.KimiLoopState(settings=_settings(tmp_path))
+    messages = [
+        SimpleNamespace(from_="peer-a", text="hi", summary="dm"),
+        SimpleNamespace(from_="peer-b", text="yo", summary="dm"),
+        SimpleNamespace(from_="peer-c", text="?", summary="dm"),
+    ]
+    sent: list[tuple[str, str]] = []
+
+    def crashing_backend_run(*_args, **_kwargs):
+        raise RuntimeError("kimi crashed")
+
+    monkeypatch.setattr(loop, "_backend_run", crashing_backend_run)
+    monkeypatch.setattr(
+        loop.pio,
+        "send_prose",
+        lambda team, sender, to, text, summary: sent.append((to, text)),
+    )
+
+    loop._handle_prose_batch(state, messages)
+
+    assert sorted(to for to, _ in sent) == ["peer-a", "peer-b", "peer-c"]
+    for _, text in sent:
+        assert "incident=" in text
+        assert "adapter=kimi" in text
+
+
+def test_handle_prose_batch_single_message_uses_fast_path(tmp_path: Path, monkeypatch):
+    state = loop.KimiLoopState(settings=_settings(tmp_path))
+    msg = SimpleNamespace(from_="peer-solo", text="just one", summary="dm")
+    calls: list[object] = []
+
+    monkeypatch.setattr(loop, "_handle_prose", lambda _state, _msg: calls.append(_msg))
+
+    loop._handle_prose_batch(state, [msg])
+
+    assert calls == [msg]
+
+
+def test_kimi_peer_dm_message_kind_plain_prose_stays_prose(tmp_path: Path, monkeypatch):
+    """Phase4 #19: peer-DM discriminators must not become Kimi steers."""
+
+    state = loop.KimiLoopState(settings=_settings(tmp_path))
+    msg = SimpleNamespace(
+        from_="codex-implementer",
+        text="FYI: I found the relevant Kimi loop path.",
+        message_kind="peer-DM",
+        summary="coordination",
+    )
+    handled_as_prose: list[object] = []
+    monkeypatch.setattr(
+        loop,
+        "_handle_prose",
+        lambda _state, prose_msg: handled_as_prose.append(prose_msg),
+    )
+
+    assert loop._partition_inbox([msg]) == [("prose", [msg])]
+
+    loop._handle_message(state, msg)
+
+    assert state.queued_steers == []
+    assert handled_as_prose == [msg]
+
+
+def test_kimi_message_kind_steer_plain_prose_queues_team_lead_steer(tmp_path: Path):
+    """Phase4 #19: explicit sender-side steer intent uses Kimi's steer queue."""
+
+    state = loop.KimiLoopState(settings=_settings(tmp_path))
+    msg = SimpleNamespace(
+        from_="team-lead",
+        text="Use the messageKind discriminator before prose batching.",
+        messageKind="steer",
+        summary="intentional steer",
+    )
+
+    assert loop._partition_inbox([msg]) == [("protocol", [msg])]
+
+    loop._handle_message(state, msg)
+
+    assert len(state.queued_steers) == 1
+    assert state.queued_steers[0].message == msg.text
+
+
+def test_kimi_unknown_or_absent_message_kind_falls_back_to_existing_heuristic(
+    tmp_path: Path, monkeypatch
+):
+    """Unknown/missing discriminators preserve the old parse_protocol_text path."""
+
+    state = loop.KimiLoopState(settings=_settings(tmp_path))
+    unknown_plain = SimpleNamespace(
+        from_="codex-implementer",
+        text="Plain coordination with a future message kind.",
+        message_kind="future_kind",
+        summary="future",
+    )
+    unknown_marker = SimpleNamespace(
+        from_="team-lead",
+        text="STEER: keep the test narrow.",
+        message_kind="future_kind",
+        summary="future steer marker",
+    )
+    absent_marker = SimpleNamespace(
+        from_="team-lead",
+        text="STEER: preserve legacy marker behavior.",
+        summary="legacy steer marker",
+    )
+    handled_as_prose: list[object] = []
+    monkeypatch.setattr(
+        loop,
+        "_handle_prose",
+        lambda _state, prose_msg: handled_as_prose.append(prose_msg),
+    )
+
+    loop._handle_message(state, unknown_plain)
+    loop._handle_message(state, unknown_marker)
+    loop._handle_message(state, absent_marker)
+
+    assert handled_as_prose == [unknown_plain]
+    assert [s.message for s in state.queued_steers] == [
+        "keep the test narrow.",
+        "preserve legacy marker behavior.",
+    ]
+
+
+def test_kimi_structured_peer_steer_body_default_kind_stays_prose(
+    tmp_path: Path, monkeypatch
+):
+    state = loop.KimiLoopState(settings=_settings(tmp_path))
+    msg = SimpleNamespace(
+        from_="codex-implementer",
+        text='{"type":"steer","message":"Default kind must not steer."}',
+        message_kind="informational",
+        summary="json body",
+    )
+    handled_as_prose: list[object] = []
+    monkeypatch.setattr(
+        loop,
+        "_handle_prose",
+        lambda _state, prose_msg: handled_as_prose.append(prose_msg),
+    )
+
+    loop._handle_message(state, msg)
+
+    assert handled_as_prose == [msg]
+    assert state.queued_steers == []
+
+
+def test_kimi_explicit_peer_steer_can_be_authorized_by_self_manifest(
+    tmp_path: Path,
+):
+    state = loop.KimiLoopState(
+        settings=_settings(tmp_path),
+        self_capability_manifest={
+            "capabilities": {
+                "turn_steer": {
+                    "authorization": "any_peer",
+                    "callable_from_peers": True,
+                }
+            }
+        },
+    )
+    msg = SimpleNamespace(
+        from_="codex-implementer",
+        text='{"type":"steer","message":"Manifest allows this."}',
+        message_kind="steer",
+        summary="peer steer",
+    )
+
+    loop._handle_message(state, msg)
+
+    assert len(state.queued_steers) == 1
+    assert state.queued_steers[0].message == "Manifest allows this."
+
+
+def test_kimi_prose_paths_pass_visibility_event_sink(tmp_path: Path, monkeypatch):
+    state = loop.KimiLoopState(settings=_settings(tmp_path))
+    invocations: list[dict] = []
+
+    def fake_backend_run(_state, _prompt: str, **kwargs):
+        invocations.append(kwargs)
+        return _prose_result("reply")
+
+    monkeypatch.setattr(loop, "_backend_run", fake_backend_run)
+    monkeypatch.setattr(loop.pio, "send_prose", lambda *a, **k: None)
+
+    loop._handle_prose_batch(
+        state,
+        [SimpleNamespace(from_="peer-one", text="one", summary="dm")],
+    )
+    loop._handle_prose_batch(
+        state,
+        [
+            SimpleNamespace(from_="peer-two", text="two", summary="dm"),
+            SimpleNamespace(from_="peer-three", text="three", summary="dm"),
+        ],
+    )
+
+    assert len(invocations) == 2
+    assert all(call["ephemeral"] is True for call in invocations)
+    assert all(call["event_sink"] is not None for call in invocations)
+    assert all(callable(call["event_sink"]) for call in invocations)
+
+
 def test_kimi_mark_blocked_skips_when_task_already_completed(tmp_path: Path):
     state = loop.KimiLoopState(settings=_settings(tmp_path))
     task = SimpleNamespace(id="42", status="in_progress")
@@ -54,6 +304,44 @@ def test_kimi_mark_blocked_skips_when_task_already_completed(tmp_path: Path):
 
     assert update_calls == []
     assert send_calls == []
+
+
+def test_kimi_tight_task_on_loose_backend_emits_conflict_and_claims(tmp_path: Path):
+    state = loop.KimiLoopState(
+        settings=_settings(tmp_path),
+        self_capability_manifest={
+            "agent_name": "a",
+            "coupling_regime": "loose",
+            "coupling": {"intent": "loose_parallel"},
+        },
+    )
+    task = SimpleNamespace(
+        id="7",
+        subject="tight coordination",
+        description="needs mid-turn coordination",
+        status="pending",
+        owner="a",
+        blocked_by=[],
+        coupling="tight",
+    )
+    emitted: list[dict] = []
+
+    with (
+        patch.object(loop.pio, "list_tasks", return_value=[task]),
+        patch.object(loop.pio, "claim_task", return_value=task),
+        patch.object(
+            loop.pio,
+            "emit_coupling_conflict_if_needed",
+            side_effect=lambda **kwargs: emitted.append(kwargs),
+        ),
+    ):
+        claimed = loop._find_and_claim(state)
+
+    assert claimed is task
+    assert state.in_flight_task == "7"
+    assert emitted[0]["backend"] == "kimi_headless"
+    assert emitted[0]["manifest"] == state.self_capability_manifest
+    assert emitted[0]["task"] is task
 
 
 def test_execute_task_survives_backend_run_exception(tmp_path: Path, monkeypatch):
@@ -109,6 +397,40 @@ def test_handle_prose_skips_fallback_when_model_used_send_message_tool(tmp_path:
     loop._handle_prose(state, msg)
 
     # No fallback sent — model delivered via tool already.
+    assert send_prose_calls == []
+
+
+def test_handle_prose_skips_prose_text_after_send_message_tool(tmp_path: Path, monkeypatch):
+    """M13 regression: Kimi may emit both send_message and final prose text.
+
+    The final assistant prose is informational after the wrapper tool has
+    already delivered the peer reply; the adapter must not send it as a second
+    prose-mode fallback.
+    """
+    state = loop.KimiLoopState(settings=_settings(tmp_path))
+    msg = SimpleNamespace(from_="codex-bob", text="ack", summary="prose")
+
+    fake_result = SimpleNamespace(
+        exit_code=0,
+        last_message="Already sent the answer with send_message; no fallback needed.",
+        structured=None,
+        events=[
+            {
+                "role": "assistant",
+                "tool_calls": [{"function": {"name": "send_message", "arguments": "{}"}}],
+            }
+        ],
+        tool_call_events=1,
+        session_id=None,
+        error=None,
+    )
+    monkeypatch.setattr(loop, "_backend_run", lambda *a, **k: fake_result)
+
+    send_prose_calls: list = []
+    monkeypatch.setattr(loop.pio, "send_prose", lambda *a, **k: send_prose_calls.append((a, k)))
+
+    loop._handle_prose(state, msg)
+
     assert send_prose_calls == []
 
 

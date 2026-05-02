@@ -139,6 +139,8 @@ dependencies = [
     { name = "filelock" },
     { name = "jsonschema" },
     { name = "pydantic" },
+    { name = "watchfiles" },
+    { name = "websockets" },
 ]
 
 [package.dev-dependencies]
@@ -153,6 +155,8 @@ requires-dist = [
     { name = "filelock", specifier = "==3.16" },
     { name = "jsonschema", specifier = ">=4.20" },
     { name = "pydantic", specifier = ">=2.10" },
+    { name = "watchfiles", specifier = ">=1.0" },
+    { name = "websockets", specifier = ">=12" },
 ]
 
 [package.metadata.requires-dev]

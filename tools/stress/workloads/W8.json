@@ -1,0 +1,14 @@
+{
+  "schema_version": 1,
+  "workload_id": "W8",
+  "name": "chained-delegation",
+  "description": "A task must pass from one peer to another without a lead pivot. The first peer scopes the change, hands off the implementation, and the second peer completes it.",
+  "lead_prompt_template": "In {repo}, {assigned_to_a} should scope a two-file change, then hand it off directly to {assigned_to_b} with `handoff:` peer-DM language. {assigned_to_b} must implement and acknowledge the handoff. Do not route through team-lead.",
+  "tasks_per_run": 1,
+  "min_team_size": 2,
+  "success_check": {
+    "type": "files_modified",
+    "args": {"max_files": 4, "must_include": ["src/", "tests/"], "min_distinct_authors": 2, "handoff_required": true}
+  },
+  "primary_metrics": ["M4", "M7", "M11", "M12"]
+}

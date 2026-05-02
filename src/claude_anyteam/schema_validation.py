@@ -13,16 +13,21 @@ module state, and no side effects beyond raising for programmer errors.
 from __future__ import annotations
 
 import json
+from importlib.resources.abc import Traversable
 from pathlib import Path
 from typing import Any
 
 import jsonschema
 
 
-def load_schema(path: Path) -> dict[str, Any]:
+def load_schema(path: Path | Traversable) -> dict[str, Any]:
     """Read and parse a JSON Schema file. Raises the usual FileNotFoundError
-    / JSONDecodeError — callers should treat those as programmer errors."""
-    with open(path, encoding="utf-8") as f:
+    / JSONDecodeError — callers should treat those as programmer errors.
+
+    R1 (09 §3.1) moves schemas to importlib resources, so callers may pass
+    either a filesystem Path or an importlib Traversable.
+    """
+    with path.open(encoding="utf-8") as f:
         return json.load(f)
 
 

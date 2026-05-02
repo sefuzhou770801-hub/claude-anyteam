@@ -14,6 +14,7 @@ from dataclasses import dataclass
 
 from .env import (
     BINARY_ENV,
+    CLAUDE_SHIM_MATCH_ENV,
     LEGACY_BINARY_ENV,
     GEMINI_BINARY_ENV,
     GEMINI_SHIM_MATCH_ENV,
@@ -27,6 +28,7 @@ from .env import (
 )
 
 DEFAULT_CODEX_MATCH = r"^codex-"
+DEFAULT_CLAUDE_MATCH = r"^claude-"
 DEFAULT_GEMINI_MATCH = r"^gemini-"
 DEFAULT_KIMI_MATCH = r"^kimi-"
 PRIMARY_BINARY = "claude-anyteam"
@@ -101,7 +103,13 @@ def _resolve_binary(default_name: str, *env_vars: str, fallback_name: str | None
     return shutil.which(default_name) or (shutil.which(fallback_name) if fallback_name else None)
 
 
-_AGENT_CONFIG_KEYS = ("model", "effort", "turn_timeout_s")
+_AGENT_CONFIG_KEYS = (
+    "model",
+    "effort",
+    "turn_timeout_s",
+    "non_progress_warn_s",
+    "non_progress_interrupt_s",
+)
 
 
 def _agent_config_path(team_name: str, agent_name: str) -> str:
@@ -152,9 +160,9 @@ def _load_agent_config(team_name: str | None, agent_name: str | None) -> dict[st
     out: dict[str, str] = {}
     for key in _AGENT_CONFIG_KEYS:
         value = raw.get(key)
-        # Accept both string and numeric (for turn_timeout_s); stringify
-        # uniformly so the downstream argv builder can pass it as a CLI flag
-        # without further branching.
+        # Accept both string and numeric values; stringify uniformly so the
+        # downstream argv builder can pass it as a CLI flag without further
+        # branching.
         if isinstance(value, str) and value:
             out[key] = value
         elif isinstance(value, (int, float)):
@@ -177,11 +185,13 @@ def _resolve_current_invocation(argv0: str) -> str | None:
 
 
 def _resolve_native_claude(argv0: str) -> str | None:
+    current = _resolve_current_invocation(argv0)
     override = env_first(os.environ, NATIVE_CLAUDE_ENV, LEGACY_NATIVE_CLAUDE_ENV)
     if override:
-        return shutil.which(override) or override
+        resolved = shutil.which(override) or override
+        if not (current and os.path.realpath(resolved) == current):
+            return resolved
 
-    current = _resolve_current_invocation(argv0)
     candidate = shutil.which("claude")
     if candidate and os.path.realpath(candidate) != current:
         return candidate
@@ -213,6 +223,10 @@ def _route_match(parsed: ParsedArgs, *, env_name: str, legacy_env_name: str | No
 
 def _codex_route(parsed: ParsedArgs) -> bool:
     return _route_match(parsed, env_name=SHIM_MATCH_ENV, legacy_env_name=LEGACY_SHIM_MATCH_ENV, default=DEFAULT_CODEX_MATCH)
+
+
+def _claude_route(parsed: ParsedArgs) -> bool:
+    return _route_match(parsed, env_name=CLAUDE_SHIM_MATCH_ENV, legacy_env_name=None, default=DEFAULT_CLAUDE_MATCH)
 
 
 def _gemini_route(parsed: ParsedArgs) -> bool:
@@ -251,7 +265,13 @@ def _require_binary(binary: str | None, label: str) -> str:
 
 
 
-def _adapter_argv(binary: str, parsed: ParsedArgs, *, include_effort: bool) -> tuple[list[str], dict[str, str]]:
+def _adapter_argv(
+    binary: str,
+    parsed: ParsedArgs,
+    *,
+    include_effort: bool,
+    include_watchdog: bool = False,
+) -> tuple[list[str], dict[str, str]]:
     argv = [binary, "--name", parsed.agent_name]
     if parsed.team_name is not None:
         argv.extend(["--team", parsed.team_name])
@@ -264,6 +284,12 @@ def _adapter_argv(binary: str, parsed: ParsedArgs, *, include_effort: bool) -> t
         argv.extend(["--effort", agent_config["effort"]])
     if "turn_timeout_s" in agent_config:
         argv.extend(["--turn-timeout-s", agent_config["turn_timeout_s"]])
+    if include_watchdog and "non_progress_warn_s" in agent_config:
+        argv.extend(["--non-progress-warn-s", agent_config["non_progress_warn_s"]])
+    if include_watchdog and "non_progress_interrupt_s" in agent_config:
+        argv.extend(
+            ["--non-progress-interrupt-s", agent_config["non_progress_interrupt_s"]]
+        )
     return argv, agent_config
 
 def main(argv: list[str] | None = None) -> int:
@@ -290,7 +316,9 @@ def main(argv: list[str] | None = None) -> int:
             _resolve_binary(PRIMARY_BINARY, BINARY_ENV, LEGACY_BINARY_ENV, fallback_name=LEGACY_BINARY),
             PRIMARY_BINARY,
         )
-        adapter_argv, agent_config = _adapter_argv(binary, parsed, include_effort=True)
+        adapter_argv, agent_config = _adapter_argv(
+            binary, parsed, include_effort=True, include_watchdog=True
+        )
         _log_dispatch("codex", parsed.agent_name, binary, agent_config or None)
         os.execv(binary, adapter_argv)
         return 0
@@ -307,6 +335,12 @@ def main(argv: list[str] | None = None) -> int:
         adapter_argv, agent_config = _adapter_argv(binary, parsed, include_effort=True)
         _log_dispatch("kimi", parsed.agent_name, binary, agent_config or None)
         os.execv(binary, adapter_argv)
+        return 0
+
+    if _claude_route(parsed):
+        binary = _require_binary(_resolve_native_claude(full_argv[0]), "claude")
+        _log_dispatch("claude", parsed.agent_name, binary)
+        os.execv(binary, full_argv)
         return 0
 
     binary = _require_binary(_resolve_native_claude(full_argv[0]), "claude")

@@ -13,10 +13,23 @@ rejected in favour of path 2 per the user's direction.
 
 from __future__ import annotations
 
+import json
+import subprocess
 from pathlib import Path
 from unittest.mock import patch
 
+import pytest
+from claude_teams import messaging as cs_messaging  # type: ignore[import-untyped]
+
+from claude_anyteam import protocol_io as pio
 from claude_anyteam import codex as codex_mod
+
+
+@pytest.fixture
+def events_root(tmp_path: Path, monkeypatch):
+    base = tmp_path / "home" / ".claude" / "teams"
+    monkeypatch.setattr(cs_messaging, "TEAMS_DIR", base)
+    return base
 
 
 class _FakeCompletedProcess:
@@ -144,3 +157,82 @@ def test_fresh_exec_still_includes_schema_and_cwd():
     assert "-C" in argv
     # No `resume` positional.
     assert "resume" not in argv
+
+
+def test_codex_exec_sets_task_id_env_for_wrapper(events_root, tmp_path):
+    captured: dict = {}
+
+    def fake_run(args, **kwargs):
+        captured["env"] = kwargs.get("env")
+        return subprocess.CompletedProcess(args, 0, stdout="", stderr="")
+
+    with patch.object(codex_mod.subprocess, "run", side_effect=fake_run):
+        codex_mod.run(
+            prompt="noop",
+            cwd=tmp_path,
+            schema=None,
+            codex_binary="codex",
+            wrapper_identity=("team-x", "codex-a"),
+            task_id="58",
+        )
+
+    assert captured["env"]["CLAUDE_ANYTEAM_TASK_ID"] == "58"
+
+
+def test_codex_exec_emits_headless_turn_digest(events_root, tmp_path):
+    stdout = "\n".join([
+        json.dumps({"type": "thread.started", "thread_id": "thread-1"}),
+        json.dumps({"type": "mcp_tool_call", "name": "send_message"}),
+    ])
+
+    def fake_run(args, **_):
+        return subprocess.CompletedProcess(args, 0, stdout=stdout, stderr="")
+
+    with patch.object(codex_mod.subprocess, "run", side_effect=fake_run):
+        result = codex_mod.run(
+            prompt="noop",
+            cwd=tmp_path,
+            schema=None,
+            codex_binary="codex",
+            wrapper_identity=("team-x", "codex-a"),
+            task_id="19",
+        )
+
+    assert result.exit_code == 0
+    assert result.tool_call_events == 1
+    events = pio.read_visibility_events("team-x", "codex-a")
+    assert [event.kind for event in events] == ["turn_started", "tool_event", "turn_completed"]
+    assert events[0].backend == "codex_exec"
+    assert events[0].task_id == "19"
+    assert events[1].payload["raw_backend_type"] == "mcp_tool_call"
+    assert events[1].payload["tool_name"] == "send_message"
+    assert events[2].payload["tool_call_events"] == 1
+    assert events[2].payload["events"][1]["name"] == "send_message"
+
+
+def test_codex_exec_digest_marks_task_complete_json_structured_without_schema(
+    events_root, tmp_path
+):
+    payload = {"files_changed": ["src/app.py"], "summary": "Renamed app module"}
+
+    def fake_run(args, **_):
+        last_message_path = Path(args[args.index("--output-last-message") + 1])
+        last_message_path.write_text(json.dumps(payload), encoding="utf-8")
+        return subprocess.CompletedProcess(args, 0, stdout="", stderr="")
+
+    with patch.object(codex_mod.subprocess, "run", side_effect=fake_run):
+        result = codex_mod.run(
+            prompt="noop",
+            cwd=tmp_path,
+            schema=None,
+            codex_binary="codex",
+            wrapper_identity=("team-x", "codex-a"),
+            resume_session_id="session-1",
+            task_id="19",
+        )
+
+    assert result.exit_code == 0
+    assert result.structured is None
+    events = pio.read_visibility_events("team-x", "codex-a")
+    assert events[-1].kind == "turn_completed"
+    assert events[-1].payload["structured"] is True

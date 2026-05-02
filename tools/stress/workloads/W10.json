@@ -1,0 +1,14 @@
+{
+  "schema_version": 1,
+  "workload_id": "W10",
+  "name": "cross-backend-rendezvous",
+  "description": "Two different backends rendezvous by peer-DM, agree on a shared marker, and write the agreed marker into the sandbox without duplicate prose fallback noise.",
+  "lead_prompt_template": "In {repo}, {assigned_to_a} and {assigned_to_b} must rendezvous across backends using peer-DM, agree on a marker string, and commit it to `RENDEZVOUS_AGREEMENT.txt`. Exactly one substantive reply per question; avoid canned fallback duplicates.",
+  "tasks_per_run": 1,
+  "min_team_size": 2,
+  "success_check": {
+    "type": "files_modified",
+    "args": {"max_files": 2, "must_include": ["RENDEZVOUS_AGREEMENT.txt"], "agreement_marker_required": true}
+  },
+  "primary_metrics": ["M3", "M4", "M7", "M11", "M13"]
+}

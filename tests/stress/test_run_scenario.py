@@ -1,0 +1,789 @@
+from __future__ import annotations
+
+import json
+import os
+import sys
+from pathlib import Path
+from types import SimpleNamespace
+from unittest.mock import Mock
+
+import pytest
+
+REPO_ROOT = Path(__file__).resolve().parents[2]
+if str(REPO_ROOT) not in sys.path:
+    sys.path.insert(0, str(REPO_ROOT))
+
+from claude_teams import messaging as cs_messaging
+from claude_teams import tasks as cs_tasks
+from claude_teams import teams as cs_teams
+from tools.stress import run_scenario
+
+
+@pytest.fixture
+def isolated_protocol_roots(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> tuple[Path, Path]:
+    teams_root = tmp_path / "home" / ".claude" / "teams"
+    tasks_root = tmp_path / "home" / ".claude" / "tasks"
+    monkeypatch.setattr(cs_teams, "TEAMS_DIR", teams_root)
+    monkeypatch.setattr(cs_teams, "TASKS_DIR", tasks_root)
+    monkeypatch.setattr(cs_tasks, "TASKS_DIR", tasks_root)
+    monkeypatch.setattr(cs_messaging, "TEAMS_DIR", teams_root)
+    # run_scenario defaults to cleaning /tmp/stress-sandbox-*; keep unit tests
+    # hermetic and let individual cleanup tests opt into a tmp_path root.
+    monkeypatch.setattr(run_scenario, "STRESS_SANDBOX_ROOT", tmp_path / "stress-root")
+    return teams_root, tasks_root
+
+
+def _fake_scorer_modules(*, fail: str | None = None):
+    def throughput_score(*, events_dir: Path, scenario: str, run_id: str, out: Path):
+        if fail == "throughput":
+            raise RuntimeError("boom-throughput")
+        doc = {
+            "schema_version": 1,
+            "scenario": scenario,
+            "run_id": run_id,
+            "aggregate": {
+                "M1_throughput_per_min": {"sum": 1.5, "mean": 0.5, "min": 0.4, "max": 0.6},
+                "M5_turn_failed_rate": {"weighted_mean": 0.1},
+                "M11b_team_p95_turn_duration_seconds": 84.0,
+            },
+            "per_agent_files": ["agents/codex-tgt-app.json"],
+        }
+        (out / "agents").mkdir(parents=True, exist_ok=True)
+        (out / "agents" / "codex-tgt-app.json").write_text(json.dumps({"agent": "codex-tgt-app"}) + "\n")
+        (out / "scenario.json").write_text(json.dumps(doc) + "\n")
+        return doc
+
+    def collab_score(*, events_dir: Path, scenario: str, run_id: str, out: Path):
+        if fail == "collab":
+            raise RuntimeError("boom-collab")
+        doc = {
+            "schema_version": 1,
+            "scenario": scenario,
+            "run_id": run_id,
+            "aggregate": {
+                "M4_team_cross_peer_ratio": 0.75,
+                "M9_team_steer_ack_rate": 0.9,
+                "M11a_team_p95_rtt_seconds": 42.0,
+                "samples_used_for_M11a": 7,
+                "M11a_p50": 12.0,
+                "M11a_max": 99.0,
+                "M13_total_collisions": 0,
+            },
+            "per_agent_files": ["agents/codex-tgt-app.json"],
+            "pair_file": "pairs.json",
+        }
+        agent_doc = {
+            "agent": "codex-tgt-app",
+            "metrics": {
+                "M11a_peer_dm_rtt_seconds_by_recipient_backend": {
+                    "gemini_acp": {"p50": None, "p95": None, "max": 12.0, "samples": 1},
+                    "kimi_headless": {"p50": None, "p95": None, "max": None, "samples": 0},
+                }
+            },
+        }
+        (out / "agents").mkdir(parents=True, exist_ok=True)
+        (out / "agents" / "codex-tgt-app.json").write_text(json.dumps(agent_doc) + "\n")
+        (out / "pairs.json").write_text(json.dumps({"pairs": []}) + "\n")
+        (out / "scenario.json").write_text(json.dumps(doc) + "\n")
+        return doc
+
+    def quality_score(*, events_dir: Path, sandbox: Path, workload_manifest: Path, scenario: str, run_id: str, out: Path):
+        if fail == "quality":
+            raise RuntimeError("boom-quality")
+        doc = {
+            "schema_version": 1,
+            "scenario": scenario,
+            "run_id": run_id,
+            "task_verdicts": {"pass": 1, "fail": 0, "deferred": 0, "manual_pending": 0, "unknown_check": 0},
+            "task_pass_rate": 1.0,
+            "M6_team_total_visibility_degraded": 0,
+            "M7_team_total_capability_manifest_calls": 1,
+            "M12_team_average_coverage_ratio": 0.8,
+            "M12_backends_below_threshold": [],
+            "s1_flatten_violations": [],
+            "per_task_files": ["tasks/1.json"],
+            "per_agent_files": ["agents/codex-tgt-app.json"],
+        }
+        (out / "tasks").mkdir(parents=True, exist_ok=True)
+        (out / "agents").mkdir(parents=True, exist_ok=True)
+        (out / "tasks" / "1.json").write_text(json.dumps({"task_id": "1", "verdict": "pass"}) + "\n")
+        (out / "agents" / "codex-tgt-app.json").write_text(json.dumps({"agent": "codex-tgt-app", "s1_flatten_violations": []}) + "\n")
+        (out / "scenario.json").write_text(json.dumps(doc) + "\n")
+        return doc
+
+    return (
+        SimpleNamespace(score=Mock(side_effect=throughput_score)),
+        SimpleNamespace(score=Mock(side_effect=collab_score)),
+        SimpleNamespace(score=Mock(side_effect=quality_score)),
+    )
+
+
+@pytest.fixture
+def fake_scorers(monkeypatch: pytest.MonkeyPatch):
+    modules = _fake_scorer_modules()
+    monkeypatch.setattr(run_scenario, "_load_scorers", lambda: modules)
+    return modules
+
+
+def _workload(name: str = "W1.json") -> Path:
+    return Path("tools/stress/workloads") / name
+
+
+def _invoke(tmp_path: Path, scenario: str, workload: str = "W1.json", run_id: str = "20260427T1530Z", extra: list[str] | None = None) -> tuple[int, Path, Path]:
+    out = tmp_path / "runs" / f"{scenario}-{run_id}"
+    sandbox = tmp_path / "sandbox"
+    argv = [
+        "--scenario",
+        scenario,
+        "--run-id",
+        run_id,
+        "--workload-manifest",
+        str(_workload(workload)),
+        "--sandbox",
+        str(sandbox),
+        "--out",
+        str(out),
+        "--dry-run",
+    ]
+    if extra:
+        argv.extend(extra)
+    return run_scenario.main(argv), out, sandbox
+
+
+def _scorecard(out: Path) -> dict:
+    return json.loads((out / "scorecard.json").read_text())
+
+
+def _mark_stress_sandbox(path: Path) -> None:
+    path.mkdir(parents=True, exist_ok=True)
+    (path / run_scenario.STRESS_SANDBOX_MARKER).write_text("stress sandbox\n")
+
+
+def test_cleanup_sandbox_explicit_flag_removes_marked_prior_sandbox(
+    isolated_protocol_roots,
+    fake_scorers,
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+) -> None:
+    monkeypatch.setattr(run_scenario, "STRESS_SANDBOX_ROOT", tmp_path)
+    prior = tmp_path / "stress-sandbox-old-run"
+    _mark_stress_sandbox(prior)
+
+    rc, _, sandbox = _invoke(
+        tmp_path,
+        "S1",
+        run_id="CLEANUP-EXPLICIT",
+        extra=["--cleanup-sandbox"],
+    )
+
+    assert rc == 0
+    assert not prior.exists()
+    assert (sandbox / run_scenario.STRESS_SANDBOX_MARKER).is_file()
+
+
+def test_no_cleanup_sandbox_preserves_prior_sandboxes(
+    isolated_protocol_roots,
+    fake_scorers,
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+) -> None:
+    monkeypatch.setattr(run_scenario, "STRESS_SANDBOX_ROOT", tmp_path)
+    prior = tmp_path / "stress-sandbox-old-run"
+    _mark_stress_sandbox(prior)
+
+    rc, _, sandbox = _invoke(
+        tmp_path,
+        "S1",
+        run_id="NO-CLEANUP",
+        extra=["--no-cleanup-sandbox"],
+    )
+
+    assert rc == 0
+    assert prior.is_dir()
+    assert (prior / run_scenario.STRESS_SANDBOX_MARKER).is_file()
+    assert (sandbox / run_scenario.STRESS_SANDBOX_MARKER).is_file()
+
+
+def test_cleanup_sandbox_preserves_active_peer_sandboxes(
+    isolated_protocol_roots,
+    fake_scorers,
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+) -> None:
+    monkeypatch.setattr(run_scenario, "STRESS_SANDBOX_ROOT", tmp_path)
+    current = tmp_path / "stress-sandbox-current"
+    active_peer = tmp_path / "stress-sandbox-active-peer"
+    stale = tmp_path / "stress-sandbox-stale"
+    _mark_stress_sandbox(current)
+    _mark_stress_sandbox(stale)
+    marker = run_scenario.write_sandbox_marker(
+        active_peer,
+        scenario_id="S6",
+        run_id="ACTIVE-PEER",
+    )
+
+    removed = run_scenario.cleanup_stress_sandboxes(current)
+
+    assert stale in removed
+    assert not stale.exists()
+    assert active_peer.is_dir()
+    assert run_scenario.sandbox_marker_is_active(marker)
+    assert current.is_dir()
+
+
+def test_write_sandbox_marker_records_active_owner_pid(tmp_path: Path) -> None:
+    marker = run_scenario.write_sandbox_marker(
+        tmp_path / "stress-sandbox-marker",
+        scenario_id="S6",
+        run_id="MARKER",
+    )
+
+    payload = json.loads(marker.read_text(encoding="utf-8"))
+    assert payload["kind"] == run_scenario.STRESS_SANDBOX_MARKER_KIND
+    assert payload["state"] == "active"
+    assert payload["owner_pid"] == os.getpid()
+    assert run_scenario.sandbox_marker_is_active(marker)
+
+
+def test_run_scenario_marks_sandbox_completed_after_return(
+    isolated_protocol_roots,
+    fake_scorers,
+    tmp_path: Path,
+) -> None:
+    rc, _, sandbox = _invoke(tmp_path, "S1", run_id="MARKER-COMPLETED")
+
+    assert rc == 0
+    payload = json.loads((sandbox / run_scenario.STRESS_SANDBOX_MARKER).read_text())
+    assert payload["state"] == "completed"
+    assert "completed_at" in payload
+    assert not run_scenario.sandbox_marker_is_active(
+        sandbox / run_scenario.STRESS_SANDBOX_MARKER
+    )
+
+
+def test_mark_sandbox_marker_aborted_writes_aborted_state(tmp_path: Path) -> None:
+    sandbox = tmp_path / "stress-sandbox-aborted"
+    marker = run_scenario.write_sandbox_marker(
+        sandbox, scenario_id="S6", run_id="ABORTED"
+    )
+    assert json.loads(marker.read_text(encoding="utf-8"))["state"] == "active"
+
+    run_scenario.mark_sandbox_marker_aborted(sandbox, reason="SIGTERM")
+
+    payload = json.loads(marker.read_text(encoding="utf-8"))
+    assert payload["state"] == "aborted"
+    assert "aborted_at" in payload
+    assert payload["aborted_reason"] == "SIGTERM"
+    # An aborted marker is no longer "active"; cleanup may remove it.
+    assert not run_scenario.sandbox_marker_is_active(marker)
+
+
+def test_mark_completed_preserves_aborted_state(tmp_path: Path) -> None:
+    """Defense: the finally-driven completed call must NOT erase an aborted state.
+
+    Phase4 #20: the SIGTERM handler marks aborted, then control returns to the
+    finally block which calls mark_sandbox_marker_completed. Without this
+    defense, completed would silently overwrite the aborted state and the
+    operational verdict would be wrong.
+    """
+
+    sandbox = tmp_path / "stress-sandbox-aborted-then-completed"
+    marker = run_scenario.write_sandbox_marker(
+        sandbox, scenario_id="S6", run_id="DEFENSE"
+    )
+
+    run_scenario.mark_sandbox_marker_aborted(sandbox, reason="SIGTERM")
+    aborted_payload = json.loads(marker.read_text(encoding="utf-8"))
+    assert aborted_payload["state"] == "aborted"
+
+    run_scenario.mark_sandbox_marker_completed(sandbox)
+
+    payload_after = json.loads(marker.read_text(encoding="utf-8"))
+    assert payload_after["state"] == "aborted"
+    assert payload_after.get("aborted_reason") == "SIGTERM"
+    assert "completed_at" not in payload_after
+
+
+def test_install_abort_signal_handlers_marks_aborted_on_sigterm(
+    tmp_path: Path,
+) -> None:
+    """Sending SIGTERM after install must flip the marker to aborted.
+
+    The handler exits with SystemExit(143) (conventional SIGTERM exit code);
+    we let pytest catch it and assert on the marker side-effect.
+    """
+
+    import signal as _signal
+
+    sandbox = tmp_path / "stress-sandbox-sigterm"
+    marker = run_scenario.write_sandbox_marker(
+        sandbox, scenario_id="S6", run_id="SIGTERM-PATH"
+    )
+
+    prior_term = _signal.signal(_signal.SIGTERM, _signal.SIG_DFL)
+    prior_int = _signal.signal(_signal.SIGINT, _signal.SIG_DFL)
+    try:
+        run_scenario._install_abort_signal_handlers(sandbox)
+        with pytest.raises(SystemExit) as exc_info:
+            _signal.raise_signal(_signal.SIGTERM)
+        assert exc_info.value.code == 143
+        payload = json.loads(marker.read_text(encoding="utf-8"))
+        assert payload["state"] == "aborted"
+        assert payload["aborted_reason"] == "SIGTERM"
+    finally:
+        _signal.signal(_signal.SIGTERM, prior_term)
+        _signal.signal(_signal.SIGINT, prior_int)
+
+
+def test_cleanup_sandbox_marker_safety_preserves_unmarked_pattern_dirs(
+    isolated_protocol_roots,
+    fake_scorers,
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+) -> None:
+    monkeypatch.setattr(run_scenario, "STRESS_SANDBOX_ROOT", tmp_path)
+    marked = tmp_path / "stress-sandbox-marked"
+    _mark_stress_sandbox(marked)
+    unmarked = tmp_path / "stress-sandbox-user-data"
+    unmarked.mkdir()
+    (unmarked / "do-not-delete.txt").write_text("not owned by stress harness\n")
+
+    rc, _, _ = _invoke(tmp_path, "S1", run_id="MARKER-SAFETY")
+
+    assert rc == 0
+    assert not marked.exists()
+    assert unmarked.is_dir()
+    assert (unmarked / "do-not-delete.txt").is_file()
+
+
+def test_cleanup_sandbox_never_removes_current_sandbox(
+    isolated_protocol_roots,
+    fake_scorers,
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+) -> None:
+    monkeypatch.setattr(run_scenario, "STRESS_SANDBOX_ROOT", tmp_path)
+    current = tmp_path / "stress-sandbox-current"
+    _mark_stress_sandbox(current)
+    (current / "keep.txt").write_text("belongs to this run\n")
+    out = tmp_path / "runs" / "current"
+
+    rc = run_scenario.main(
+        [
+            "--scenario",
+            "S1",
+            "--run-id",
+            "CURRENT-SANDBOX",
+            "--workload-manifest",
+            str(_workload()),
+            "--sandbox",
+            str(current),
+            "--out",
+            str(out),
+            "--dry-run",
+            "--cleanup-sandbox",
+        ]
+    )
+
+    assert rc == 0
+    assert (current / "keep.txt").is_file()
+    assert (current / run_scenario.STRESS_SANDBOX_MARKER).is_file()
+
+
+def test_cleanup_sandbox_help_documents_default_and_marker_safety() -> None:
+    help_text = run_scenario.build_parser().format_help()
+    normalized_help = " ".join(help_text.split())
+
+    assert "--cleanup-sandbox" in help_text
+    assert "--no-cleanup-sandbox" in help_text
+    assert "/tmp/stress-sandbox-*" in help_text
+    assert run_scenario.STRESS_SANDBOX_MARKER in help_text
+    assert "active runner-owned sandboxes are preserved" in normalized_help
+
+
+def test_run_scenario_fails_before_team_creation_when_repo_init_missing(
+    isolated_protocol_roots,
+    fake_scorers,
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+    capsys: pytest.CaptureFixture[str],
+) -> None:
+    monkeypatch.setattr(run_scenario, "init_sandbox_repo", lambda repo: None)
+    create_team = Mock()
+    monkeypatch.setattr(run_scenario, "create_stress_team", create_team)
+
+    rc, _, _ = _invoke(tmp_path, "S1", run_id="MISSING-REPO")
+
+    assert rc == 1
+    assert "sandbox repo was not initialized before teammate spawn" in capsys.readouterr().err
+    create_team.assert_not_called()
+
+
+def test_dry_run_S1(isolated_protocol_roots, fake_scorers, tmp_path: Path) -> None:
+    rc, out, _ = _invoke(tmp_path, "S1")
+
+    assert rc == 0
+    card = _scorecard(out)
+    assert card["scorecards"] == {
+        "throughput": "throughput/scenario.json",
+        "collab": "collab/scenario.json",
+        "quality": "quality/scenario.json",
+    }
+    assert (out / "events").exists()
+
+
+def test_scorecard_records_run_time_and_scoring_time_git_shas(
+    isolated_protocol_roots,
+    fake_scorers,
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+) -> None:
+    git_sha = Mock(side_effect=["run-start-sha", "score-time-sha"])
+    monkeypatch.setattr(run_scenario, "_git_sha", git_sha)
+
+    rc, out, _ = _invoke(tmp_path, "S1")
+
+    assert rc == 0
+    card = _scorecard(out)
+    assert card["run_time_git_sha"] == "run-start-sha"
+    assert card["scoring_time_git_sha"] == "score-time-sha"
+    assert card["git_sha"] == "run-start-sha"
+
+
+def test_dry_run_S5_mixed(isolated_protocol_roots, fake_scorers, tmp_path: Path) -> None:
+    rc, out, _ = _invoke(tmp_path, "S5", workload="W9.json")
+
+    assert rc == 0
+    agent_doc = json.loads((out / "collab" / "agents" / "codex-tgt-app.json").read_text())
+    by_backend = agent_doc["metrics"]["M11a_peer_dm_rtt_seconds_by_recipient_backend"]
+    assert "gemini_acp" in by_backend
+    headline = _scorecard(out)["headline_metrics"]
+    assert headline["M11a_team_p95_rtt_seconds"] == 42.0
+    assert headline["samples_used_for_M11a"] == 7
+    assert headline["M11a_p50"] == 12.0
+    assert headline["M11a_max"] == 99.0
+    assert headline["M11b_team_p95_turn_duration_seconds"] == 84.0
+
+
+def test_dry_run_S10a_ablation(isolated_protocol_roots, fake_scorers, tmp_path: Path) -> None:
+    rc, out, _ = _invoke(tmp_path, "S10a")
+
+    assert rc == 0
+    card = _scorecard(out)
+    assert card["env_overrides"] == {"CLAUDE_ANYTEAM_DISABLE_PEER_PROMPT_FRAGMENTS": "1"}
+    assert card["ablation_against"] == "S5"
+
+
+def test_dry_run_S10b_ablation(isolated_protocol_roots, fake_scorers, tmp_path: Path) -> None:
+    rc, out, _ = _invoke(tmp_path, "S10b")
+
+    assert rc == 0
+    assert _scorecard(out)["env_overrides"] == {
+        "CLAUDE_ANYTEAM_DISABLE_PEER_PROMPT_FRAGMENTS": "1",
+        "CLAUDE_ANYTEAM_DISABLE_MANIFEST_CACHE": "1",
+    }
+
+
+def test_dry_run_S10c_ablation(isolated_protocol_roots, fake_scorers, tmp_path: Path) -> None:
+    rc, out, _ = _invoke(tmp_path, "S10c")
+
+    assert rc == 0
+    card = _scorecard(out)
+    assert card["env_overrides"] == {
+        "CLAUDE_ANYTEAM_DISABLE_PEER_STEER_MANIFEST_CHECK": "1"
+    }
+    assert card["ablation_against"] == "S6"
+
+
+def test_unknown_scenario_id(isolated_protocol_roots, fake_scorers, tmp_path: Path, capsys: pytest.CaptureFixture[str]) -> None:
+    rc, _, _ = _invoke(tmp_path, "S404")
+
+    assert rc == 1
+    assert "unknown scenario" in capsys.readouterr().err
+
+
+def test_workload_manifest_missing(isolated_protocol_roots, fake_scorers, tmp_path: Path, capsys: pytest.CaptureFixture[str]) -> None:
+    out = tmp_path / "runs" / "missing"
+    sandbox = tmp_path / "sandbox"
+    rc = run_scenario.main(
+        [
+            "--scenario",
+            "S1",
+            "--run-id",
+            "MISSING",
+            "--workload-manifest",
+            str(tmp_path / "missing.json"),
+            "--sandbox",
+            str(sandbox),
+            "--out",
+            str(out),
+            "--dry-run",
+        ]
+    )
+
+    assert rc == 1
+    assert "workload manifest missing" in capsys.readouterr().err
+
+
+def test_command_for_member_constructs_claude_invocation(monkeypatch, tmp_path: Path) -> None:
+    sandbox = tmp_path / "sandbox"
+    monkeypatch.setattr(run_scenario, "_resolve_backend_binary", lambda name: f"/usr/bin/{name}")
+
+    cmd = run_scenario._command_for_member(
+        {"name": "claude-tgt-a", "agent_type": "claude", "model": "sonnet"},
+        "stress-S2-20260427T1530Z",
+        sandbox,
+    )
+
+    assert cmd is not None
+    assert cmd[:3] == [sys.executable, "-m", "claude_anyteam.backends.claude_native.cli"]
+    assert "--print" not in cmd
+    assert "--agent-id" not in cmd
+    assert "--agent-name" not in cmd
+    assert "--team-name" not in cmd
+    assert "--team" in cmd
+    assert cmd[cmd.index("--team") + 1] == "stress-S2-20260427T1530Z"
+    assert "--name" in cmd
+    assert cmd[cmd.index("--name") + 1] == "claude-tgt-a"
+    assert "--cwd" in cmd
+    assert cmd[cmd.index("--cwd") + 1] == str(sandbox / "repo")
+    assert "--claude-binary" in cmd
+    assert cmd[cmd.index("--claude-binary") + 1] == "/usr/bin/claude"
+    assert "--model" in cmd
+    assert cmd[cmd.index("--model") + 1] == "sonnet"
+
+
+def test_spawn_teammates_uses_native_claude_headless_bridge_argv(
+    isolated_protocol_roots,
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+) -> None:
+    sandbox = tmp_path / "sandbox"
+    scenario = {
+        "members": [
+            {"name": "claude-tgt-a", "agent_type": "claude", "model": "sonnet"},
+        ]
+    }
+    run_scenario.init_sandbox_repo(sandbox / "repo")
+    run_scenario.create_stress_team("stress-S2-test", scenario, sandbox)
+
+    popen_calls: list[dict] = []
+
+    class FakePopen:
+        def __init__(self, cmd, cwd=None, env=None, stdout=None, stderr=None):
+            popen_calls.append({"cmd": cmd, "cwd": cwd, "env": env})
+
+        def poll(self):
+            return 0
+
+        def wait(self, timeout=None):
+            return 0
+
+    monkeypatch.setattr(run_scenario.subprocess, "Popen", FakePopen)
+    monkeypatch.setattr(run_scenario, "_resolve_backend_binary", lambda name: f"/usr/bin/{name}")
+
+    notes: list[str] = []
+    procs = run_scenario.spawn_teammates(
+        "stress-S2-test",
+        scenario["members"],
+        env={"CLAUDECODE": "1", "CLAUDE_CODE_EXPERIMENTAL_AGENT_TEAMS": "1"},
+        sandbox=sandbox,
+        notes=notes,
+    )
+
+    assert notes == []
+    assert set(procs) == {"claude-tgt-a"}
+    cmd = popen_calls[0]["cmd"]
+    assert cmd[:3] == [sys.executable, "-m", "claude_anyteam.backends.claude_native.cli"]
+    assert "--team" in cmd
+    assert cmd[cmd.index("--team") + 1] == "stress-S2-test"
+    assert "--name" in cmd
+    assert cmd[cmd.index("--name") + 1] == "claude-tgt-a"
+    assert "--color" in cmd
+    assert cmd[cmd.index("--color") + 1] == "blue"
+    assert "--claude-binary" in cmd
+    assert cmd[cmd.index("--claude-binary") + 1] == "/usr/bin/claude"
+    assert "--agent-id" not in cmd
+    assert "--print" not in cmd
+    assert popen_calls[0]["cwd"] == sandbox / "repo"
+
+
+def test_command_for_member_passes_explicit_gemini_binary(monkeypatch, tmp_path: Path) -> None:
+    """§3 spawn-correctness: gemini members must pass --gemini-binary with the
+    absolute path resolved at construction time, NOT default to PATH-resolved
+    `gemini` (which under stress-spawn context can shadow with a sibling
+    `gemini-anyteam` shim that doesn't accept --version, killing S3 at the
+    feature_test step). Filed as task #42 from the S3 launch failure."""
+    fake_gemini = tmp_path / "fake_gemini"
+    fake_gemini.write_text("#!/bin/sh\necho gemini 2.5\n", encoding="utf-8")
+    fake_gemini.chmod(0o755)
+    monkeypatch.setattr(run_scenario.shutil, "which", lambda name: str(fake_gemini) if name == "gemini" else None)
+
+    cmd = run_scenario._command_for_member(
+        {"name": "gemini-tgt-a", "agent_type": "gemini", "model": "gemini-2.5-pro", "transport": "acp"},
+        "stress-S3-test",
+        tmp_path,
+    )
+
+    assert cmd is not None
+    assert "--gemini-binary" in cmd, "gemini spawn must pass --gemini-binary explicitly"
+    assert cmd[cmd.index("--gemini-binary") + 1] == str(fake_gemini), \
+        "gemini-binary must be an absolute path, not a name to PATH-resolve"
+    assert "--model" in cmd
+    assert cmd[cmd.index("--model") + 1] == "gemini-2.5-pro"
+
+
+def test_command_for_member_passes_explicit_kimi_binary(monkeypatch, tmp_path: Path) -> None:
+    """Same §3 spawn-correctness as gemini: kimi members must pass --kimi-binary
+    explicitly. Defensive: kimi-cli could resolve to a sibling shim under PATH
+    pressure too. Same fix shape per task #42."""
+    fake_kimi = tmp_path / "fake_kimi"
+    fake_kimi.write_text("#!/bin/sh\necho kimi-cli 0.1\n", encoding="utf-8")
+    fake_kimi.chmod(0o755)
+    monkeypatch.setattr(run_scenario.shutil, "which", lambda name: str(fake_kimi) if name == "kimi" else None)
+
+    cmd = run_scenario._command_for_member(
+        {"name": "kimi-tgt-a", "agent_type": "kimi", "model": "kimi-k2"},
+        "stress-S4-test",
+        tmp_path,
+    )
+
+    assert cmd is not None
+    assert "--kimi-binary" in cmd, "kimi spawn must pass --kimi-binary explicitly"
+    assert cmd[cmd.index("--kimi-binary") + 1] == str(fake_kimi)
+    assert "--backend" in cmd  # default headless transport
+
+
+def test_kimi_scenario_members_dont_specify_unknown_model(tmp_path: Path) -> None:
+    """SCENARIOS spec for kimi members must NOT pass `model` to the kimi adapter.
+
+    Background: S4 (homogeneous-kimi, 20260427T0929Z) failed when every kimi
+    turn exited with `"LLM not set"` to stdout. Root cause: the SCENARIOS dict
+    specified `model: "kimi-k2"` for every kimi member, which the adapter
+    forwarded as `--model kimi-k2` to the kimi CLI; the kimi CLI's config
+    (~/.kimi/config.toml) defines models like `kimi-code/kimi-for-coding` and
+    rejected `kimi-k2` as unknown. Each turn died in 5.979s with structured=False.
+
+    Fix: drop the `model` field from kimi scenario specs; let kimi use its
+    config.toml `default_model`. Stress runs measure the harness as it ships,
+    not a model the user doesn't have configured.
+
+    This test asserts the SCENARIOS dict invariant so future edits don't
+    re-introduce a model spec the kimi CLI doesn't recognize.
+    """
+    for scenario_id, scenario in run_scenario.SCENARIOS.items():
+        for member in scenario.get("members", []):
+            if member.get("agent_type") == "kimi":
+                assert "model" not in member, (
+                    f"SCENARIOS[{scenario_id!r}] kimi member {member['name']!r} "
+                    f"specifies model={member.get('model')!r}; remove `model` "
+                    f"so kimi CLI uses its config.toml default. See task #46 "
+                    f"(S4 'LLM not set' root cause, 2026-04-27)."
+                )
+
+
+def test_command_for_member_raises_when_backend_binary_missing(monkeypatch, tmp_path: Path) -> None:
+    """Fail loud if the gemini/kimi binary isn't on PATH — better than silently
+    spawning a broken adapter that wastes 1800s on a feature_test timeout."""
+    monkeypatch.setattr(run_scenario.shutil, "which", lambda name: None)
+
+    with pytest.raises(FileNotFoundError) as exc_info:
+        run_scenario._command_for_member(
+            {"name": "gemini-tgt-a", "agent_type": "gemini"},
+            "stress-test",
+            tmp_path,
+        )
+    assert "gemini" in str(exc_info.value)
+    assert "not found on PATH" in str(exc_info.value)
+
+
+def test_archive_paths(isolated_protocol_roots, fake_scorers, tmp_path: Path) -> None:
+    rc, out, _ = _invoke(tmp_path, "S1")
+
+    assert rc == 0
+    assert (out / "events").is_dir()
+    assert (out / "tasks").is_dir()
+    assert (out / "team-config.json").is_file()
+    assert (out / "workload-manifest.json").is_file()
+    assert (out / "throughput" / "scenario.json").is_file()
+    assert (out / "collab" / "scenario.json").is_file()
+    assert (out / "quality" / "scenario.json").is_file()
+
+
+def test_unified_scorecard_headline_metrics_present(isolated_protocol_roots, fake_scorers, tmp_path: Path) -> None:
+    rc, out, _ = _invoke(tmp_path, "S1")
+
+    assert rc == 0
+    card = _scorecard(out)
+    for key in run_scenario.HEADLINE_KEYS:
+        assert key in card["headline_metrics"]
+    assert "s1_flatten_violations" in card
+    assert "north_star_signals" in card
+
+
+def test_scorer_failure_caught(isolated_protocol_roots, monkeypatch: pytest.MonkeyPatch, tmp_path: Path) -> None:
+    modules = _fake_scorer_modules(fail="collab")
+    monkeypatch.setattr(run_scenario, "_load_scorers", lambda: modules)
+
+    rc, out, _ = _invoke(tmp_path, "S1")
+
+    assert rc == 3
+    card = _scorecard(out)
+    assert any(note.startswith("scorer_failure:") for note in card["notes"])
+
+
+def test_team_already_exists(isolated_protocol_roots, fake_scorers, tmp_path: Path, capsys: pytest.CaptureFixture[str]) -> None:
+    cs_teams.create_team("stress-S1-EXISTS", session_id="preexisting")
+
+    rc, _, _ = _invoke(tmp_path, "S1", run_id="EXISTS")
+
+    assert rc == 2
+    assert "team already exists" in capsys.readouterr().err
+
+
+def test_workload_manifest_w8_chained_delegation() -> None:
+    manifest = json.loads(_workload("W8.json").read_text())
+
+    assert manifest["workload_id"] == "W8"
+    assert manifest["success_check"]["type"] == "files_modified"
+    assert manifest["success_check"]["args"]["min_distinct_authors"] == 2
+    assert manifest["success_check"]["args"]["handoff_required"] is True
+
+
+def test_workload_manifest_w9_capability_aware() -> None:
+    manifest = json.loads(_workload("W9.json").read_text())
+
+    assert manifest["workload_id"] == "W9"
+    assert manifest["metric_check"]["metric"] == "M7"
+    assert "M7" in json.dumps(manifest)
+
+
+def test_workload_manifest_w10_cross_backend() -> None:
+    manifest = json.loads(_workload("W10.json").read_text())
+
+    assert manifest["workload_id"] == "W10"
+    assert "RENDEZVOUS_AGREEMENT.txt" in manifest["success_check"]["args"]["must_include"]
+    assert manifest["success_check"]["args"]["agreement_marker_required"] is True
+
+
+def test_load_scorers_adds_project_root_when_missing(monkeypatch: pytest.MonkeyPatch) -> None:
+    """Regression: detached `setsid nohup python tools/stress/run_scenario.py`
+    invocations don't put the project root on sys.path, so `from tools.stress
+    import score_*` fails with ModuleNotFoundError. _load_scorers() must be
+    self-sufficient and add the project root if missing.
+    """
+    project_root = str(Path(run_scenario.__file__).resolve().parents[2])
+
+    saved_path = list(sys.path)
+    monkeypatch.setattr(sys, "path", [p for p in saved_path if p != project_root])
+    for mod in ("tools", "tools.stress"):
+        sys.modules.pop(mod, None)
+
+    assert project_root not in sys.path
+
+    throughput, collab, quality = run_scenario._load_scorers()
+
+    assert throughput.__name__ == "tools.stress.score_throughput"
+    assert collab.__name__ == "tools.stress.score_collab"
+    assert quality.__name__ == "tools.stress.score_quality"
+    assert project_root in sys.path

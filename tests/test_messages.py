@@ -9,11 +9,21 @@ from __future__ import annotations
 import json
 
 from claude_anyteam.messages import (
+    BatchSummaryChild,
+    BatchSummaryPayload,
+    IdleNotificationOut,
+    PermissionRequestOut,
+    PlanBlockedOut,
     PlanApprovalRequestIn,
+    PlanApprovalResponseIn,
+    ShutdownApprovedOut,
+    ShutdownRejectedOut,
     ShutdownRequestIn,
     ShutdownResponseOut,
+    TaskBlockedOut,
     TaskAssignmentIn,
     TaskCompleteOut,
+    VisibilityEvent,
     parse_protocol_text,
 )
 
@@ -87,20 +97,66 @@ def test_parse_extra_fields_tolerated():
     assert isinstance(p, ShutdownRequestIn)
 
 
-def test_shutdown_response_serializes_with_snake_case():
+def test_shutdown_approved_serializes_host_catalog_shape():
+    r = ShutdownApprovedOut(
+        request_id="abc",
+        from_="worker",
+        pane_id="in-process",
+        backend_type="codex",
+    )
+    as_dict = json.loads(r.model_dump_json(by_alias=True, exclude_none=True))
+    assert as_dict["type"] == "shutdown_approved"
+    assert as_dict["schema_version"] == 1
+    assert as_dict["requestId"] == "abc"
+    assert as_dict["from"] == "worker"
+    assert as_dict["paneId"] == "in-process"
+    assert as_dict["backendType"] == "codex"
+
+
+def test_shutdown_rejected_serializes_host_catalog_shape():
+    r = ShutdownRejectedOut(request_id="abc", from_="worker", reason="busy")
+    as_dict = json.loads(r.model_dump_json(by_alias=True, exclude_none=True))
+    assert as_dict["type"] == "shutdown_rejected"
+    assert as_dict["schema_version"] == 1
+    assert as_dict["requestId"] == "abc"
+    assert as_dict["from"] == "worker"
+    assert as_dict["reason"] == "busy"
+
+
+def test_parse_shutdown_approved_and_rejected_host_catalog_shapes():
+    approved = parse_protocol_text(
+        json.dumps({"type": "shutdown_approved", "requestId": "a1", "from": "worker", "timestamp": "ts"})
+    )
+    rejected = parse_protocol_text(
+        json.dumps({"type": "shutdown_rejected", "requestId": "r1", "from": "worker", "reason": "busy", "timestamp": "ts"})
+    )
+    assert isinstance(approved, ShutdownApprovedOut)
+    assert approved.request_id == "a1"
+    assert isinstance(rejected, ShutdownRejectedOut)
+    assert rejected.reason == "busy"
+
+
+def test_legacy_shutdown_response_alias_still_parses_for_one_release():
     r = ShutdownResponseOut(request_id="abc", approve=True)
     as_dict = json.loads(r.model_dump_json(by_alias=True, exclude_none=True))
     assert as_dict["type"] == "shutdown_response"
     assert as_dict["request_id"] == "abc"
     assert as_dict["approve"] is True
     assert "feedback" not in as_dict  # omitted when None
+    parsed = parse_protocol_text(json.dumps(as_dict))
+    assert isinstance(parsed, ShutdownResponseOut)
 
 
-def test_shutdown_response_with_feedback():
+def test_legacy_shutdown_response_alias_maps_to_host_catalog_shape():
     r = ShutdownResponseOut(request_id="abc", approve=False, feedback="busy")
-    as_dict = json.loads(r.model_dump_json(by_alias=True, exclude_none=True))
-    assert as_dict["approve"] is False
-    assert as_dict["feedback"] == "busy"
+    host = r.to_host_catalog("worker")
+    assert isinstance(host, ShutdownRejectedOut)
+    as_dict = json.loads(host.model_dump_json(by_alias=True, exclude_none=True))
+    assert as_dict["type"] == "shutdown_rejected"
+    assert as_dict["schema_version"] == 1
+    assert as_dict["requestId"] == "abc"
+    assert as_dict["from"] == "worker"
+    assert as_dict["reason"] == "busy"
 
 
 def test_task_complete_serializes_with_kind():
@@ -115,3 +171,127 @@ def test_task_complete_serializes_with_kind():
     assert as_dict["task_id"] == "7"
     assert as_dict["files_changed"] == ["src/foo.py"]
     assert as_dict["codex_exit_code"] == 0
+
+
+def test_batch_summary_payload_serializes_delegated_child_links():
+    payload = BatchSummaryPayload(
+        parent_task_id="40",
+        child_task_ids=["41", "42"],
+        child_tasks=[
+            BatchSummaryChild(
+                task_id="41",
+                status="completed",
+                session_id="session-41",
+                stop_reason="task_complete",
+                summary="child one done",
+            ),
+            BatchSummaryChild(
+                task_id="42",
+                status="blocked",
+                stop_reason="needs review",
+            ),
+        ],
+        summary="batch finished",
+    )
+
+    as_dict = payload.model_dump(by_alias=True, exclude_none=True)
+    assert as_dict == {
+        "parentTaskId": "40",
+        "childTaskIds": ["41", "42"],
+        "childTasks": [
+            {
+                "taskId": "41",
+                "status": "completed",
+                "sessionId": "session-41",
+                "stopReason": "task_complete",
+                "summary": "child one done",
+            },
+            {
+                "taskId": "42",
+                "status": "blocked",
+                "stopReason": "needs review",
+            },
+        ],
+        "summary": "batch finished",
+    }
+
+
+def test_parse_batch_summary_visibility_event():
+    event = VisibilityEvent(
+        kind="batch_summary",
+        event_id="worker:batch-summary:40:abc123",
+        team="team-x",
+        agent="worker",
+        backend="claude_teams_server",
+        task_id="40",
+        seq=0,
+        summary="batch finished",
+        payload={
+            "parentTaskId": "40",
+            "childTaskIds": ["41"],
+            "childTasks": [{"taskId": "41", "status": "completed"}],
+            "summary": "batch finished",
+        },
+    )
+
+    parsed = parse_protocol_text(event.model_dump_json(by_alias=True, exclude_none=True))
+
+    assert isinstance(parsed, VisibilityEvent)
+    assert parsed.kind == "batch_summary"
+    assert parsed.payload["parentTaskId"] == "40"
+
+
+def test_parse_typed_lifecycle_payload_variants():
+    examples = [
+        (
+            {"type": "idle_notification", "from": "worker", "idleReason": "available"},
+            IdleNotificationOut,
+        ),
+        (
+            {
+                "kind": "task_complete",
+                "task_id": "7",
+                "files_changed": ["src/foo.py"],
+                "summary": "done",
+                "codex_exit_code": 0,
+            },
+            TaskCompleteOut,
+        ),
+        (
+            {"kind": "task_blocked", "task_id": "7", "reason": "missing approval"},
+            TaskBlockedOut,
+        ),
+        (
+            {
+                "kind": "plan_blocked",
+                "request_id": "p1",
+                "reason": "no claimable task",
+            },
+            PlanBlockedOut,
+        ),
+        (
+            {
+                "type": "plan_approval_response",
+                "requestId": "p1",
+                "approve": False,
+                "feedback": "revise",
+            },
+            PlanApprovalResponseIn,
+        ),
+        (
+            {
+                "type": "permission_request",
+                "request_id": "perm-1",
+                "tool_name": "Bash",
+                "tool_args": {"cmd": "pytest"},
+                "task_id": "7",
+                "teammate_name": "worker",
+                "trust_mode": "default",
+            },
+            PermissionRequestOut,
+        ),
+    ]
+
+    for body, cls in examples:
+        parsed = parse_protocol_text(json.dumps(body))
+        assert isinstance(parsed, cls)

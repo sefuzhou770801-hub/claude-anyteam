@@ -4,8 +4,8 @@ build-backend = "hatchling.build"
 
 [project]
 name = "claude-anyteam"
-version = "0.7.11"
-description = "Bring Codex, Gemini, and Kimi CLI powered teammates into Claude Code with multi-backend routing."
+version = "0.8.0"
+description = "Bring Codex, Gemini, Kimi, and native Claude CLI powered teammates into Claude Code with multi-backend routing."
 requires-python = ">=3.12"
 license = "MIT"
 readme = "README.md"
@@ -22,6 +22,11 @@ dependencies = [
     # Python because `codex exec resume` on codex-cli 0.122.0 does not
     # accept `--output-schema`.
     "jsonschema>=4.20",
+    # Event-driven teammate inbox wakeups: mirrors aproto-codex-bridge's
+    # fs.watch-on-inbox-dir pattern with basename filtering.
+    "watchfiles>=1.0",
+    # Tiny WebSocket projection for `visibility-tail --serve`.
+    "websockets>=12",
 ]
 
 [dependency-groups]
@@ -47,6 +52,7 @@ packages = ["src/claude_anyteam", "src/claude_teams"]
 
 [tool.pytest.ini_options]
 testpaths = ["tests"]
+pythonpath = ["src"]
 asyncio_mode = "auto"
 addopts = ["-m", "not integration"]
 markers = [

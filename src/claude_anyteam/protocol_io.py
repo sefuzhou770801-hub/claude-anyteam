@@ -9,7 +9,9 @@ module also provides helpers for adapter-owned message types
 from __future__ import annotations
 
 import json
+import inspect
 import time
+from pathlib import Path
 from typing import Any
 
 from claude_teams._filelock import file_lock as _file_lock  # type: ignore[import-untyped]
@@ -18,21 +20,196 @@ from claude_teams import tasks as _t  # type: ignore[import-untyped]
 from claude_teams import teams as _teams  # type: ignore[import-untyped]
 from claude_teams.models import InboxMessage as _InboxMessage  # type: ignore[import-untyped]
 from claude_teams.models import TaskFile as _TaskFile  # type: ignore[import-untyped]
+from claude_teams.coupling import (
+    CouplingDeclarationError,
+    canonical_regime,
+    declared_intent_from_manifest,
+    declared_regime_from_manifest,
+)
 
 from . import logger
+from .auth_preflight import AuthPreflightFailure
 from .messages import (
     IdleNotificationOut,
     PermissionRequestOut,
     PermissionResponseIn,
+    PlanBlockedOut,
     PlanApprovalRequestOut,
+    ShutdownApprovedOut,
+    ShutdownRejectedOut,
     ShutdownResponseOut,
+    TaskBlockedOut,
     TaskCompleteOut,
+    VisibilityEvent,
     now_iso,
+    parse_protocol_text,
 )
 
 
 def read_config(team: str):
     return _teams.read_config(team)
+
+
+def _normalise_tool_name(value: str) -> str:
+    return "".join(ch for ch in value.lower() if ch.isalnum())
+
+
+def _is_send_message_tool_name(value: Any) -> bool:
+    if not isinstance(value, str) or not value:
+        return False
+    normalised = _normalise_tool_name(value)
+    if normalised == "sendmessage":
+        return True
+    return normalised.endswith("sendmessage") and (
+        "anyteam" in normalised or "wrapper" in normalised
+    )
+
+
+def _event_mentions_send_message_tool(value: Any) -> bool:
+    """Return True if a raw backend event references the wrapper send tool.
+
+    The three prose backends expose different event shapes:
+
+    - Codex exec: ``{"type": "mcp_tool_call", "name": "send_message"}``
+    - Codex App Server: ``{"params": {"item": {"tool": "send_message"}}}``
+    - Kimi: ``{"role": "assistant", "tool_calls": [{"function": {"name": ...}}]}``
+    - Gemini: ``{"type": "tool_use", "tool_name": "mcp_anyteam_send_message"}``
+
+    Keep this duck-typed so the shared guard remains independent of backend
+    result classes.
+    """
+    if isinstance(value, dict):
+        for key in ("name", "tool", "tool_name", "function_name"):
+            if _is_send_message_tool_name(value.get(key)):
+                return True
+        function = value.get("function")
+        if isinstance(function, dict) and _is_send_message_tool_name(function.get("name")):
+            return True
+        for nested_key in ("item", "params", "tool_calls", "call", "function"):
+            nested = value.get(nested_key)
+            if nested is not None and _event_mentions_send_message_tool(nested):
+                return True
+        return False
+    if isinstance(value, list):
+        return any(_event_mentions_send_message_tool(item) for item in value)
+    return False
+
+
+def _event_mentions_direct_peer_delivery(value: Any) -> bool:
+    """Return True for successful host-shell peer-message delivery workarounds.
+
+    Codex App Server prose turns sometimes fail to surface wrapper MCP tools to
+    the model even though the wrapper is configured.  When that happens, Codex
+    can still use its host shell to call the team substrate directly
+    (``claude_teams.messaging.send_plain_message`` / ``append_message``), or to
+    instantiate the wrapper server and call ``send_message`` through a local
+    FastMCP client.  Those are not normal model tool-call shapes, but they have
+    already delivered a peer reply; the prose fallback guard must therefore
+    treat them like delivered-via-tool replies to avoid double-sending the
+    final assistant prose.
+
+    Keep this deliberately narrow: only successful ``commandExecution`` items
+    count, and only when the command text contains an actual call expression.
+    Source greps, signature inspection, or ``command -v send_message`` should
+    not suppress fallback prose.
+    """
+
+    if isinstance(value, dict):
+        item = value.get("item")
+        if not isinstance(item, dict):
+            params = value.get("params")
+            if isinstance(params, dict) and isinstance(params.get("item"), dict):
+                item = params["item"]
+            else:
+                item = value
+
+        item_type = str(item.get("type") or item.get("raw_backend_type") or "")
+        if item_type == "commandExecution":
+            status = str(item.get("status") or value.get("status") or "").lower()
+            exit_code = item.get("exitCode", item.get("exit_code", value.get("exit_code")))
+            try:
+                exit_code_int = int(exit_code) if exit_code is not None else 0
+            except (TypeError, ValueError):
+                exit_code_int = 1
+            command = str(item.get("command") or value.get("command") or "")
+            if status in {"completed", "success"} and exit_code_int == 0:
+                direct_delivery_needles = (
+                    "messaging.send_plain_message(",
+                    "messaging.append_message(",
+                    ".send_plain_message(",
+                    ".append_message(",
+                    "call_tool('send_message'",
+                    'call_tool("send_message"',
+                    "call_tool('mcp_anyteam_send_message'",
+                    'call_tool("mcp_anyteam_send_message"',
+                )
+                if any(needle in command for needle in direct_delivery_needles):
+                    return True
+
+        for nested_key in ("item", "params", "tool_calls", "call", "function"):
+            nested = value.get(nested_key)
+            if nested is not None and _event_mentions_direct_peer_delivery(nested):
+                return True
+        return False
+    if isinstance(value, list):
+        return any(_event_mentions_direct_peer_delivery(item) for item in value)
+    return False
+
+
+def result_has_send_message_tool_call(result: Any) -> bool:
+    """Best-effort detection that a backend result called wrapper send_message."""
+    events = getattr(result, "events", None)
+    if isinstance(events, list) and events:
+        return any(
+            _event_mentions_send_message_tool(event)
+            or _event_mentions_direct_peer_delivery(event)
+            for event in events
+        )
+    # Legacy / unit-test duck type: early PR-#11/#12 tests only exposed a
+    # successful tool-call count. Preserve that contract when no raw event stream
+    # is available to inspect.
+    return getattr(result, "tool_call_events", 0) > 0
+
+
+def read_agent_manifest(
+    team: str,
+    agent: str,
+    *,
+    teams_root: Any | None = None,
+) -> dict[str, Any] | None:
+    """Read one cached Agent Card manifest if present.
+
+    Native host Claude teammates may have no routed-backend manifest; callers
+    treat ``None`` as "no declaration to compare" rather than inventing a
+    default regime.
+    """
+
+    root = Path(teams_root) if teams_root is not None else _teams.TEAMS_DIR
+    path = root / team / "manifests" / f"{agent}.json"
+    try:
+        raw = json.loads(path.read_text(encoding="utf-8"))
+    except FileNotFoundError:
+        return None
+    if not isinstance(raw, dict):
+        raise ValueError(f"capability manifest at {path} is not a JSON object")
+    return raw
+
+
+def should_skip_prose_fallback(result: Any) -> bool:
+    """Return True when a prose reply was already delivered by a tool call.
+
+    09 R23 extracts the PR-#11/#12 delivered-via-tool guard from the Codex,
+    Gemini, and Kimi loops into one helper. Some backends leave
+    ``last_message`` empty after the model calls the wrapper ``send_message``
+    tool; others (notably Kimi) also emit final assistant prose after the tool
+    call. In both cases the adapter must not add a prose-mode fallback on top of
+    the real peer reply.
+    """
+    return (
+        result is not None
+        and getattr(result, "exit_code", None) == 0
+        and result_has_send_message_tool_call(result)
+    )
 
 
 def read_inbox(team: str, name: str, *, mark_as_read: bool = True) -> list[_InboxMessage]:
@@ -48,7 +225,8 @@ def read_inbox(team: str, name: str, *, mark_as_read: bool = True) -> list[_Inbo
     invariant that we only mutate our own file.
     """
     try:
-        return _m.read_inbox(team, name, unread_only=True, mark_as_read=mark_as_read)
+        messages = _m.read_inbox(team, name, unread_only=True, mark_as_read=mark_as_read)
+        return materialize_attached_protocol_messages(team, messages)
     except json.JSONDecodeError as e:
         logger.warn("inbox.parse_race", error=str(e))
         return []
@@ -73,6 +251,62 @@ def read_own_inbox(team: str, self_name: str, agent_name: str) -> list[_InboxMes
         f"Use read_inbox(..., mark_as_read=False) for read-only access."
     )
     return read_inbox(team, agent_name, mark_as_read=True)
+
+
+PLAIN_PREVIEW_MESSAGE_KINDS = frozenset({"peer_dm", "informational", "handoff"})
+
+
+def should_materialize_attachment_for_protocol(message: _InboxMessage) -> bool:
+    """Return True when the adapter should read an attached full body now.
+
+    Plain peer DMs intentionally stay as previews to avoid model-context bloat;
+    protocol/control messages need their original JSON or steer body so routing
+    decisions do not accidentally treat a preview marker as prose.
+    """
+
+    if message.attachment is None:
+        return False
+    kind = (getattr(message, "message_kind", None) or "peer_dm").lower()
+    return kind not in PLAIN_PREVIEW_MESSAGE_KINDS
+
+
+def resolve_attachment_text(team: str, message: _InboxMessage) -> str:
+    """Return the full attached body for ``message``.
+
+    Raises ``ValueError`` if the message has no attachment. This helper is for
+    code paths that explicitly need the full body; normal inbox reads should
+    preserve previews unless ``should_materialize_attachment_for_protocol``
+    says the body is required for control-flow parsing.
+    """
+
+    if message.attachment is None:
+        raise ValueError("inbox message has no attachment")
+    return _m.read_attachment_text(team, message.attachment)
+
+
+def materialize_attached_protocol_message(
+    team: str,
+    message: _InboxMessage,
+) -> _InboxMessage:
+    if not should_materialize_attachment_for_protocol(message):
+        return message
+    try:
+        return message.model_copy(update={"text": resolve_attachment_text(team, message)})
+    except (OSError, ValueError) as e:
+        logger.warn(
+            "inbox.attachment_read_failed",
+            sender=message.from_,
+            message_kind=message.message_kind,
+            error=str(e),
+        )
+        return message
+
+
+def materialize_attached_protocol_messages(
+    team: str,
+    messages: list[_InboxMessage],
+) -> list[_InboxMessage]:
+    return [materialize_attached_protocol_message(team, m) for m in messages]
 
 
 def list_tasks(team: str) -> list[_TaskFile]:
@@ -137,6 +371,7 @@ def update_task(
     status: str | None = None,
     active_form: str | None = None,
     metadata: dict[str, Any] | None = None,
+    coupling: dict | str | None = None,
 ) -> _TaskFile:
     return _t.update_task(
         team,
@@ -144,12 +379,29 @@ def update_task(
         status=status,
         active_form=active_form,
         metadata=metadata,
+        coupling=coupling,
     )
+
+
+def _message_kind_from_protocol_text(text: str) -> str | None:
+    payload = parse_protocol_text(text)
+    if payload is None:
+        return None
+    raw = payload.model_dump(by_alias=True, exclude_none=True)
+    kind = raw.get("kind") or raw.get("type")
+    return kind if isinstance(kind, str) else None
 
 
 def send_prose(team: str, sender: str, to: str, text: str, summary: str) -> None:
     """Send a plain-text message to an arbitrary teammate."""
-    _m.send_plain_message(team, sender, to, text, summary=summary)
+    _send_plain_message_compat(
+        team,
+        sender,
+        to,
+        text,
+        summary=summary,
+        message_kind=_message_kind_from_protocol_text(text),
+    )
 
 
 def send_prose_to_lead(team: str, sender: str, text: str, summary: str) -> None:
@@ -161,11 +413,58 @@ def send_prose_to_lead(team: str, sender: str, text: str, summary: str) -> None:
     send_prose(team, sender, "team-lead", text, summary=summary)
 
 
+def _send_plain_message_compat(
+    team: str,
+    sender: str,
+    to: str,
+    body: str,
+    *,
+    summary: str,
+    message_kind: str | None = None,
+) -> None:
+    """Call the substrate send helper with an optional R3 message_kind.
+
+    R16 can stub messageKind now without taking ownership of foundation's R3
+    substrate migration: if the installed `claude_teams.messaging` already
+    accepts `message_kind`, pass the kind through; otherwise write the raw
+    inbox entry under the normal inbox lock with `messageKind` preserved.
+    """
+
+    kwargs: dict[str, Any] = {"summary": summary}
+    if message_kind is not None:
+        try:
+            params = inspect.signature(_m.send_plain_message).parameters
+        except (TypeError, ValueError):
+            params = {}
+        accepts_var_kw = any(
+            p.kind is inspect.Parameter.VAR_KEYWORD for p in params.values()
+        )
+        if "message_kind" in params or accepts_var_kw:
+            kwargs["message_kind"] = message_kind
+            _m.send_plain_message(team, sender, to, body, **kwargs)
+            return
+        _m.append_message(
+            team,
+            to,
+            _InboxMessage(
+                from_=sender,
+                text=body,
+                timestamp=now_iso(),
+                read=False,
+                summary=summary,
+                message_kind=message_kind,
+            ),
+        )
+        return
+    _m.send_plain_message(team, sender, to, body, **kwargs)
+
+
 def send_json_to_lead(
     team: str,
     sender: str,
     payload: dict[str, Any] | Any,
     summary: str,
+    message_kind: str | None = None,
 ) -> None:
     """Send a JSON payload as the message body. `payload` may be a dict or
     a Pydantic model (must have `.model_dump_json`).
@@ -174,12 +473,621 @@ def send_json_to_lead(
         body = payload.model_dump_json(by_alias=True, exclude_none=True)
     else:
         body = json.dumps(payload)
-    _m.send_plain_message(team, sender, "team-lead", body, summary=summary)
+    _send_plain_message_compat(
+        team,
+        sender,
+        "team-lead",
+        body,
+        summary=summary,
+        message_kind=message_kind,
+    )
+
+
+def _visibility_events_dir(team: str):
+    """Return the R16/B9 §6.4 event-log directory for a team.
+
+    The append-only visibility stream lives next to `inboxes/` but uses its
+    own `events/.lock` so high-volume backend activity never contends with
+    human mailbox traffic. Resolve through `claude_teams.messaging.TEAMS_DIR`
+    so tests and alternate storage roots follow the same monkeypatch surface
+    as inbox helpers.
+    """
+
+    return _m.TEAMS_DIR / team / "events"
+
+
+def visibility_event_path(team: str, agent: str):
+    return _visibility_events_dir(team) / f"{agent}.jsonl"
+
+
+def team_visibility_event_path(team: str):
+    """Return the aggregate per-team VisibilityEvent JSONL stream path.
+
+    The canonical durable store remains the per-agent ``events/<agent>.jsonl``
+    files from R16.  The lightweight live UI projector added for §2 also needs
+    a single attach point, so every append is mirrored into this team stream
+    under the same ``events/.lock``.  Keep the aggregate outside ``events/`` so
+    scorer-time readers that glob per-agent ``events/*.jsonl`` never double
+    count the mirrored rows.
+    """
+
+    return _m.TEAMS_DIR / team / "visibility.jsonl"
+
+
+def append_visibility_event(
+    team: str,
+    agent: str,
+    event: VisibilityEvent | dict[str, Any],
+) -> VisibilityEvent:
+    """Append one validated B9 §6 visibility envelope.
+
+    This is the canonical full-fidelity channel introduced by 09 R16 / 08
+    PE-2+L17: `~/.claude/teams/<team>/events/<agent>.jsonl`, guarded by the
+    directory-local `events/.lock`. Fan-out to mailbox/task-state/stderr is
+    policy on top of this envelope, not a backend-name flattener; emitters
+    must preserve native event names in `payload.raw_backend_type` per
+    07 §7.3.
+    """
+
+    envelope = (
+        event if isinstance(event, VisibilityEvent)
+        else VisibilityEvent.model_validate(event)
+    )
+    events_dir = _visibility_events_dir(team)
+    events_dir.mkdir(parents=True, exist_ok=True)
+    (events_dir / ".lock").touch(exist_ok=True)
+    line = envelope.model_dump_json(by_alias=True, exclude_none=True)
+    with _file_lock(events_dir / ".lock"):
+        with (events_dir / f"{agent}.jsonl").open("a", encoding="utf-8") as f:
+            f.write(line)
+            f.write("\n")
+        # §2 UI projection attach point: mirror the same full-fidelity
+        # envelope into a per-team stream so a lead can attach once without
+        # knowing every active teammate file up front.
+        with team_visibility_event_path(team).open("a", encoding="utf-8") as f:
+            f.write(line)
+            f.write("\n")
+    # Some filelock implementations may unlink an empty lockfile on release;
+    # keep the protocol-visible events/.lock sentinel present like inboxes/.lock.
+    (events_dir / ".lock").touch(exist_ok=True)
+    return envelope
+
+
+def append_event(
+    team: str,
+    agent: str,
+    event: VisibilityEvent | dict[str, Any],
+) -> VisibilityEvent:
+    """Compatibility alias for the R16/R17/R18/R19 roadmap name.
+
+    The implementation originally landed as ``append_visibility_event``; the
+    protocol-rev docs and later work items (R17 codex sink, R18 wrapper
+    instrumentation, R19 headless digests) refer to the same helper as
+    ``append_event``. Keep both spellings wired to one append-only substrate.
+    """
+
+    return append_visibility_event(team, agent, event)
+
+
+def read_visibility_events(
+    team: str,
+    agent: str,
+    *,
+    since_seq: int | None = None,
+    limit: int | None = None,
+) -> list[VisibilityEvent]:
+    """Read event-log entries for diagnostics/tests.
+
+    `since_seq` is exclusive (`seq > since_seq`), matching the R16
+    offset-style acceptance without mutating the append-only file.
+    """
+
+    path = visibility_event_path(team, agent)
+    if not path.exists():
+        return []
+    out: list[VisibilityEvent] = []
+    for line in path.read_text(encoding="utf-8").splitlines():
+        if not line.strip():
+            continue
+        event = VisibilityEvent.model_validate(json.loads(line))
+        if since_seq is not None and event.seq <= since_seq:
+            continue
+        out.append(event)
+    if limit is not None and limit >= 0:
+        out = out[-limit:]
+    return out
+
+
+def append_event(
+    team: str,
+    agent: str,
+    event: VisibilityEvent | dict[str, Any],
+) -> VisibilityEvent:
+    """Compatibility alias for the R16/R17 roadmap helper name.
+
+    The implementation landed as ``append_visibility_event``; 09 R17 and 07
+    §7 call the primitive ``append_event``. Keep both spellings so backend
+    fan-out code can use the protocol name without breaking existing tests
+    and callers from the R16 catch-up.
+    """
+
+    return append_visibility_event(team, agent, event)
+
+
+def read_events(
+    team: str,
+    agent: str,
+    *,
+    since_seq: int | None = None,
+    limit: int | None = None,
+) -> list[VisibilityEvent]:
+    """Compatibility alias for ``read_visibility_events``."""
+
+    return read_visibility_events(
+        team,
+        agent,
+        since_seq=since_seq,
+        limit=limit,
+    )
+
+
+def send_visibility_event_to_lead(
+    team: str,
+    sender: str,
+    event: VisibilityEvent | dict[str, Any],
+    *,
+    summary: str | None = None,
+) -> None:
+    """Mailbox fan-out for low-frequency visibility events.
+
+    R3's `InboxMessage.message_kind` discriminator is present as an explicit
+    field in this branch; set it to the envelope kind (`turn_progress`,
+    `tool_event`, ...), while leaving the envelope body itself unchanged.
+    """
+
+    envelope = (
+        event if isinstance(event, VisibilityEvent)
+        else VisibilityEvent.model_validate(event)
+    )
+    send_json_to_lead(
+        team,
+        sender,
+        envelope,
+        summary=summary or f"visibility:{envelope.kind}",
+        message_kind=envelope.kind,
+    )
+
+
+def _bounded_text(value: Any, *, limit: int = 4000) -> Any:
+    """Return a JSON-safe, bounded representation of a native error field."""
+
+    if value is None:
+        return None
+    if isinstance(value, bytes):
+        text = value.decode("utf-8", errors="replace")
+    elif isinstance(value, str):
+        text = value
+    elif isinstance(value, (int, float, bool)):
+        return value
+    else:
+        try:
+            json.dumps(value)
+            return value
+        except (TypeError, ValueError):
+            text = repr(value)
+    if len(text) > limit:
+        return text[:limit] + "…"
+    return text
+
+
+def _exception_wire_details(error: BaseException) -> dict[str, Any]:
+    """Preserve backend-native exception details for visibility envelopes.
+
+    The visibility envelope should normalize routing fields only.  Startup
+    probes often wrap a native subprocess exception in RuntimeError; include
+    the wrapper *and* the cause so leads can see the original command,
+    return code, stdout, and stderr without grepping tmux/proc logs.
+    """
+
+    def _one(exc: BaseException) -> dict[str, Any]:
+        detail: dict[str, Any] = {
+            "type": f"{exc.__class__.__module__}.{exc.__class__.__name__}",
+            "message": str(exc),
+            "repr": repr(exc),
+        }
+        for attr in ("cmd", "returncode", "stdout", "stderr", "output", "timeout"):
+            if hasattr(exc, attr):
+                value = getattr(exc, attr)
+                if value is not None:
+                    detail[attr] = _bounded_text(value)
+        return detail
+
+    out = _one(error)
+    cause = error.__cause__ or error.__context__
+    if cause is not None and cause is not error:
+        out["cause"] = _one(cause)
+    return out
+
+
+def emit_adapter_startup_crash(
+    *,
+    team: str,
+    agent: str,
+    backend: str,
+    phase: str,
+    error: BaseException,
+    payload: dict[str, Any] | None = None,
+) -> VisibilityEvent:
+    """Emit a lead-visible startup-crash ``visibility_degraded`` envelope.
+
+    Gemini/Kimi routed teammates can fail before their first turn (for
+    example during CLI binary/feature probes).  Those failures used to live
+    only in stderr/proc logs; this helper fans the structured envelope out to
+    both the append-only event log and the lead mailbox while preserving the
+    backend-native exception/subprocess details in ``payload.raw_backend_error``.
+    """
+
+    error_message = str(error)
+    event_payload: dict[str, Any] = {
+        "surface": "adapter_startup",
+        "phase": phase,
+        "error_type": f"{error.__class__.__module__}.{error.__class__.__name__}",
+        "error_message": error_message,
+        "raw_backend_error": _exception_wire_details(error),
+    }
+    if payload:
+        event_payload.update(payload)
+
+    event_id = f"{agent}:startup-crash:{int(time.time() * 1000)}"
+    envelope = VisibilityEvent(
+        kind="visibility_degraded",
+        event_id=event_id,
+        team=team,
+        agent=agent,
+        backend=backend,
+        seq=0,
+        severity="error",
+        summary=(
+            f"{backend} adapter startup failed during {phase}: {error_message}"
+        )[:300],
+        visibility={
+            "mailbox": True,
+            "task_state": False,
+            "event_log": True,
+            "stderr": True,
+        },
+        payload=event_payload,
+    )
+
+    log_payload = {
+        "kind": envelope.kind,
+        "event_id": envelope.event_id,
+        "seq": envelope.seq,
+        "severity": envelope.severity,
+        "summary": envelope.summary,
+        "visibility_event": envelope.model_dump(by_alias=True, exclude_none=True),
+    }
+    logger.error("visibility.event", **log_payload)
+
+    appended = False
+    try:
+        append_event(team, agent, envelope)
+        appended = True
+    except Exception as e:
+        logger.warn(
+            "visibility.startup_crash_event_log_failed",
+            backend=backend,
+            agent=agent,
+            phase=phase,
+            error=str(e),
+        )
+    try:
+        send_visibility_event_to_lead(team, agent, envelope)
+    except Exception as e:
+        logger.warn(
+            "visibility.startup_crash_mailbox_failed",
+            backend=backend,
+            agent=agent,
+            phase=phase,
+            event_log_appended=appended,
+            error=str(e),
+        )
+    return envelope
+
+
+def emit_auth_preflight_failure(
+    *,
+    team: str,
+    agent: str,
+    backend: str,
+    error: AuthPreflightFailure,
+    payload: dict[str, Any] | None = None,
+) -> VisibilityEvent:
+    """Emit the spawn-time auth-failure ``visibility_degraded`` envelope.
+
+    This is deliberately separate from the generic startup-crash helper: bad
+    Gemini/Kimi credentials and exhausted quota are external constraints, not
+    adapter bugs.  They should therefore carry the stable machine-readable
+    ``reason=auth_failure`` and backend error class required by the stress
+    harness so the lead can see the failure before any turn loop starts.
+    """
+
+    event_payload: dict[str, Any] = {
+        "surface": "adapter_spawn_auth_preflight",
+        "reason": "auth_failure",
+        "backend": error.backend or backend,
+        "error_class": error.error_class,
+        "error_message": error.error_message,
+    }
+    if error.reset_after_seconds is not None:
+        event_payload["reset_after_seconds"] = error.reset_after_seconds
+    if payload:
+        event_payload.update(payload)
+    event_payload["raw_backend_error"] = _exception_wire_details(error)
+
+    event_id = f"{agent}:auth-preflight:{int(time.time() * 1000)}"
+    envelope = VisibilityEvent(
+        kind="visibility_degraded",
+        event_id=event_id,
+        team=team,
+        agent=agent,
+        backend=backend,
+        seq=0,
+        severity="error",
+        summary=(
+            f"{backend} auth preflight failed: {error.error_class}"
+        )[:300],
+        visibility={
+            "mailbox": True,
+            "task_state": False,
+            "event_log": True,
+            "stderr": True,
+        },
+        payload=event_payload,
+    )
+
+    logger.error(
+        "visibility.event",
+        kind=envelope.kind,
+        event_id=envelope.event_id,
+        seq=envelope.seq,
+        severity=envelope.severity,
+        summary=envelope.summary,
+        visibility_event=envelope.model_dump(by_alias=True, exclude_none=True),
+    )
+
+    appended = False
+    try:
+        append_event(team, agent, envelope)
+        appended = True
+    except Exception as e:
+        logger.warn(
+            "visibility.auth_preflight_event_log_failed",
+            backend=backend,
+            agent=agent,
+            error=str(e),
+        )
+    try:
+        send_visibility_event_to_lead(team, agent, envelope)
+    except Exception as e:
+        logger.warn(
+            "visibility.auth_preflight_mailbox_failed",
+            backend=backend,
+            agent=agent,
+            event_log_appended=appended,
+            error=str(e),
+        )
+    return envelope
 
 
 def send_idle_notification(team: str, sender: str, reason: str = "available") -> None:
     payload = IdleNotificationOut(from_=sender, idle_reason=reason)  # type: ignore[call-arg]
-    send_json_to_lead(team, sender, payload, summary="idle")
+    send_json_to_lead(
+        team,
+        sender,
+        payload,
+        summary="idle",
+        message_kind="idle_notification",
+    )
+
+
+def emit_peer_steer_rejection(
+    *,
+    team: str,
+    agent: str,
+    backend: str,
+    sender: str,
+) -> VisibilityEvent:
+    """Emit visibility_degraded for a peer-steer rejection.
+
+    09 R15-vis-followup (08 CD-6 / 07 §6.5): when a backend's steer handler
+    rejects a non-lead steer because `accepts_peer_steer` is not declared in
+    its capability list, emit a structured `visibility_degraded` envelope to
+    the lead's mailbox AND append it to the agent's event log. The
+    pre-existing `logger.warn` call site stays for stderr forensics — this
+    helper is additive so the lead can observe coordination signals at
+    native fidelity without grepping stderr (the §2 anti-pattern this fix
+    closes).
+
+    Returns the appended envelope so callers can assert against it in tests.
+    """
+
+    event_id = f"{agent}:steer-reject:{int(time.time() * 1000)}"
+    envelope = VisibilityEvent(
+        kind="visibility_degraded",
+        event_id=event_id,
+        team=team,
+        agent=agent,
+        backend=backend,
+        seq=0,
+        severity="warn",
+        summary=f"peer steer from {sender} rejected; accepts_peer_steer not declared",
+        payload={
+            "surface": "peer_steer_rejected",
+            "reason": "accepts_peer_steer_not_declared",
+            "sender": sender,
+            "recipient": agent,
+        },
+    )
+    # Fan-out per 07 §7.4: event log always, mailbox always for warn-level
+    # rejection so the lead can audit without stderr scrape.
+    append_event(team, agent, envelope)
+    send_visibility_event_to_lead(team, agent, envelope)
+    return envelope
+
+
+def emit_coupling_conflict_if_needed(
+    *,
+    team: str,
+    agent: str,
+    backend: str,
+    task: Any,
+    manifest: dict[str, Any] | None,
+) -> VisibilityEvent | None:
+    """Emit a visibility envelope when task coupling conflicts with manifest.
+
+    The comparison reads the backend's protocol declaration from the supplied
+    Agent Card manifest. It intentionally does not infer a regime from
+    ``backend``/``backend_type``: those strings are only copied into the event
+    envelope for audit context. If no manifest/declaration exists (e.g. native
+    host Claude), the check is skipped because there is no routed-backend
+    declaration to compare against.
+    """
+
+    requested = canonical_regime(getattr(task, "coupling", None))
+    if requested is None:
+        return None
+    if manifest is None:
+        return None
+
+    try:
+        declared = declared_regime_from_manifest(manifest)
+        declared_intent = declared_intent_from_manifest(manifest)
+    except CouplingDeclarationError:
+        # A manifest was present but not usable. Let callers/tests catch this
+        # as a declaration error rather than silently applying a fake default.
+        raise
+
+    if requested == declared:
+        return None
+
+    task_id = str(getattr(task, "id", ""))
+    task_coupling = getattr(task, "coupling", None)
+    manifest_version = manifest.get("capability_version") or manifest.get("capabilityVersion")
+    suggested_fix = (
+        "consider routing this task to a tight-declared backend, or pin "
+        "task.coupling.intent=loose_parallel"
+        if requested == "tight"
+        else
+        "consider routing this task to a loose-declared backend, or pin "
+        "task.coupling.intent=tight_peer_loop"
+    )
+    now = now_iso()
+    envelope = VisibilityEvent(
+        kind="visibility_degraded",
+        event_id=f"{agent}:coupling-conflict:{task_id}:{int(time.time() * 1000)}",
+        timestamp=now,
+        team=team,
+        agent=agent,
+        backend=backend,
+        task_id=task_id or None,
+        seq=0,
+        severity="warn",
+        summary=(
+            f"task #{task_id or '?'} requests {requested} coupling but "
+            f"{agent} declares {declared}"
+        ),
+        payload={
+            "surface": "coupling_intent_conflict",
+            "reason": "task_coupling_conflicts_with_backend_declaration",
+            "task_id": task_id,
+            "requested_coupling": requested,
+            "task_coupling": task_coupling,
+            "backend_coupling_regime": declared,
+            "backend_coupling_intent": declared_intent,
+            "backend_manifest_version": str(manifest_version) if manifest_version is not None else None,
+            "backend_manifest_agent": manifest.get("agent_name") or manifest.get("agentName"),
+            "backend_manifest_transport": manifest.get("transport"),
+            "backend_label": backend,
+            "suggested_fix": suggested_fix,
+            "observation_timestamp": now,
+        },
+    )
+    append_event(team, agent, envelope)
+    send_visibility_event_to_lead(team, agent, envelope)
+    return envelope
+
+
+def _shutdown_member_metadata(
+    team: str,
+    sender: str,
+) -> tuple[str | None, str | None]:
+    """Best-effort metadata for host-catalog shutdown_approved.
+
+    The 03 §"Lifecycle" host-binary lifecycle/mailbox extract lists paneId/backendType as
+    optional; include them when the shim registry has them, but never let a
+    config read race block the shutdown acknowledgement.
+    """
+
+    try:
+        cfg = _teams.read_config(team)
+    except Exception as e:
+        logger.debug("shutdown.metadata_unavailable", error=str(e))
+        return None, None
+    for member in getattr(cfg, "members", []):
+        if getattr(member, "name", None) == sender:
+            return (
+                getattr(member, "tmux_pane_id", None),
+                getattr(member, "backend_type", None),
+            )
+    return None, None
+
+
+def send_shutdown_approved(
+    team: str,
+    sender: str,
+    request_id: str,
+    *,
+    pane_id: str | None = None,
+    backend_type: str | None = None,
+) -> None:
+    if pane_id is None or backend_type is None:
+        found_pane_id, found_backend_type = _shutdown_member_metadata(team, sender)
+        pane_id = pane_id if pane_id is not None else found_pane_id
+        backend_type = backend_type if backend_type is not None else found_backend_type
+    payload = ShutdownApprovedOut(
+        request_id=request_id,
+        from_=sender,
+        pane_id=pane_id,
+        backend_type=backend_type,
+    )
+    send_json_to_lead(
+        team,
+        sender,
+        payload,
+        summary="shutdown_approved",
+        message_kind="shutdown_approved",
+    )
+
+
+def send_shutdown_rejected(
+    team: str,
+    sender: str,
+    request_id: str,
+    reason: str,
+) -> None:
+    payload = ShutdownRejectedOut(
+        request_id=request_id,
+        from_=sender,
+        reason=reason or "Shutdown rejected",
+    )
+    send_json_to_lead(
+        team,
+        sender,
+        payload,
+        summary="shutdown_rejected",
+        message_kind="shutdown_rejected",
+    )
 
 
 def send_shutdown_response(
@@ -189,13 +1097,42 @@ def send_shutdown_response(
     approve: bool,
     feedback: str | None = None,
 ) -> None:
+    """Deprecated R6 alias for one release.
+
+    New code should call send_shutdown_approved/send_shutdown_rejected so the
+    wire type matches 09 R6, 07 §5.1, and the 03 §"Lifecycle" host catalog.
+    """
+
+    logger.warn(
+        "shutdown_response.deprecated_alias",
+        replacement="shutdown_approved" if approve else "shutdown_rejected",
+        request_id=request_id,
+    )
     payload = ShutdownResponseOut(
         request_id=request_id,
         approve=approve,
         feedback=feedback,
     )
-    summary = "shutdown_approved" if approve else "shutdown_rejected"
-    send_json_to_lead(team, sender, payload, summary=summary)
+    host_payload = payload.to_host_catalog(sender)
+    if isinstance(host_payload, ShutdownApprovedOut):
+        pane_id, backend_type = _shutdown_member_metadata(team, sender)
+        host_payload.pane_id = pane_id
+        host_payload.backend_type = backend_type
+        send_json_to_lead(
+            team,
+            sender,
+            host_payload,
+            summary="shutdown_approved",
+            message_kind="shutdown_approved",
+        )
+    else:
+        send_json_to_lead(
+            team,
+            sender,
+            host_payload,
+            summary="shutdown_rejected",
+            message_kind="shutdown_rejected",
+        )
 
 
 def send_task_blocked(
@@ -208,12 +1145,37 @@ def send_task_blocked(
     task the adapter claimed cannot proceed, without relying on prose
     parsing.
     """
-    payload = {
-        "kind": "task_blocked",
-        "task_id": task_id,
-        "reason": reason,
-    }
-    send_json_to_lead(team, sender, payload, summary=f"task_blocked:{task_id}")
+    payload = TaskBlockedOut(task_id=task_id, reason=reason)
+    send_json_to_lead(
+        team,
+        sender,
+        payload,
+        summary=f"task_blocked:{task_id}",
+        message_kind="task_blocked",
+    )
+
+
+def send_plan_blocked(
+    team: str,
+    sender: str,
+    *,
+    request_id: str,
+    reason: str,
+    task_id: str | None = None,
+) -> None:
+    """Send a typed plan-blocked lifecycle payload to the lead."""
+    payload = PlanBlockedOut(
+        request_id=request_id,
+        reason=reason,
+        task_id=task_id,
+    )
+    send_json_to_lead(
+        team,
+        sender,
+        payload,
+        summary=f"plan_blocked:{request_id}",
+        message_kind="plan_blocked",
+    )
 
 
 def send_task_complete(
@@ -230,7 +1192,13 @@ def send_task_complete(
         summary=summary_text,
         codex_exit_code=codex_exit_code,
     )
-    send_json_to_lead(team, sender, payload, summary=f"task_complete:{task_id}")
+    send_json_to_lead(
+        team,
+        sender,
+        payload,
+        summary=f"task_complete:{task_id}",
+        message_kind="task_complete",
+    )
 
 
 def send_plan_approval_request(
@@ -240,7 +1208,13 @@ def send_plan_approval_request(
     plan: dict[str, Any],
 ) -> None:
     payload = PlanApprovalRequestOut(request_id=request_id, plan=plan)
-    send_json_to_lead(team, sender, payload, summary=f"plan_approval:{request_id}")
+    send_json_to_lead(
+        team,
+        sender,
+        payload,
+        summary=f"plan_approval:{request_id}",
+        message_kind="plan_approval_request",
+    )
 
 
 def send_permission_request_to_lead(
@@ -265,7 +1239,13 @@ def send_permission_request_to_lead(
         label=label,
         session_id=session_id,
     )
-    send_json_to_lead(team, sender, payload, summary=f"permission_request:{request_id}")
+    send_json_to_lead(
+        team,
+        sender,
+        payload,
+        summary=f"permission_request:{request_id}",
+        message_kind="permission_request",
+    )
 
 
 def _read_matching_permission_response_locked(

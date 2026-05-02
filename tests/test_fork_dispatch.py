@@ -307,8 +307,14 @@ def test_model_effort_carry_through_fork_path():
     client = _FakeClient.created[0]
     parent_thread_id, fork_kwargs = client.forked_threads[0]
     assert parent_thread_id == "thread-parent"
-    assert fork_kwargs["base_instructions"] == (
+    assert fork_kwargs["base_instructions"].startswith(
         "You are a, a Codex teammate on the t team. Execute the task below."
+    )
+    assert "# Team messaging" in fork_kwargs["base_instructions"]
+    assert "send_message is exposed lowercase" in fork_kwargs["base_instructions"]
+    assert (
+        "Plain prose output is NOT visible to teammates"
+        in fork_kwargs["base_instructions"]
     )
     assert fork_kwargs["developer_instructions"] == "noop"
     assert fork_kwargs["sandbox"] == "danger-full-access"
