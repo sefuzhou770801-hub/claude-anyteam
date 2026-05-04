@@ -65,7 +65,7 @@ class _FakeClient:
     def start(self):
         pass
 
-    def initialize(self):
+    def initialize(self, **_kwargs):
         return {}
 
     def thread_start(self, **kwargs):
@@ -455,7 +455,7 @@ def test_app_server_no_checkpoint_after_300s_emits_turn_progress(monkeypatch):
         created.append(client)
         return client
 
-    ticks = iter([0, 0, 301, 301, 301, 301, 302, 303])
+    ticks = iter([0, 0, 0, 0, 0, 301, 301, 301, 301, 302, 303])
 
     def fake_monotonic():
         try:
@@ -507,7 +507,7 @@ def test_app_server_watchdog_fans_out_to_event_log_mailbox_and_active_form(
         created.append(client)
         return client
 
-    ticks = iter([0, 0, 0, 300, 301])
+    ticks = iter([0, 0, 0, 0, 0, 0, 300, 301])
 
     def fake_monotonic():
         try:
@@ -578,7 +578,7 @@ def test_app_server_watchdog_does_not_interrupt_without_opt_in(monkeypatch):
         created.append(client)
         return client
 
-    ticks = iter([0, 0, 0, 300, 350, 420, 421])
+    ticks = iter([0, 0, 0, 0, 0, 0, 300, 350, 420, 421])
 
     def fake_monotonic():
         try:
@@ -620,7 +620,7 @@ def test_app_server_watchdog_interrupts_only_when_opted_in(monkeypatch):
         created.append(client)
         return client
 
-    ticks = iter([0, 0, 0, 300, 350, 420])
+    ticks = iter([0, 0, 0, 0, 0, 0, 300, 350, 420])
 
     def fake_monotonic():
         try:

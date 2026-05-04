@@ -27,6 +27,19 @@ class AppServerClient(JsonRpcStdioClient):
             env=env,
             log_prefix="app_server",
             stderr_log_prefix="app_server.stderr",
+            # Put the Codex app-server (and any helper subprocesses it forks
+            # for auth refresh / model I/O / network handshake) in its own
+            # POSIX session so that ``close()`` can SIGTERM the entire process
+            # group, not just the leader. Without this, helper children
+            # outlive the wrapper's ``client.close()`` and the next per-turn
+            # ``AppServerClient`` cold start can collide with their open fds /
+            # sockets / cache locks — the long-lived-wrapper
+            # "second-or-later cold-start hangs at initialize for 600s"
+            # symptom in #40. Mirrors the convention the gemini ACP transport
+            # already uses (``backends/gemini/acp.py``:
+            # ``client.terminate_process_group(...)``).
+            start_new_session=True,
+            terminate_process_group=True,
         )
         self._error_cls = AppServerError
         self.last_thread_result: dict[str, Any] | None = None
@@ -139,12 +152,30 @@ class AppServerClient(JsonRpcStdioClient):
 
     # ---- helpers for well-known methods -----------------------------------
 
-    def initialize(self, client_info: dict[str, Any] | None = None) -> Any:
+    def initialize(
+        self,
+        client_info: dict[str, Any] | None = None,
+        *,
+        timeout: float | None = None,
+    ) -> Any:
+        """Send the JSON-RPC ``initialize`` handshake.
+
+        ``timeout`` overrides ``request()``'s 600s default; the Codex App
+        Server initialize handshake should complete in seconds, not
+        minutes — the only successful empirical sample we have is ~17s on
+        a parking-ack prompt (issue #40 thread). 600s as the silent
+        default made a hung handshake indistinguishable from "agent is
+        thinking hard." Callers should pass an explicit budget (the
+        adapter loop reads ``CLAUDE_ANYTEAM_APP_SERVER_INITIALIZE_TIMEOUT_S``,
+        default 90s).
+        """
         params = {
             "clientInfo": client_info
             or {"name": "claude-anyteam-adapter", "version": "0.1.0"},
         }
-        return self.request("initialize", params)
+        if timeout is None:
+            return self.request("initialize", params)
+        return self.request("initialize", params, timeout=timeout)
 
     def thread_start(
         self,

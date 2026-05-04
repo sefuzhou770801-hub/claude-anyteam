@@ -36,6 +36,8 @@ from typing import Any, Callable
 
 from . import logger
 from .env import (
+    APP_SERVER_INITIALIZE_PROGRESS_INTERVAL_ENV,
+    APP_SERVER_INITIALIZE_TIMEOUT_ENV,
     CWD_ENV,
     DUMP_EVENTS_ENV,
     LEGACY_CWD_ENV,
@@ -754,6 +756,225 @@ def run(
 # can inject additional input into an in-flight turn when a mid-task inbox
 # message arrives. See `docs/v7-architecture.md` §4 (Option Y) and the
 # v7.1 task spec.
+
+
+_DEFAULT_INITIALIZE_TIMEOUT_S = 90.0
+_DEFAULT_INITIALIZE_PROGRESS_INTERVAL_S = 30.0
+
+
+def _read_float_env(name: str, default: float, *, allow_zero: bool = False) -> float:
+    raw = os.environ.get(name)
+    if raw is None or raw == "":
+        return default
+    try:
+        value = float(raw)
+    except ValueError:
+        return default
+    if allow_zero:
+        return max(0.0, value)
+    return max(0.001, value)
+
+
+def _read_proc_cpu_pct(pid: int) -> float | None:
+    """Best-effort CPU% sample from ``/proc/<pid>/stat`` (Linux only).
+
+    Returns the cumulative ``utime + stime`` ratio over the process's wall
+    time since fork — coarser than ``ps``'s short-window sample but
+    requires no extra threads or sampling intervals. Used in
+    ``app_server_initialize_progress`` payloads so the lead can see "this
+    second-spawn is wedged at 100% CPU" without running ``top``. Silent
+    on non-Linux (returns None) — the lead's UI just omits the field.
+    """
+    try:
+        with open(f"/proc/{pid}/stat", "r", encoding="utf-8") as fh:
+            stat = fh.read()
+    except (FileNotFoundError, PermissionError, OSError):
+        return None
+    # Field order: pid (comm) state ppid pgrp session tty_nr tpgid flags
+    # minflt cminflt majflt cmajflt utime stime cutime cstime priority
+    # nice num_threads ... starttime ...
+    # `comm` may contain spaces inside parentheses, so split on the
+    # closing paren rather than whitespace.
+    try:
+        end_comm = stat.rindex(") ")
+        rest = stat[end_comm + 2 :].split()
+        utime = int(rest[11])  # 14 - 3
+        stime = int(rest[12])  # 15 - 3
+        starttime = int(rest[19])  # 22 - 3
+    except (ValueError, IndexError):
+        return None
+    try:
+        with open("/proc/uptime", "r", encoding="utf-8") as fh:
+            uptime = float(fh.read().split()[0])
+    except (FileNotFoundError, OSError, ValueError, IndexError):
+        return None
+    try:
+        clock_ticks = float(os.sysconf("SC_CLK_TCK"))
+    except (AttributeError, OSError, ValueError):
+        clock_ticks = 100.0
+    elapsed_s = uptime - (starttime / clock_ticks)
+    if elapsed_s <= 0:
+        return None
+    cpu_s = (utime + stime) / clock_ticks
+    return min(100.0 * 8, (cpu_s / elapsed_s) * 100.0)
+
+
+def _initialize_with_progress_events(
+    client: "Any",
+    *,
+    emit_visibility: Callable[..., VisibilityEvent],
+    prompt_byte_size: int,
+) -> Any:
+    """Run JSON-RPC ``initialize`` against the App Server with timing,
+    progress events, and a bounded budget.
+
+    #40 Phase 1 deliverables, all bundled here so the App Server entry
+    path has one structured handshake surface:
+
+    * ``timeout`` defaults to 90s (override via
+      ``CLAUDE_ANYTEAM_APP_SERVER_INITIALIZE_TIMEOUT_S``). The previous
+      600s default was the only signal a hung initialize was hung at all
+      — see #40 issue thread, "10-minute silence is indistinguishable
+      from 'agent is genuinely thinking hard.'"
+    * On success, emits ``app_server_initialize_completed`` with
+      ``elapsed_ms`` and ``prompt_byte_size``. This is the success-path
+      instrumentation the steward asked for so we can revisit the 90s
+      default with real data instead of the single 17s anecdote.
+    * While waiting, emits ``app_server_initialize_progress`` events at
+      ``CLAUDE_ANYTEAM_APP_SERVER_INITIALIZE_PROGRESS_INTERVAL_S`` (default
+      30s; set 0 to disable). Each carries ``attempt``, ``elapsed_s``,
+      ``last_observed_pid``, and (Linux only) ``last_observed_cpu_pct``.
+
+    On timeout: re-raises the underlying ``AppServerError`` so the
+    surrounding ``try`` block in ``app_server_invoke`` records the
+    failure via the existing `turn_failed` path. The error message is
+    preserved so loop-side handlers that key on
+    ``"did not respond to initialize"`` continue to work.
+
+    ``prompt_byte_size`` source choice: callers pass
+    ``len(task_prompt.encode('utf-8'))`` where ``task_prompt`` is the
+    ``developer_instructions`` block we'll send to Codex on
+    ``thread/start``. This is the user-supplied content that contributes
+    to the prompt-side preprocessing the App Server may do before
+    replying to ``initialize``. We deliberately do NOT include the
+    base instructions / system prompt boilerplate in the byte-size: that
+    payload is constant across turns, and the variable that
+    distinguishes a fast first-cold-start from a slow one in the issue
+    thread is the user's task brief size. See product-steward's #40
+    Phase 1 brief, point 4.
+    """
+    import threading
+
+    timeout_s = _read_float_env(
+        APP_SERVER_INITIALIZE_TIMEOUT_ENV,
+        _DEFAULT_INITIALIZE_TIMEOUT_S,
+    )
+    progress_interval_s = _read_float_env(
+        APP_SERVER_INITIALIZE_PROGRESS_INTERVAL_ENV,
+        _DEFAULT_INITIALIZE_PROGRESS_INTERVAL_S,
+        allow_zero=True,
+    )
+
+    started_at = time.monotonic()
+    result_holder: dict[str, Any] = {}
+    error_holder: dict[str, BaseException] = {}
+
+    def _worker() -> None:
+        try:
+            result_holder["result"] = client.initialize(timeout=timeout_s)
+        except BaseException as exc:  # noqa: BLE001 — re-raised on main
+            error_holder["error"] = exc
+
+    worker = threading.Thread(
+        target=_worker,
+        name="app_server-initialize",
+        daemon=True,
+    )
+    worker.start()
+
+    attempt = 0
+    while True:
+        wait_s = (
+            min(progress_interval_s, max(0.05, timeout_s - (time.monotonic() - started_at)))
+            if progress_interval_s > 0
+            else max(0.05, timeout_s - (time.monotonic() - started_at))
+        )
+        worker.join(timeout=wait_s)
+        if not worker.is_alive():
+            break
+        elapsed_s = time.monotonic() - started_at
+        if elapsed_s >= timeout_s:
+            # The underlying request() timeout will fire on its own; let
+            # the worker observe it and raise. We just stop emitting
+            # progress and fall through to the join below.
+            break
+        if progress_interval_s <= 0:
+            continue
+        attempt += 1
+        pid = client.pid
+        cpu_pct = _read_proc_cpu_pct(pid) if isinstance(pid, int) else None
+        progress_payload: dict[str, Any] = {
+            "attempt": attempt,
+            "elapsed_s": round(elapsed_s, 2),
+            "timeout_s": timeout_s,
+            "progress_interval_s": progress_interval_s,
+            "prompt_byte_size": prompt_byte_size,
+            "last_observed_pid": pid,
+        }
+        if cpu_pct is not None:
+            progress_payload["last_observed_cpu_pct"] = round(cpu_pct, 1)
+        try:
+            emit_visibility(
+                kind="app_server_initialize_progress",
+                severity="warn",
+                summary=(
+                    f"Codex App Server initialize still pending after "
+                    f"{int(elapsed_s)}s (attempt {attempt})"
+                ),
+                visibility={
+                    "mailbox": False,
+                    "task_state": False,
+                    "event_log": True,
+                    "stderr": True,
+                },
+                payload=progress_payload,
+            )
+        except Exception as e:
+            logger.debug(
+                "app_server.initialize_progress_emit_failed",
+                error=str(e),
+            )
+
+    worker.join()
+    elapsed_ms = int((time.monotonic() - started_at) * 1000)
+
+    if "error" in error_holder:
+        raise error_holder["error"]
+
+    try:
+        emit_visibility(
+            kind="app_server_initialize_completed",
+            severity="info",
+            summary=f"Codex App Server initialize completed in {elapsed_ms}ms",
+            visibility={
+                "mailbox": False,
+                "task_state": False,
+                "event_log": True,
+                "stderr": True,
+            },
+            payload={
+                "elapsed_ms": elapsed_ms,
+                "prompt_byte_size": prompt_byte_size,
+                "timeout_s": timeout_s,
+            },
+        )
+    except Exception as e:
+        logger.debug(
+            "app_server.initialize_completed_emit_failed",
+            error=str(e),
+        )
+
+    return result_holder.get("result")
 
 
 def _start_or_fork_thread(
@@ -1481,7 +1702,11 @@ def app_server_invoke(
 
     try:
         client.start()
-        client.initialize()
+        _initialize_with_progress_events(
+            client,
+            emit_visibility=_emit_visibility_event,
+            prompt_byte_size=len(task_prompt.encode("utf-8")),
+        )
 
         thread_id = _start_or_fork_thread(
             client,

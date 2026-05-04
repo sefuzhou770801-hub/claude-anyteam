@@ -45,7 +45,7 @@ def _capture_thread_start_config(
         def start(self):
             pass
 
-        def initialize(self):
+        def initialize(self, **_kwargs):
             return {}
 
         def thread_start(self, **kwargs):

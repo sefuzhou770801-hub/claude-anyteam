@@ -15,6 +15,15 @@ dependencies = [
     # `claude_anyteam.wrapper_server` and pinned to match the team-protocol
     # implementation's runtime expectations.
     "fastmcp==3.0.0b1",
+    # Transitive of fastmcp / mcp / httpx-sse. Pin below 1.0 explicitly:
+    # uv's resolver promoted `httpx==1.0.dev3` into clean tool-venv installs
+    # (the dev release satisfies `>=0.27.1`/`>=0.28.1`) and that release
+    # removed `httpx.TransportError`, which `httpx-sse` imports. Result:
+    # `from fastmcp import FastMCP` raised `AttributeError` at import time,
+    # the codex spawn shim crashed inside its tmux pane, and no registration
+    # event ever fired — the silent-spawn failure observed in #32. Hold the
+    # pin until fastmcp / httpx-sse drop their httpx-1.0 incompatibility.
+    "httpx>=0.28,<1.0",
     # Used by `claude_teams` for the file-based mailbox / config locking
     # that the team protocol relies on.
     "filelock==3.16",

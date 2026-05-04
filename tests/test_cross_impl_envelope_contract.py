@@ -131,7 +131,7 @@ class _ContractAppServerClient:
     def start(self) -> None:
         pass
 
-    def initialize(self) -> dict[str, Any]:
+    def initialize(self, **_kwargs) -> dict[str, Any]:
         return {}
 
     def thread_start(self, **kwargs: Any) -> str:
@@ -201,7 +201,7 @@ class _RecoveringAppServerClient:
     def start(self) -> None:
         pass
 
-    def initialize(self) -> dict[str, Any]:
+    def initialize(self, **_kwargs) -> dict[str, Any]:
         return {}
 
     def thread_start(self, **kwargs: Any) -> str:
@@ -315,7 +315,7 @@ class _ContractGeminiAcpClient:
     def close(self) -> None:
         pass
 
-    def initialize(self) -> dict[str, Any]:
+    def initialize(self, **_kwargs) -> dict[str, Any]:
         return {"protocolVersion": 1}
 
     def session_new(self, **kwargs: Any) -> dict[str, str]:

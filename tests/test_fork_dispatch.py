@@ -69,7 +69,7 @@ class _FakeClient:
     def start(self):
         pass
 
-    def initialize(self):
+    def initialize(self, **_kwargs):
         return {}
 
     def thread_start(self, **kwargs):

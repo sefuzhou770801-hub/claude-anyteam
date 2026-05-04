@@ -58,7 +58,9 @@ from .env import (
 from .messages import (
     BatchSummaryChild,
     BatchSummaryPayload,
+    KNOWN_TASK_BLOCKED_REASONS,
     VisibilityEvent,
+    is_token_shaped_reason,
     parse_protocol_text,
 )
 from . import protocol_io
@@ -521,6 +523,37 @@ def _normalise_lifecycle_send_body(kind: str, body: str) -> str:
     if payload is None:
         raise ToolError(f"body is not a valid {kind!r} protocol payload")
     return payload.model_dump_json(by_alias=True, exclude_none=True)
+
+
+def _task_blocked_reason_drift(body: str) -> str | None:
+    """Return the offending reason if a typed ``task_blocked`` body uses a
+    token-shaped reason that is not in ``KNOWN_TASK_BLOCKED_REASONS``.
+
+    #40 Phase 1, graduated rung 1+2 (declare + suggest): the
+    ``task_blocked.reason`` field is an open ``str`` for backward compat,
+    but new machine-readable tokens (e.g. ``app_server_initialize_timeout``)
+    are registered. Token-shaped reasons that are NOT in the registry
+    likely indicate either a typo or a missing registration step. We
+    surface those via a ``visibility_degraded`` warn at the wrapper layer
+    so the lead can see drift, without blocking delivery (free-form prose
+    reasons remain legal — only ``snake_case`` token-shaped strings are
+    policed).
+    """
+
+    try:
+        raw = json.loads(body)
+    except (TypeError, ValueError):
+        return None
+    if not isinstance(raw, dict):
+        return None
+    reason = raw.get("reason")
+    if not isinstance(reason, str):
+        return None
+    if reason in KNOWN_TASK_BLOCKED_REASONS:
+        return None
+    if not is_token_shaped_reason(reason):
+        return None
+    return reason
 
 
 def _run_git(
@@ -1269,6 +1302,43 @@ def build_server(argv: list[str] | None = None) -> FastMCP:
             raise ToolError(f"`kind` must be one of {SEND_MESSAGE_KINDS}; got {kind!r}")
         if kind in LIFECYCLE_SEND_MESSAGE_KINDS:
             body = _normalise_lifecycle_send_body(kind, body)
+            if kind == "task_blocked":
+                drifted = _task_blocked_reason_drift(body)
+                if drifted is not None:
+                    # #40 Phase 1: surface drift in token-shaped
+                    # task_blocked reasons without blocking delivery.
+                    # The §2 contract is that the lead can see the
+                    # mismatch — if a typo or missed registry update is
+                    # leaking into typed lifecycle, the warn event is
+                    # how they catch it.
+                    try:
+                        warn_event = _make_event(
+                            kind="visibility_degraded",
+                            severity="warn",
+                            summary=(
+                                f"task_blocked emitted with unregistered "
+                                f"reason token: {drifted!r}"
+                            ),
+                            mailbox=True,
+                            payload={
+                                "surface": "task_blocked_unknown_reason",
+                                "reason": drifted,
+                                "registered_reasons": sorted(
+                                    KNOWN_TASK_BLOCKED_REASONS
+                                ),
+                                "impact": (
+                                    "Recipients filtering on task_blocked.reason "
+                                    "may not match this value. Either add the "
+                                    "token to KNOWN_TASK_BLOCKED_REASONS or "
+                                    "use a free-form prose reason instead."
+                                ),
+                            },
+                        )
+                        _fanout_visibility_event(warn_event)
+                    except Exception as e:
+                        logger.warning(
+                            "task_blocked_drift_emit_failed: %s", e
+                        )
         if to == self_name:
             raise ToolError(f"refusing to send message to self ({self_name!r})")
         try:
