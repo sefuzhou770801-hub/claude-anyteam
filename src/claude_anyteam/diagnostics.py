@@ -117,6 +117,7 @@ def record_incident(
 ERROR_CLASSES: tuple[str, ...] = (
     "subprocess_crash",         # the backend process didn't return a result at all
     "turn_timeout",             # backend reported its own timeout (e.g. App Server 900s)
+    "app_server_initialize_timeout",  # JSON-RPC `initialize` budget exceeded (#40 Phase 1)
     "schema_validation_failed", # final response didn't match the configured schema
     "mcp_send_message_unavailable",  # wrapper MCP allowlist gap (B2 lifecycle bug)
     "subprocess_nonzero_exit",  # backend exited non-zero with no clearer signal
@@ -138,6 +139,10 @@ def classify_failure(result: Any) -> str:
     if result is None:
         return "subprocess_crash"
     err = (getattr(result, "error", "") or "").lower()
+    # Check more specific patterns BEFORE generic "timeout" so initialize
+    # timeouts are classified into their dedicated bucket (#40 Phase 1).
+    if "did not respond to initialize" in err:
+        return "app_server_initialize_timeout"
     if "timeout" in err or "did not complete within" in err:
         return "turn_timeout"
     if "schema" in err and "valid" in err:
@@ -155,7 +160,20 @@ def fallback_message(*, backend: str, incident_id: str, error_class: str) -> str
     The shape is the same across backends so the lead can recognize it at
     a glance regardless of which teammate emitted it. Keep it short — this
     text lands in chat, not a log viewer.
+
+    #40 Phase 1: ``app_server_initialize_timeout`` gets a concise pointer
+    rather than the full apologetic preamble. The typed
+    ``visibility_degraded`` event the prose-bound emitter pairs with
+    carries the structured detail; prose stays minimal. See product
+    steward's #40 Phase 1 brief, Gap 2.
     """
+    if error_class == "app_server_initialize_timeout":
+        return (
+            f"App Server initialize timed out (incident_id={incident_id}). "
+            f"See `claude-anyteam diagnose --incident {incident_id}` for "
+            f"detail; the typed visibility_degraded event has structured "
+            f"context for the lead's event log."
+        )
     return (
         f"I received your message but couldn't generate a reply "
         f"(adapter={backend}, error={error_class}, incident={incident_id}). "

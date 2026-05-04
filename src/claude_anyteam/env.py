@@ -45,6 +45,21 @@ LEGACY_NON_PROGRESS_WARN_ENV = "CODEX_TEAMMATE_NON_PROGRESS_WARN_S"
 NON_PROGRESS_INTERRUPT_ENV = "CLAUDE_ANYTEAM_NON_PROGRESS_INTERRUPT_S"
 LEGACY_NON_PROGRESS_INTERRUPT_ENV = "CODEX_TEAMMATE_NON_PROGRESS_INTERRUPT_S"
 
+# Codex App Server JSON-RPC ``initialize`` budget (#40 Phase 1).
+# Default 90s — chosen because the only successful empirical sample we
+# have (codex-reviewer turn 1, parking-ack prompt, ~17s) is well under
+# 90s. Override via env when a legitimate first-cold-start on a complex
+# prompt needs longer; the new ``app_server_initialize_completed`` event
+# records ``elapsed_ms`` and ``prompt_byte_size`` per success so we can
+# revisit the default with data, not vibes.
+APP_SERVER_INITIALIZE_TIMEOUT_ENV = "CLAUDE_ANYTEAM_APP_SERVER_INITIALIZE_TIMEOUT_S"
+# Cadence (in seconds) for ``app_server_initialize_progress`` typed
+# events emitted while waiting on JSON-RPC ``initialize`` (#40 Phase 1).
+# Default 30s. Set to 0 to disable progress emission entirely.
+APP_SERVER_INITIALIZE_PROGRESS_INTERVAL_ENV = (
+    "CLAUDE_ANYTEAM_APP_SERVER_INITIALIZE_PROGRESS_INTERVAL_S"
+)
+
 LOG_ENV = "CLAUDE_ANYTEAM_LOG"
 LEGACY_LOG_ENV = "CODEX_TEAMMATE_LOG"
 

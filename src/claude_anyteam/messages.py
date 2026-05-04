@@ -12,6 +12,7 @@ conform exactly.
 
 from __future__ import annotations
 
+import re
 from datetime import datetime, timezone
 from typing import Any, Literal
 
@@ -254,6 +255,58 @@ class TaskBlockedOut(_Base):
     timestamp: str = Field(default_factory=now_iso)
 
 
+# #40 Phase 1 — discriminated-reason registry (graduated enforcement).
+#
+# ``task_blocked.reason`` is an open ``str`` field for backward compat
+# with existing free-form values like ``"codex invocation crashed: ..."``
+# or ``"plan generation failed twice ..."``. New machine-readable tokens
+# get registered here so peers can query/filter by stable discriminator
+# instead of grepping prose substrates. The wrapper-MCP ``send_message``
+# tool emits a ``visibility_degraded`` warn for token-shaped reasons that
+# are NOT in this registry — surfaces drift without blocking delivery.
+#
+# Adding a new typed token? Add it here AND ensure the emit-site is
+# tested. Free-form prose reasons (with whitespace / mixed case) bypass
+# the validator entirely — they are still legal but not recommended.
+#
+# Per ``feedback_graduated_enforcement_ladder``: rung 1 (declare) +
+# rung 2 (suggest via warn). Future PR can promote to rung 3 (reject)
+# once we've verified all production emit-sites use registered tokens.
+KNOWN_TASK_BLOCKED_REASONS: frozenset[str] = frozenset(
+    {
+        # #40 Phase 1: JSON-RPC ``initialize`` budget exceeded during a
+        # turn invocation. Stable token replaces the prior raw error
+        # string ``"app_server error: did not respond to initialize ..."``.
+        "app_server_initialize_timeout",
+        # #40 Phase 1: ``initialize`` budget exceeded specifically while
+        # the adapter was honoring an in-flight ``shutdown_request``. The
+        # discriminator distinction lets the lead surface a no-op
+        # shutdown burning the budget vs a work-turn timeout uniformly
+        # in their dashboard, but with separate filters.
+        "app_server_shutdown_timeout",
+    }
+)
+
+
+# Token shape for the registry's gate: snake_case, lowercase ASCII +
+# digits + underscores, starting with a letter. Matches what we expect
+# for stable machine-readable reason values; everything else (prose with
+# spaces, mixed case, JSON, traceback dumps) bypasses the gate.
+_TOKEN_SHAPED_REASON_RE = re.compile(r"^[a-z][a-z0-9_]+$")
+
+
+def is_token_shaped_reason(reason: str) -> bool:
+    """Return True if ``reason`` looks like a stable machine-readable token.
+
+    The wrapper-MCP validator only checks the registry for token-shaped
+    values; free-form prose reasons (which have whitespace or punctuation
+    or mixed case) pass through silently. This is the §1-respecting
+    pragmatic shape: structural tokens are policed, free-form is left
+    alone for backward compat.
+    """
+    return bool(_TOKEN_SHAPED_REASON_RE.match(reason))
+
+
 class PlanBlockedOut(_Base):
     """Typed lifecycle payload for an unfulfillable plan-approval request."""
 
@@ -323,6 +376,22 @@ VisibilityEventKind = Literal[
     "capability_changed",
     "capability_manifest_updated",
     "batch_summary",
+    # #40 Phase 1: success-path instrumentation for the Codex App Server
+    # JSON-RPC ``initialize`` handshake. Carries ``elapsed_ms`` and
+    # ``prompt_byte_size`` so we can revisit the default initialize
+    # timeout (90s — see ``APP_SERVER_INITIALIZE_TIMEOUT_ENV``) with real
+    # success-path data instead of the single 17s anecdote we have today.
+    # Closes the meta-observability gap noted in the #40 thread:
+    # "10-minute silence is indistinguishable from 'agent is genuinely
+    # thinking hard' until the failure event lands."
+    "app_server_initialize_completed",
+    # #40 Phase 1: periodic progress envelope emitted while we are still
+    # waiting on the ``initialize`` reply. Cadence is
+    # ``APP_SERVER_INITIALIZE_PROGRESS_INTERVAL_ENV`` (default 30s). Lets
+    # the lead observe a slow cold start without staring at a 90s
+    # silence; carries ``attempt``, ``elapsed_s``, ``last_observed_pid``,
+    # and (Linux only, best-effort) ``last_observed_cpu_pct``.
+    "app_server_initialize_progress",
 ]
 
 VisibilitySeverity = Literal["debug", "info", "warn", "error"]
@@ -431,6 +500,8 @@ def parse_protocol_text(text: str) -> _Base | None:
         "capability_changed",
         "capability_manifest_updated",
         "batch_summary",
+        "app_server_initialize_completed",
+        "app_server_initialize_progress",
     }:
         return _safe_load(VisibilityEvent, raw)
     return None

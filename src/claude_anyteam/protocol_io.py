@@ -891,6 +891,73 @@ def send_idle_notification(team: str, sender: str, reason: str = "available") ->
     )
 
 
+def emit_initialize_timeout_visibility_degraded(
+    *,
+    team: str,
+    agent: str,
+    backend: str,
+    phase: str,
+    incident_id: str,
+    sender: str | None = None,
+    shutdown_request: bool = False,
+    error: str | None = None,
+) -> VisibilityEvent:
+    """Emit a typed ``visibility_degraded`` envelope for a prose-bound App
+    Server ``initialize`` timeout (#40 Phase 1, Gap 2).
+
+    Task-bound initialize timeouts route to ``task_blocked`` with a
+    typed reason via ``send_task_blocked``. Prose-bound timeouts have no
+    ``task_id`` to block, so they emit this typed envelope instead — the
+    lead's event log and mailbox carry the structured detail; the prose
+    response (which still ships, because the sender's turn needs *some*
+    completion) becomes a thin pointer at the incident_id.
+
+    ``phase`` distinguishes the prose context (typically
+    ``"prose_bound"``) from any future variants. ``shutdown_request``
+    flags whether the timeout was hit while honoring an in-flight
+    shutdown_request — the worst-UX variant from the #40 issue thread,
+    where a no-op shutdown burned the full 600s.
+
+    Fan-out: event log always, mailbox always (the lead must see this
+    at native fidelity rather than scraping stderr).
+    """
+
+    event_id = f"{agent}:init-timeout-prose:{int(time.time() * 1000)}"
+    payload: dict[str, Any] = {
+        "surface": "app_server_initialize_timeout",
+        "phase": phase,
+        "incident_id": incident_id,
+        "shutdown_request": bool(shutdown_request),
+    }
+    if sender is not None:
+        payload["sender"] = sender
+    if error is not None:
+        payload["raw_backend_error"] = _bounded_text(error, limit=600)
+    envelope = VisibilityEvent(
+        kind="visibility_degraded",
+        event_id=event_id,
+        team=team,
+        agent=agent,
+        backend=backend,
+        seq=0,
+        severity="error",
+        summary=(
+            f"App Server initialize timed out (prose-bound; "
+            f"shutdown_request={bool(shutdown_request)})"
+        )[:300],
+        visibility={
+            "mailbox": True,
+            "task_state": False,
+            "event_log": True,
+            "stderr": True,
+        },
+        payload=payload,
+    )
+    append_event(team, agent, envelope)
+    send_visibility_event_to_lead(team, agent, envelope)
+    return envelope
+
+
 def emit_peer_steer_rejection(
     *,
     team: str,

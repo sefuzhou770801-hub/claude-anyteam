@@ -171,38 +171,89 @@ def _backend_metadata(settings: Settings) -> BackendMetadata:
 
 
 def run(settings: Settings) -> int:
-    """Run the adapter's main loop. Returns a process exit code."""
-    codex_mod.feature_test(
-        settings.codex_binary,
-        mcp_probe=True,
-        team=settings.team_name,
-        agent_name=settings.agent_name,
-    )
-    register(settings, _backend_metadata(settings))
+    """Run the adapter's main loop. Returns a process exit code.
 
-    state = LoopState(settings=settings)
-    state.self_capability_manifest = pio.read_agent_manifest(
-        settings.team_name,
-        settings.agent_name,
-    )
-    state.peer_manifest_cache = CapabilityManifestCache(
-        settings.team_name,
-        self_name=settings.agent_name,
-    )
-    state.peer_manifest_cache.load_startup()
-
-    def _sig_handler(signum: int, _frame: Any) -> None:
-        logger.warn("signal.received", signum=signum)
-        state.shutdown_requested = True
-
-    signal.signal(signal.SIGINT, _sig_handler)
-    signal.signal(signal.SIGTERM, _sig_handler)
-
+    Bootstrap (``feature_test``, ``register``, manifest load, signal setup)
+    runs inside the same try/except as ``_main_loop`` so a crash before the
+    first inbox poll is surfaced to the lead the same way native-Claude and
+    Gemini/Kimi cold-start crashes are: a structured ``visibility_degraded``
+    envelope to the lead mailbox + event log, plus a ``record_incident``
+    diagnostic. Without this, codex-* spawn-bootstrap failures (e.g. the v0.5
+    httpx-version-mismatch that broke ``from fastmcp import FastMCP``) exit
+    silently to a tmux-pane stderr the lead may not be reading — see issue
+    #32. Mirrors the pattern that Gemini's ``backends/gemini/loop.py:run`` and
+    Kimi's ``backends/kimi/loop.py:run`` already use.
+    """
+    state: LoopState | None = None
     exit_code = 0
+    startup_phase = "feature_test"
+    startup_complete = False
     try:
+        codex_mod.feature_test(
+            settings.codex_binary,
+            mcp_probe=True,
+            team=settings.team_name,
+            agent_name=settings.agent_name,
+        )
+        startup_phase = "registration"
+        register(settings, _backend_metadata(settings))
+
+        startup_phase = "capability_manifest_load"
+        state = LoopState(settings=settings)
+        state.self_capability_manifest = pio.read_agent_manifest(
+            settings.team_name,
+            settings.agent_name,
+        )
+        state.peer_manifest_cache = CapabilityManifestCache(
+            settings.team_name,
+            self_name=settings.agent_name,
+        )
+        state.peer_manifest_cache.load_startup()
+
+        def _sig_handler(signum: int, _frame: Any) -> None:
+            logger.warn("signal.received", signum=signum)
+            assert state is not None
+            state.shutdown_requested = True
+
+        startup_phase = "signal_setup"
+        signal.signal(signal.SIGINT, _sig_handler)
+        signal.signal(signal.SIGTERM, _sig_handler)
+
+        startup_complete = True
         _main_loop(state)
     except Exception as e:
-        logger.error("loop.crash", error=str(e))
+        if startup_complete:
+            logger.error("loop.crash", error=str(e))
+            error_class = "adapter_crash"
+        else:
+            logger.error(
+                "loop.startup_crash",
+                phase=startup_phase,
+                error=str(e),
+            )
+            error_class = "adapter_startup_crash"
+            # Startup failures happen before the first inbox poll, so fan out
+            # an envelope directly. Without this the lead sees a teammate that
+            # never registers — indistinguishable from "still booting" for the
+            # lifetime of the team. (#32 visibility-parity gap.)
+            try:
+                pio.emit_adapter_startup_crash(
+                    team=settings.team_name,
+                    agent=settings.agent_name,
+                    backend="codex",
+                    phase=startup_phase,
+                    error=e,
+                    payload={
+                        "codex_binary": settings.codex_binary,
+                        "cwd": str(settings.cwd),
+                        "app_server": bool(getattr(settings, "app_server", False)),
+                    },
+                )
+            except Exception as emit_exc:
+                logger.debug(
+                    "loop.startup.visibility_emit_failed",
+                    error=str(emit_exc),
+                )
         # Persist a structured incident so the lead can find this via
         # `claude-anyteam diagnose`. Without this the only crash signal
         # is stderr in a tmux pane the lead may not be reading.
@@ -212,7 +263,7 @@ def run(settings: Settings) -> int:
                 team=settings.team_name,
                 agent=settings.agent_name,
                 backend="codex",
-                error_class="adapter_crash",
+                error_class=error_class,
                 summary=str(e),
             )
         except Exception:
@@ -226,13 +277,13 @@ def run(settings: Settings) -> int:
         # and returning — so SIGTERM exits cleanly. Only uncaught exceptions
         # (loop.crash) skip deregistration and leave a zombie entry for the
         # lead to inspect.
-        if state.approved_shutdown:
+        if state is not None and state.approved_shutdown:
             deregister(settings)
             logger.info("loop.deregistered", name=settings.agent_name)
         else:
             logger.warn(
                 "loop.exit_without_deregister",
-                in_flight_task=state.in_flight_task,
+                in_flight_task=(state.in_flight_task if state is not None else None),
             )
     return exit_code
 
@@ -514,6 +565,17 @@ def _prose_fallback_reply(
     the incident_id embedded so the lead can run
     ``claude-anyteam diagnose --incident <id>`` to recover details without
     raw error strings leaking into chat.
+
+    #40 Phase 1 — Gap 2 (prose-bound initialize timeout): when the
+    failure is specifically the App Server JSON-RPC ``initialize``
+    timeout (the most common high-cost failure surfaced in the issue
+    thread), ALSO emit a typed ``visibility_degraded`` envelope to the
+    lead with ``surface="app_server_initialize_timeout"`` and
+    ``phase="prose_bound"``. The prose response stays as the courtesy
+    completion (the sender's turn needs *some* reply), but it's
+    rewritten to be a thin pointer at the typed event rather than an
+    apology in lieu of structured detail. See product-steward's #40
+    Phase 1 brief, Gap 2.
     """
     from . import diagnostics  # local import keeps loop.py import graph thin
     s = state.settings
@@ -533,6 +595,29 @@ def _prose_fallback_reply(
             "error": (result.error if result is not None else None),
         },
     )
+    if error_class == "app_server_initialize_timeout":
+        # Pair the prose pointer with a typed event the lead's event log
+        # surfaces immediately. The shutdown_request flag distinguishes
+        # no-op shutdown burns (the user's #40 evidence: even 600s on
+        # a {"type":"shutdown_request"}) from work-turn timeouts so the
+        # lead can filter on `shutdown_request: true` for the worst-UX
+        # variant.
+        try:
+            pio.emit_initialize_timeout_visibility_degraded(
+                team=s.team_name,
+                agent=s.agent_name,
+                backend="codex",
+                phase="prose_bound",
+                incident_id=incident_id,
+                sender=sender,
+                shutdown_request=state.shutdown_requested,
+                error=(result.error if result is not None else None),
+            )
+        except Exception as e:
+            logger.debug(
+                "prose.initialize_timeout_visibility_emit_failed",
+                error=str(e),
+            )
     return diagnostics.fallback_message(
         backend="codex",
         incident_id=incident_id,
@@ -1280,11 +1365,19 @@ def _execute_task(state: LoopState, task) -> None:
             exit_code=result.exit_code,
             error=result.error,
         )
-        _mark_blocked(
-            state,
-            task,
-            reason=(result.error or f"codex exited {result.exit_code} with no structured result"),
+        # #40 Phase 1: when the failure is specifically the App Server
+        # JSON-RPC ``initialize`` timeout, route to a stable
+        # machine-readable reason token so the lead's task-state view
+        # can grep ``task_blocked.reason == "app_server_initialize_timeout"``
+        # (or ``"app_server_shutdown_timeout"`` if a shutdown is in
+        # flight) instead of parsing a per-incident error string.
+        # Replaces the ad-hoc prose_reply fallback the wrapper used to
+        # emit. Both tokens live in ``messages.KNOWN_TASK_BLOCKED_REASONS``.
+        reason = _classify_task_block_reason(
+            result,
+            shutdown_requested=state.shutdown_requested,
         )
+        _mark_blocked(state, task, reason=reason)
         state.in_flight_task = None
         return
 
@@ -1711,6 +1804,38 @@ def _execute_task_app_server(state: LoopState, task, prompt: str):
                 error=str(e),
             )
     return result
+
+
+def _classify_task_block_reason(result: Any, *, shutdown_requested: bool = False) -> str:
+    """Map a failed Codex result to a stable ``task_blocked.reason`` token.
+
+    Today the wrapper used the raw error string as the reason, which made
+    lead-side filters key on substrings like ``"did not respond to
+    initialize"``. #40 Phase 1 surfaces a stable machine-readable token
+    for the most common high-cost failures so lead-side automation can
+    branch cleanly:
+
+    - ``"app_server_shutdown_timeout"`` — JSON-RPC ``initialize`` did
+      not respond, AND the adapter has an in-flight shutdown request.
+      The user's #40 thread documented "even shutdown turns hang for
+      600s" — distinct discriminator so the lead can filter no-op
+      shutdown burns separately from work-turn timeouts.
+    - ``"app_server_initialize_timeout"`` — JSON-RPC ``initialize`` did
+      not respond within the configured budget on a regular turn.
+    - Falls back to the raw error string (preserves prior behavior for
+      the long tail of failures we haven't classified yet).
+
+    Both new tokens live in
+    ``claude_anyteam.messages.KNOWN_TASK_BLOCKED_REASONS`` so the
+    wrapper-MCP validator recognizes them as registered.
+    """
+    err = (getattr(result, "error", "") or "")
+    err_l = err.lower()
+    if "did not respond to initialize" in err_l:
+        if shutdown_requested:
+            return "app_server_shutdown_timeout"
+        return "app_server_initialize_timeout"
+    return err or f"codex exited {getattr(result, 'exit_code', '?')} with no structured result"
 
 
 def _mark_blocked(state: LoopState, task, reason: str) -> None:
