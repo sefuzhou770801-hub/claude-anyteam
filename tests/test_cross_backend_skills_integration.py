@@ -6,8 +6,10 @@ Locks the empirical contract validated against live codex teammates in the
 1. The shared ``skill_discovery`` cache picks up both in-repo skills and
    marketplace skills under ``~/.claude/plugins/marketplaces/*/skills/``.
 2. The C-side ``compose_project_skills_fragment`` heuristic correctly maps
-   diverse domain tasks (cold email, SEO, copywriting, marketing ideas) to
-   the right top-1 skill name.
+   diverse domain tasks (cold email, SEO, copywriting, marketing ideas) so
+   that the right skill name appears in the top-3 matches the receiving
+   teammate sees. The teammate's LLM picks among those top-3 candidates;
+   the heuristic's job is "right candidate present", not "uniquely #1".
 3. The fragment shape includes the explicit
    ``mcp_anyteam_invoke_skill('<name>')`` invitation so the receiving LLM
    has a concrete next step.
