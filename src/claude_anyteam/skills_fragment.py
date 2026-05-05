@@ -74,12 +74,28 @@ def _tokens(text: str) -> set[str]:
 
 
 def _skill_name_matches(task_text: str, name: str) -> bool:
-    """True if the skill name appears as a word/slash-command in the task text."""
+    """True if the skill name appears as a word/slash-command in the task text.
+
+    Bare single-token stopword names (e.g. ``help``) only count as an explicit
+    mention when the task text uses the slash-command form (``/help``).
+    Otherwise generic prose like "I need help with…" would falsely score
+    ``/help`` as the dominant match. Compound names (``cold-email``,
+    ``marketing-ideas``) bypass the stopword check by definition.
+    """
+
     normalized = name.strip().lstrip("/").lower()
     if not normalized:
         return False
+    lower = task_text.lower()
+    # Slash-prefixed mentions are deliberate; always honor them.
+    if re.search(rf"(?<![a-z0-9])/{re.escape(normalized)}(?![a-z0-9])", lower):
+        return True
+    # Non-slash mentions: skip if the bare name is also a stopword (single
+    # token, not compound). Compound names like "cold-email" pass through.
+    if "-" not in normalized and "_" not in normalized and normalized in _STOPWORDS:
+        return False
     return (
-        re.search(rf"(?<![a-z0-9])/?{re.escape(normalized)}(?![a-z0-9])", task_text.lower())
+        re.search(rf"(?<![a-z0-9]){re.escape(normalized)}(?![a-z0-9])", lower)
         is not None
     )
 

@@ -2,11 +2,17 @@
 
 from __future__ import annotations
 
-import os
 from pathlib import Path
 from typing import Any
 
 from . import logger
+
+# Per-process snapshot for the default-args ``discover_skills()`` path. Both
+# A's wrapper-MCP tools and C's prompt-fragment composer reuse this so the
+# host's skill universe is one consistent snapshot per process. New skills
+# installed/uninstalled mid-process are not picked up until restart — that's
+# the v1 staleness boundary.
+_DEFAULT_CACHE: dict[str, dict[str, Any]] | None = None
 
 
 def decode_bytes(data: bytes) -> tuple[str, str]:
@@ -83,8 +89,9 @@ def discover_skills(
     *,
     repo_skills_dir: Path | None = None,
     marketplace_root: Path | None = None,
+    refresh: bool = False,
 ) -> dict[str, dict[str, Any]]:
-    """Discover Claude Code skills once for a wrapper startup cache.
+    """Discover Claude Code skills, cached per-process for the default-args path.
 
     Sources match the PoC-A wrapper tools:
     - in-repo ``skills/<name>/SKILL.md``
@@ -93,7 +100,21 @@ def discover_skills(
 
     Skill names are the invoke key, so duplicates are kept deterministic:
     in-repo skills win over marketplace copies of the same skill name.
+
+    The default-args call (no ``repo_skills_dir`` / ``marketplace_root``) is
+    memoised in a process-wide snapshot. Both A's wrapper-MCP tools and C's
+    fragment composer share that snapshot so the host's skill universe is
+    consistent across the boundary, and neither path pays a per-call disk
+    scan. Mid-process install / uninstall is not picked up until restart;
+    pass ``refresh=True`` to force a rediscover. Custom paths always
+    rediscover and never touch the default cache (test friendly).
     """
+
+    global _DEFAULT_CACHE
+
+    use_default_path = repo_skills_dir is None and marketplace_root is None
+    if use_default_path and not refresh and _DEFAULT_CACHE is not None:
+        return _DEFAULT_CACHE
 
     repo_skills_dir = (repo_skills_dir or (repo_root() / "skills")).expanduser().resolve()
     marketplace_root = (
@@ -134,4 +155,7 @@ def discover_skills(
                 "body": body,
             },
         )
+
+    if use_default_path:
+        _DEFAULT_CACHE = discovered
     return discovered

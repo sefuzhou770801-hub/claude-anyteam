@@ -166,3 +166,103 @@ def test_task_text_for_skill_match_handles_strings_and_objects() -> None:
 
     assert task_text_for_skill_match(None) == ""
     assert task_text_for_skill_match("") == ""
+
+
+def test_compose_skills_fragment_does_not_bonus_bare_stopword_name() -> None:
+    """Bare prose like "I need help…" must not bonus a ``help``-named skill.
+
+    Regression: PR #47 review v1 noted that ``_skill_name_matches`` bypassed
+    the stopword filter, so generic ``help``-bearing prose (e.g.
+    "I need help writing the hero section copy…") spuriously matched
+    ``/help`` as the strongest skill mention even though copywriting was
+    the right domain match. Compound names ("cold-email", "marketing-ideas")
+    must still match.
+    """
+
+    skills = [
+        {
+            "name": "help",
+            "description": "Help with claude-anyteam teammates.",
+            "when_to_use": "User asks to create or troubleshoot teammates.",
+            "source_path": "skills/help/SKILL.md",
+        },
+        {
+            "name": "copywriting",
+            "description": "Landing-page copy and conversion playbook.",
+            "when_to_use": "User wants hero section / headline / body copy rewrites.",
+            "source_path": "skills/copywriting/SKILL.md",
+        },
+    ]
+
+    fragment = compose_skills_fragment(
+        "I need help writing the hero section copy for my SaaS landing page",
+        skills,
+    )
+
+    assert fragment is not None
+    # /copywriting should win over /help — not by tie-break luck but because
+    # the bare "help" token in stopwords no longer bonuses /help.
+    matched = [
+        line.split(":", 1)[0].strip()
+        for line in fragment.splitlines()
+        if line.startswith("- /")
+    ]
+    assert matched, "expected at least one skill match"
+    assert matched[0] == "- /copywriting", (
+        f"expected /copywriting at the top of matches, got: {matched}"
+    )
+
+
+def test_compose_skills_fragment_honors_explicit_slash_help() -> None:
+    """Explicit ``/help`` slash mention must still match the help skill.
+
+    The stopword guard only suppresses bare-word mentions. Slash-prefixed
+    forms are deliberate by the user and should still be honored.
+    """
+
+    skills = [
+        {
+            "name": "help",
+            "description": "Help with claude-anyteam teammates.",
+            "when_to_use": "User asks to create or troubleshoot teammates.",
+            "source_path": "skills/help/SKILL.md",
+        },
+    ]
+
+    fragment = compose_skills_fragment("Run /help on the team substrate", skills)
+    assert fragment is not None
+    assert "/help" in fragment
+
+
+def test_compose_skills_fragment_caps_matches_at_three_with_controlled_fixture() -> None:
+    """With 5 equally-matching skills, exactly 3 must appear (not the live count).
+
+    Regression: PR #47 review v1 noted that the existing
+    ``test_fragment_caps_at_three_matches`` was weak because it asserted
+    ``<= 3`` against the live marketplace, which can also legitimately yield
+    fewer than 3 matches. This controlled-fixture variant proves the cap
+    actually fires when raw matches > 3.
+    """
+
+    raw_matches = [
+        {
+            "name": f"playbook-{token}",
+            "description": f"Frobnicate {token} pipelines for marketing growth.",
+            "when_to_use": f"User wants frobnication on {token} marketing growth.",
+            "source_path": f"skills/playbook-{token}/SKILL.md",
+        }
+        for token in ("alpha", "bravo", "charlie", "delta", "echo")
+    ]
+
+    fragment = compose_skills_fragment(
+        "frobnicate marketing growth pipelines",
+        raw_matches,
+    )
+
+    assert fragment is not None
+    matched = [
+        line for line in fragment.splitlines() if line.startswith("- /playbook-")
+    ]
+    assert len(matched) == 3, (
+        f"expected exactly 3 matches under the cap, got {len(matched)}: {matched}"
+    )

@@ -664,7 +664,16 @@ def _result_indicates_failure(tool_name: str, result: Any) -> bool:
     # backend to inspect instead of raising on non-zero exit. R18 still treats
     # that as a failed wrapper-tool invocation for lead visibility.
     exit_code = _result_exit_code(result)
-    return tool_name == "mcp_anyteam_shell" and exit_code not in (None, 0)
+    if tool_name == "mcp_anyteam_shell" and exit_code not in (None, 0):
+        return True
+    # mcp_anyteam_invoke_skill returns ``{"error": "skill_not_found", ...}`` on
+    # miss instead of raising — surface that as a typed event-level failure so
+    # peer/lead visibility reflects it (§2 visibility parity).
+    if tool_name == "mcp_anyteam_invoke_skill" and isinstance(result, dict):
+        err = result.get("error")
+        if isinstance(err, str) and err:
+            return True
+    return False
 
 
 def _tool_result_payload(result: Any) -> dict[str, Any]:
@@ -682,6 +691,7 @@ def _tool_result_payload(result: Any) -> dict[str, Any]:
             ("chars_written", "chars_written"),
             ("replacements", "replacements"),
             ("status", "http_status"),
+            ("error", "error"),
         ):
             value = result.get(source_key)
             if value not in (None, ""):
@@ -895,6 +905,12 @@ def build_server(argv: list[str] | None = None) -> FastMCP:
                 payload["recipient"] = recipient
                 payload["to"] = recipient
                 payload["target"] = f"to={recipient!r}"
+        if tool_name == "mcp_anyteam_invoke_skill":
+            # Typed event field so peer/lead audit can pivot on skill_name
+            # without parsing the formatted ``target`` string (§2).
+            skill_name_arg = (tool_args or {}).get("skill_name")
+            if skill_name_arg not in (None, ""):
+                payload["skill_name"] = str(skill_name_arg)
         if started_at is not None:
             payload["duration_ms"] = max(0, int((time.monotonic() - started_at) * 1000))
         if phase == "started":
