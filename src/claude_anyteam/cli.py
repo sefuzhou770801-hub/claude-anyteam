@@ -228,11 +228,12 @@ def _build_run_parser() -> argparse.ArgumentParser:
         type=float,
         help=(
             "Wall-clock cap (seconds) on a single Codex App Server turn. "
-            "Range [60, 3600], default 900. Overrides "
-            "CLAUDE_ANYTEAM_TURN_TIMEOUT_S. Raise this for teammates that "
-            "run long pytest/build invocations; tighten for short-loop "
-            "executor roles. Currently affects Codex App Server only — "
-            "Gemini and Kimi have their own subprocess-level timeouts."
+            "Range [60, 3600], default 1800 (bumped from 900 in task #5). "
+            "Overrides CLAUDE_ANYTEAM_TURN_TIMEOUT_S. Raise this for "
+            "teammates that run long pytest/build invocations; tighten "
+            "for short-loop executor roles. Currently affects Codex App "
+            "Server only — Gemini and Kimi have their own subprocess-"
+            "level timeouts."
         ),
     )
     p.add_argument(
@@ -240,10 +241,11 @@ def _build_run_parser() -> argparse.ArgumentParser:
         type=float,
         help=(
             "Codex App Server-only soft non-progress watchdog threshold in "
-            "seconds. Range [60, 900], default 300. Overrides "
-            "CLAUDE_ANYTEAM_NON_PROGRESS_WARN_S. When tripped, the adapter "
-            "emits a turn_progress warning envelope and sends one checkpoint "
-            "turn/steer; it does not interrupt the turn."
+            "seconds. Range [60, 1800], default unset (opt-in as of task #5; "
+            "see docs/design/timers-vs-visibility.md). Overrides "
+            "CLAUDE_ANYTEAM_NON_PROGRESS_WARN_S. When set and tripped, the "
+            "adapter emits a turn_progress warning envelope and sends one "
+            "checkpoint turn/steer; it does not interrupt the turn."
         ),
     )
     p.add_argument(
@@ -252,9 +254,17 @@ def _build_run_parser() -> argparse.ArgumentParser:
         help=(
             "Codex App Server-only opt-in hard non-progress interrupt "
             "threshold in seconds. Default unset/disabled; overrides "
-            "CLAUDE_ANYTEAM_NON_PROGRESS_INTERRUPT_S. Only considered after "
-            "the soft watchdog has fired and no later visible checkpoint was "
-            "observed."
+            "CLAUDE_ANYTEAM_NON_PROGRESS_INTERRUPT_S. Two semantics "
+            "depending on whether --non-progress-warn-s is set: "
+            "(a) when warn IS set, the interrupt only fires AFTER the "
+            "soft watchdog has fired and no later visible checkpoint was "
+            "observed (anchored to turn-start elapsed time); "
+            "(b) when warn is None (the default as of task #5), the "
+            "interrupt fires when no observable progress for "
+            "non_progress_interrupt_s seconds (anchored to last-progress "
+            "time) — the §7.1 overnight-kill semantic from "
+            "docs/design/timers-vs-visibility.md. The log payload's "
+            "`warn_active` field tells which path fired."
         ),
     )
     return p
