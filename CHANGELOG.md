@@ -22,6 +22,7 @@ All notable changes to claude-anyteam are documented here. Format follows [Keep 
 ### Documentation
 
 - New design RFC at `docs/design/timers-vs-visibility.md` (issue #50): audits every timer in the wrapper, classifies stall-detection vs bounded-I/O vs teardown, proposes four new typed envelopes (`wrapper_tool_failure_unrecovered`, `app_server_idle_quiet`, `subprocess_pressure`, `transport_alive`) and a model-emitted `working_on` contract that together replace the soft watchdog. Cites #40, #43, #49 as the false-positive cases.
+- New contributor convention doc at `docs/conventions/visibility-envelopes.md`: write-time guide for PRs that add or extend a typed visibility envelope. Captures the eight checks (four-leg taxonomy, top-level kind vs `visibility_degraded`, `mailbox` flag semantics, four-fold config surface, bilateral range validation, CHANGELOG extension, boundary-case tests, RFC cross-reference) that emerged from PR #42 / #51 / #52 / #54 / #55 / #56 / #60 / #61 reviews. Anchors PR #42's `app_server_initialize_*` envelope set as the reference example.
 
 ### Migration notes
 
