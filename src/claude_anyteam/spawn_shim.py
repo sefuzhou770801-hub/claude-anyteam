@@ -492,8 +492,19 @@ def _exec_codex_with_viewer(adapter_argv: list[str], parsed: ParsedArgs) -> int:
     fifo_path = _codex_event_fifo_path(parsed)
     os.environ[EVENT_FIFO_ENV] = fifo_path
 
+    # Create FIFO before spawning adapter or viewer so both can open it
     try:
-        subprocess.Popen(adapter_argv)
+        os.mkfifo(fifo_path)
+    except FileExistsError:
+        pass
+    except OSError:
+        pass
+
+    # Redirect adapter stdout/stderr to log file so the viewer owns the TTY
+    adapter_log = f"/tmp/claude-anyteam-{parsed.team_name or 'default'}-{parsed.agent_name or 'codex'}.log"
+    try:
+        log_fd = open(adapter_log, "a")
+        subprocess.Popen(adapter_argv, stdout=log_fd, stderr=log_fd, stdin=subprocess.DEVNULL)
     except OSError as exc:
         # Adapter failed to even start in the background; fall back to a
         # blocking exec so the failure surfaces the same way it used to.
