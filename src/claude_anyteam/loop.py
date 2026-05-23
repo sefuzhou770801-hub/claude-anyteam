@@ -25,6 +25,7 @@ from __future__ import annotations
 import json
 import os
 import signal
+import sys
 import time
 from dataclasses import dataclass, field
 from typing import Any
@@ -32,6 +33,7 @@ from typing import Any
 from . import codex as codex_mod
 from . import logger, protocol_io as pio
 from . import prompts as prompts_mod
+from .env import VISIBILITY_STDERR_ENV
 from .capabilities import (
     CODEX_APP_SERVER_CAPABILITIES,
     CODEX_EXEC_CAPABILITIES,
@@ -476,6 +478,55 @@ def _task_prompt_fragments(state: LoopState, task: Any) -> str:
     return "\n\n".join(part.strip() for part in parts if part and part.strip())
 
 
+# Kinds rendered to the adapter stderr (human-readable cmux-split feed). A
+# positive allowlist keeps protocol noise (idle notifications, capability
+# manifest churn, periodic initialize-progress pings) out of the live view
+# while surfacing the work narrative: tool calls, file changes, turn edges.
+_STDERR_RENDER_KINDS = frozenset(
+    {
+        "turn_started",
+        "tool_event",
+        "artifact_event",
+        "turn_completed",
+        "turn_failed",
+    }
+)
+
+
+def _render_event_to_stderr(event: Any) -> None:
+    """Print one VisibilityEvent as a human-readable line on the adapter stderr.
+
+    The adapter usually runs inside a cmux split; without this the split only
+    shows raw App Server protocol JSON. Reusing ``visibility_tail.format_event``
+    gives the same tool/arg/status/duration cards the ``visibility-tail`` CLI
+    renders, so a lead glancing at the split sees what Codex is doing live.
+
+    This is a pure side-channel on top of the existing JSONL event log: it
+    never mutates the event and never raises into the caller. Rendering or
+    write failures are swallowed (best-effort) so a broken pipe or a malformed
+    payload can't take down the control loop. Honors
+    ``CLAUDE_ANYTEAM_VISIBILITY_STDERR=0`` as an opt-out and respects the
+    envelope's ``visibility.stderr`` flag.
+    """
+    if os.environ.get(VISIBILITY_STDERR_ENV) == "0":
+        return
+    try:
+        if getattr(event, "kind", None) not in _STDERR_RENDER_KINDS:
+            return
+        visibility = getattr(event, "visibility", None)
+        if visibility is not None and not getattr(visibility, "stderr", True):
+            return
+        from .visibility_tail import format_event
+
+        color = bool(getattr(sys.stderr, "isatty", lambda: False)())
+        line = format_event(event, color=color)
+        sys.stderr.write(line + "\n")
+        sys.stderr.flush()
+    except Exception:
+        # Best-effort live view; never let rendering break the adapter loop.
+        pass
+
+
 def _prose_visibility_event_sink(state: LoopState):
     """Build a §2-fix event sink for ephemeral prose-time Codex invocations.
 
@@ -506,6 +557,7 @@ def _prose_visibility_event_sink(state: LoopState):
                 error=str(e),
                 surface="prose",
             )
+        _render_event_to_stderr(event)
         visibility = getattr(event, "visibility", None)
         if getattr(visibility, "mailbox", False):
             try:
@@ -1773,6 +1825,7 @@ def _execute_task_app_server(state: LoopState, task, prompt: str):
                 kind=getattr(event, "kind", None),
                 error=str(e),
             )
+        _render_event_to_stderr(event)
         if task_state_requested:
             try:
                 active_form = event.summary[:120]

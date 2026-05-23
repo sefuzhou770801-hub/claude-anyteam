@@ -9,6 +9,7 @@ import json
 import os
 import re
 import shutil
+import subprocess
 import sys
 from dataclasses import dataclass
 
@@ -18,6 +19,7 @@ from .env import (
     ANTIGRAVITY_SHIM_MATCH_ENV,
     BINARY_ENV,
     CLAUDE_SHIM_MATCH_ENV,
+    EVENT_FIFO_ENV,
     LEGACY_BINARY_ENV,
     GEMINI_BINARY_ENV,
     GEMINI_SHIM_MATCH_ENV,
@@ -29,6 +31,13 @@ from .env import (
     SHIM_MATCH_ENV,
     env_first,
 )
+
+# Opt-out for the Ink TUI viewer fan-out. Default on. Set to "0"/"false" to
+# skip launching the viewer and exec the adapter directly (the pre-viewer
+# behavior). The viewer is a cosmetic live mirror; this gives operators an
+# escape hatch if the cmux split shouldn't be taken over by the TUI.
+VIEWER_ENABLE_ENV = "CLAUDE_ANYTEAM_CODEX_VIEWER"
+VIEWER_BINARY_ENV = "CLAUDE_ANYTEAM_CODEX_VIEWER_BIN"
 
 DEFAULT_CODEX_MATCH = r"^codex-"
 DEFAULT_CLAUDE_MATCH = r"^claude-"
@@ -410,6 +419,113 @@ def _adapter_argv(
         )
     return argv, agent_config
 
+def _viewer_disabled() -> bool:
+    raw = os.environ.get(VIEWER_ENABLE_ENV, "").strip().lower()
+    return raw in {"0", "false", "no", "off"}
+
+
+def _resolve_viewer_binary() -> str | None:
+    """Locate the Ink viewer entrypoint (`viewer/codex-ink-viewer.mjs`).
+
+    Tries an explicit env override first, then walks up from this module to a
+    sibling `viewer/` directory (source-checkout layout). Returns None when
+    the script can't be found — callers fall back to a plain adapter exec so a
+    missing viewer never breaks teammate spawn.
+    """
+    override = os.environ.get(VIEWER_BINARY_ENV)
+    if override and os.path.isfile(override):
+        return override
+
+    here = os.path.dirname(os.path.abspath(__file__))
+    # here = <repo>/src/claude_anyteam ; repo root is two levels up.
+    candidates = [
+        os.path.join(os.path.dirname(os.path.dirname(here)), "viewer", "codex-ink-viewer.mjs"),
+        os.path.join(os.path.dirname(here), "viewer", "codex-ink-viewer.mjs"),
+    ]
+    for candidate in candidates:
+        if os.path.isfile(candidate):
+            return candidate
+    return None
+
+
+def _codex_event_fifo_path(parsed: ParsedArgs) -> str:
+    team = parsed.team_name or "default"
+    agent = parsed.agent_name or "codex"
+    return f"/tmp/claude-anyteam-{team}-{agent}.fifo"
+
+
+def _exec_codex_with_viewer(adapter_argv: list[str], parsed: ParsedArgs) -> int:
+    """Launch the Codex adapter in the background and exec the Ink viewer in
+    the foreground so the cmux split shows the fancy live TUI.
+
+    Wiring:
+    * Sets `CLAUDE_ANYTEAM_EVENT_FIFO` so the adapter tees raw App Server
+      notifications into the pipe. The adapter creates the FIFO node lazily;
+      the viewer's read loop retries until it appears, so spawn ordering is
+      not load-bearing.
+    * Background-spawns the adapter via `subprocess.Popen` (inherits our env,
+      including the FIFO path).
+    * Foreground-execs `node <viewer> --name <agent> --fifo <path>`, replacing
+      this process so the viewer owns the split's TTY.
+
+    Degradation: if the viewer script or `node` can't be found — or the
+    adapter fails to spawn — we fall back to a direct `os.execv(adapter)`,
+    i.e. exactly the pre-viewer behavior. The teammate must run regardless of
+    whether the cosmetic viewer is available.
+    """
+    binary = adapter_argv[0]
+
+    if _viewer_disabled():
+        os.execv(binary, adapter_argv)
+        return 0
+
+    viewer_script = _resolve_viewer_binary()
+    node_binary = shutil.which("node")
+    if viewer_script is None or node_binary is None:
+        # Viewer unavailable (no node on PATH, or script not found in this
+        # install layout). Fall back to the pre-viewer behavior silently —
+        # the `spawn_shim.dispatch` line already recorded the codex route, so
+        # we keep stderr to a single structured line for that dispatch.
+        os.execv(binary, adapter_argv)
+        return 0
+
+    fifo_path = _codex_event_fifo_path(parsed)
+    os.environ[EVENT_FIFO_ENV] = fifo_path
+
+    try:
+        subprocess.Popen(adapter_argv)
+    except OSError as exc:
+        # Adapter failed to even start in the background; fall back to a
+        # blocking exec so the failure surfaces the same way it used to.
+        os.environ.pop(EVENT_FIFO_ENV, None)
+        sys.stderr.write(
+            json.dumps(
+                {
+                    "event": "spawn_shim.codex_viewer_adapter_spawn_failed",
+                    "agent_name": parsed.agent_name,
+                    "error": str(exc),
+                },
+                sort_keys=True,
+            )
+            + "\n"
+        )
+        sys.stderr.flush()
+        os.execv(binary, adapter_argv)
+        return 0
+
+    viewer_argv = [
+        node_binary,
+        viewer_script,
+        "--name",
+        parsed.agent_name or "codex",
+        "--fifo",
+        fifo_path,
+    ]
+    _log_dispatch("codex.viewer", parsed.agent_name, viewer_script)
+    os.execv(node_binary, viewer_argv)
+    return 0
+
+
 def main(argv: list[str] | None = None) -> int:
     full_argv = [sys.argv[0], *(list(argv) if argv is not None else sys.argv[1:])]
     parsed = _parse_args(full_argv[1:])
@@ -444,8 +560,7 @@ def main(argv: list[str] | None = None) -> int:
             binary, parsed, include_effort=True, include_watchdog=True
         )
         _log_dispatch("codex", parsed.agent_name, binary, agent_config or None)
-        os.execv(binary, adapter_argv)
-        return 0
+        return _exec_codex_with_viewer(adapter_argv, parsed)
 
     if _gemini_route(parsed):
         refusal = _maybe_refuse_bare_routed_prefix("gemini", parsed)

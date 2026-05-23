@@ -98,6 +98,22 @@ LEGACY_NATIVE_CLAUDE_ENV = "CODEX_TEAMMATE_NATIVE_CLAUDE"
 DUMP_EVENTS_ENV = "CLAUDE_ANYTEAM_DUMP_EVENTS"
 LEGACY_DUMP_EVENTS_ENV = "CODEX_TEAMMATE_DUMP_EVENTS"
 
+# Human-readable per-event rendering to the adapter process stderr so a cmux
+# split watching the Codex adapter shows what Codex is doing (tool calls, file
+# changes, turn boundaries) instead of raw protocol JSON. Default on; set to
+# "0" to suppress (the JSONL event log is unaffected either way).
+VISIBILITY_STDERR_ENV = "CLAUDE_ANYTEAM_VISIBILITY_STDERR"
+
+# Optional FIFO path. When set, the App Server adapter tees every raw
+# JSON-RPC notification (one JSON object per line) into this named pipe so a
+# separate process — the Ink TUI viewer running in the cmux split — can render
+# a fancy live view of the Codex teammate's turn. The write is best-effort and
+# non-blocking: if no reader is attached (viewer not started or crashed) the
+# adapter silently skips the write and never blocks. The spawn shim sets this
+# env var to `/tmp/claude-anyteam-<team>-<agent>.fifo` before launching both
+# the adapter and the viewer.
+EVENT_FIFO_ENV = "CLAUDE_ANYTEAM_EVENT_FIFO"
+
 PROBE_TAG_ENV = "CLAUDE_ANYTEAM_PROBE_TAG"
 LEGACY_PROBE_TAG_ENV = "CODEX_TEAMMATE_PROBE_TAG"
 

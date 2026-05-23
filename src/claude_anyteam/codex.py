@@ -40,6 +40,7 @@ from .env import (
     APP_SERVER_INITIALIZE_TIMEOUT_ENV,
     CWD_ENV,
     DUMP_EVENTS_ENV,
+    EVENT_FIFO_ENV,
     LEGACY_CWD_ENV,
     LEGACY_DUMP_EVENTS_ENV,
     TEAM_ENV,
@@ -1581,6 +1582,111 @@ def _app_server_recovery_prompt(task_prompt: str, *, schema: dict[str, Any] | No
     )
 
 
+class _EventFifoTee:
+    """Best-effort, non-blocking tee of raw App Server JSON-RPC notifications.
+
+    A separate process — the Ink TUI viewer in the cmux split — opens the
+    FIFO for reading and renders a live view of the Codex turn. We are the
+    *writer*. The cardinal rule: a missing or crashed reader must NEVER block
+    or crash the adapter. To guarantee that:
+
+    * The FIFO node itself is created by `ensure_fifo()` with `os.mkfifo`.
+      Pre-existing nodes (e.g. left over from a prior run, or created by the
+      spawn shim) are tolerated. A failure to create the node disables the
+      tee entirely — the adapter runs exactly as before.
+    * The write fd is opened with `os.O_WRONLY | os.O_NONBLOCK`. On a FIFO
+      with no reader attached, this raises ENXIO; we swallow it and stay
+      "closed", retrying the open lazily on the next event. This is what lets
+      the viewer attach late (or never).
+    * Every `write()` is wrapped: `BlockingIOError` (pipe buffer full because
+      the reader is slow) and `BrokenPipeError` (reader went away) are both
+      swallowed. We never raise into the adapter's hot loop.
+
+    The adapter owns the FIFO node lifecycle only when it created it: `close()`
+    unlinks the node it made. If the node already existed (shim-created), we
+    leave it for whoever made it to clean up.
+    """
+
+    def __init__(self, fifo_path: str | None) -> None:
+        self._path = fifo_path
+        self._fd: int | None = None
+        self._owns_node = False
+        self._disabled = fifo_path is None
+
+    @property
+    def enabled(self) -> bool:
+        return not self._disabled and self._path is not None
+
+    def ensure_fifo(self) -> None:
+        """Create the FIFO node if it does not already exist."""
+        if not self.enabled:
+            return
+        assert self._path is not None
+        try:
+            os.mkfifo(self._path)
+            self._owns_node = True
+        except FileExistsError:
+            # Pre-existing node (shim-created or stale). Reuse it; do not claim
+            # ownership so we don't unlink someone else's pipe on close.
+            self._owns_node = False
+        except OSError as e:
+            logger.debug("app_server.event_fifo_mkfifo_failed", path=self._path, error=str(e))
+            self._disabled = True
+
+    def _try_open(self) -> None:
+        if self._fd is not None or not self.enabled:
+            return
+        assert self._path is not None
+        try:
+            # O_NONBLOCK on a FIFO write end raises ENXIO when no reader is
+            # attached — exactly the "viewer not running" case. Treat it as
+            # "still closed" and try again on the next event.
+            self._fd = os.open(self._path, os.O_WRONLY | os.O_NONBLOCK)
+        except OSError:
+            self._fd = None
+
+    def write_notification(self, ev: dict[str, Any]) -> None:
+        """Serialize one notification as a single JSON line and best-effort write."""
+        if not self.enabled:
+            return
+        self._try_open()
+        if self._fd is None:
+            return
+        try:
+            payload = json.dumps(ev, default=str) + "\n"
+        except Exception:
+            return
+        data = payload.encode("utf-8")
+        try:
+            os.write(self._fd, data)
+        except BlockingIOError:
+            # Reader is slow / pipe buffer full. Drop this event rather than
+            # block — the viewer is a best-effort live mirror, not a log.
+            pass
+        except (BrokenPipeError, OSError):
+            # Reader went away. Close our fd so the next event re-opens (and
+            # re-hits ENXIO until a reader returns).
+            self._close_fd()
+
+    def _close_fd(self) -> None:
+        if self._fd is not None:
+            try:
+                os.close(self._fd)
+            except OSError:
+                pass
+            self._fd = None
+
+    def close(self) -> None:
+        """Close the write fd and unlink the node if we created it."""
+        self._close_fd()
+        if self._owns_node and self._path is not None:
+            try:
+                os.unlink(self._path)
+            except OSError:
+                pass
+            self._owns_node = False
+
+
 def app_server_invoke(
     *,
     task_prompt: str,
@@ -1647,6 +1753,14 @@ def app_server_invoke(
     visibility_seq = 0
     pending_wrapper_tool_failures: list[_PendingWrapperToolFailure] = []
     emitted_unrecovered_wrapper_tools: set[str] = set()
+
+    # Optional Ink TUI viewer fan-out. We tee every raw App Server JSON-RPC
+    # notification (one JSON object per line) into a FIFO that the viewer in
+    # the cmux split reads. Best-effort + non-blocking: a missing/crashed
+    # viewer never blocks or breaks the turn. Disabled when the env var is
+    # unset (the common case for non-cmux invocations and all unit tests).
+    event_fifo = _EventFifoTee(os.environ.get(EVENT_FIFO_ENV) or None)
+    event_fifo.ensure_fifo()
 
     def _emit_visibility_event(
         *,
@@ -1819,6 +1933,11 @@ def app_server_invoke(
     def _record(ev: dict[str, Any]) -> VisibilityEvent | None:
         nonlocal tool_call_events
         events.append(ev)
+        # Tee the raw JSON-RPC notification to the Ink viewer FIFO before any
+        # normalization. The viewer speaks the native App Server shape
+        # (`{method, params}`), so we forward `ev` verbatim. Non-blocking and
+        # best-effort — never raises into this hot loop.
+        event_fifo.write_notification(ev)
         method = str(ev.get("method", ""))
         params = ev.get("params", {}) if isinstance(ev.get("params"), dict) else {}
         item = params.get("item") if isinstance(params, dict) else None
@@ -2639,6 +2758,9 @@ def app_server_invoke(
         exit_code = 1
     finally:
         client.close()
+        # Tear down the viewer FIFO: close our write fd and unlink the node if
+        # this adapter created it. Best-effort — never raises.
+        event_fifo.close()
 
     elapsed_s = (
         time.monotonic() - turn_started_at

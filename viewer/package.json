@@ -1,0 +1,20 @@
+{
+  "name": "codex-ink-viewer",
+  "version": "0.1.0",
+  "private": true,
+  "type": "module",
+  "description": "Ink-based TUI viewer for a Codex teammate's App Server event stream",
+  "bin": {
+    "codex-ink-viewer": "./codex-ink-viewer.mjs"
+  },
+  "scripts": {
+    "start": "node codex-ink-viewer.mjs"
+  },
+  "dependencies": {
+    "ink": "^7.0.3",
+    "react": "^19.2.0"
+  },
+  "engines": {
+    "node": ">=22"
+  }
+}

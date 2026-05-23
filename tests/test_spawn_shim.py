@@ -1,11 +1,25 @@
 from __future__ import annotations
 
 import json
+import os
 import sys
 
 import pytest
 
 from claude_anyteam import spawn_shim
+
+
+@pytest.fixture(autouse=True)
+def _disable_codex_viewer_by_default(monkeypatch):
+    """Disable the Ink viewer fan-out for the existing argv-construction tests.
+
+    The codex route now (by default) background-spawns the adapter and execs
+    the Ink TUI viewer in the foreground. The legacy tests in this module
+    assert on the *adapter* argv and on a single-line dispatch log, so they opt
+    out of the viewer via the documented escape hatch. Tests that specifically
+    exercise the viewer path set the env var back on themselves.
+    """
+    monkeypatch.setenv(spawn_shim.VIEWER_ENABLE_ENV, "0")
 
 
 def _record_execv(monkeypatch):
@@ -952,4 +966,191 @@ def test_kimi_match_does_not_preempt_codex_or_gemini_routes(monkeypatch, tmp_pat
                 "shim-build",
             ],
         ),
+    ]
+
+
+# ---- Codex Ink viewer fan-out ---------------------------------------------
+
+
+def test_codex_route_execs_viewer_and_backgrounds_adapter(
+    monkeypatch, tmp_path, capsys
+):
+    """With the viewer enabled, the codex route background-spawns the adapter
+    and execs `node <viewer> --name <agent> --fifo <path>` in the foreground,
+    after exporting the FIFO path into the environment.
+    """
+    calls = _record_execv(monkeypatch)
+    _clear_binary_env(monkeypatch)
+    # Re-enable the viewer (the autouse fixture disables it by default).
+    monkeypatch.setenv(spawn_shim.VIEWER_ENABLE_ENV, "1")
+    monkeypatch.delenv(spawn_shim.EVENT_FIFO_ENV, raising=False)
+    monkeypatch.setenv("HOME", str(tmp_path))
+    _write_agent_config(tmp_path, "shim-build", "codex-alice", {})
+
+    popen_calls: list[list[str]] = []
+
+    def fake_popen(argv, *args, **kwargs):
+        popen_calls.append(list(argv))
+        return object()
+
+    monkeypatch.setattr(spawn_shim.subprocess, "Popen", fake_popen)
+    monkeypatch.setattr(
+        spawn_shim, "_resolve_viewer_binary", lambda: "/repo/viewer/codex-ink-viewer.mjs"
+    )
+    monkeypatch.setattr(
+        sys,
+        "argv",
+        [
+            "/usr/local/bin/claude-anyteam-spawn-shim",
+            "--agent-name",
+            "codex-alice",
+            "--team-name",
+            "shim-build",
+        ],
+    )
+    monkeypatch.setattr(
+        spawn_shim.shutil,
+        "which",
+        lambda name: {
+            "claude-anyteam": "/usr/local/bin/claude-anyteam",
+            "claude": "/usr/local/bin/claude",
+            "node": "/usr/local/bin/node",
+        }.get(name),
+    )
+
+    assert spawn_shim.main() == 0
+
+    fifo_path = "/tmp/claude-anyteam-shim-build-codex-alice.fifo"
+    # FIFO path is exported so the adapter tees notifications into it.
+    assert os.environ[spawn_shim.EVENT_FIFO_ENV] == fifo_path
+    # Adapter is launched in the background with the normal argv.
+    assert popen_calls == [
+        [
+            "/usr/local/bin/claude-anyteam",
+            "--name",
+            "codex-alice",
+            "--team",
+            "shim-build",
+        ]
+    ]
+    # Foreground exec replaces the shim with the Ink viewer.
+    assert calls == [
+        (
+            "/usr/local/bin/node",
+            [
+                "/usr/local/bin/node",
+                "/repo/viewer/codex-ink-viewer.mjs",
+                "--name",
+                "codex-alice",
+                "--fifo",
+                fifo_path,
+            ],
+        )
+    ]
+
+
+def test_codex_route_falls_back_to_adapter_when_node_missing(
+    monkeypatch, tmp_path, capsys
+):
+    """If `node` is not on PATH, the codex route degrades to a plain adapter
+    exec (the pre-viewer behavior) and does not export a FIFO path."""
+    calls = _record_execv(monkeypatch)
+    _clear_binary_env(monkeypatch)
+    monkeypatch.setenv(spawn_shim.VIEWER_ENABLE_ENV, "1")
+    monkeypatch.delenv(spawn_shim.EVENT_FIFO_ENV, raising=False)
+    monkeypatch.setenv("HOME", str(tmp_path))
+    _write_agent_config(tmp_path, "shim-build", "codex-alice", {})
+
+    def fail_popen(*args, **kwargs):  # pragma: no cover - must not be called
+        raise AssertionError("adapter must not be backgrounded without a viewer")
+
+    monkeypatch.setattr(spawn_shim.subprocess, "Popen", fail_popen)
+    monkeypatch.setattr(
+        spawn_shim, "_resolve_viewer_binary", lambda: "/repo/viewer/codex-ink-viewer.mjs"
+    )
+    monkeypatch.setattr(
+        sys,
+        "argv",
+        [
+            "/usr/local/bin/claude-anyteam-spawn-shim",
+            "--agent-name",
+            "codex-alice",
+            "--team-name",
+            "shim-build",
+        ],
+    )
+    monkeypatch.setattr(
+        spawn_shim.shutil,
+        "which",
+        lambda name: {
+            "claude-anyteam": "/usr/local/bin/claude-anyteam",
+            "claude": "/usr/local/bin/claude",
+        }.get(name),  # no "node"
+    )
+
+    assert spawn_shim.main() == 0
+
+    assert spawn_shim.EVENT_FIFO_ENV not in os.environ
+    assert calls == [
+        (
+            "/usr/local/bin/claude-anyteam",
+            [
+                "/usr/local/bin/claude-anyteam",
+                "--name",
+                "codex-alice",
+                "--team",
+                "shim-build",
+            ],
+        )
+    ]
+
+
+def test_codex_route_falls_back_when_viewer_script_missing(
+    monkeypatch, tmp_path, capsys
+):
+    """If the viewer script can't be located, the codex route degrades to a
+    plain adapter exec even when `node` is available."""
+    calls = _record_execv(monkeypatch)
+    _clear_binary_env(monkeypatch)
+    monkeypatch.setenv(spawn_shim.VIEWER_ENABLE_ENV, "1")
+    monkeypatch.delenv(spawn_shim.EVENT_FIFO_ENV, raising=False)
+    monkeypatch.setenv("HOME", str(tmp_path))
+    _write_agent_config(tmp_path, "shim-build", "codex-alice", {})
+
+    monkeypatch.setattr(spawn_shim, "_resolve_viewer_binary", lambda: None)
+    monkeypatch.setattr(
+        sys,
+        "argv",
+        [
+            "/usr/local/bin/claude-anyteam-spawn-shim",
+            "--agent-name",
+            "codex-alice",
+            "--team-name",
+            "shim-build",
+        ],
+    )
+    monkeypatch.setattr(
+        spawn_shim.shutil,
+        "which",
+        lambda name: {
+            "claude-anyteam": "/usr/local/bin/claude-anyteam",
+            "claude": "/usr/local/bin/claude",
+            "node": "/usr/local/bin/node",
+        }.get(name),
+    )
+
+    assert spawn_shim.main() == 0
+
+    assert spawn_shim.EVENT_FIFO_ENV not in os.environ
+    assert calls == [
+        (
+            "/usr/local/bin/claude-anyteam",
+            [
+                "/usr/local/bin/claude-anyteam",
+                "--name",
+                "codex-alice",
+                "--team",
+                "shim-build",
+            ],
+        )
     ]
