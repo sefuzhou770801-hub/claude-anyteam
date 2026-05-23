@@ -83,6 +83,13 @@ KIMI_HEADLESS_CAPABILITIES = [
     "large_context",
 ]
 
+ANTIGRAVITY_HEADLESS_CAPABILITIES = [
+    "headless_invocation",
+    "session_resume",
+    "structured_output",
+    "plan_mode",
+]
+
 CLAUDE_NATIVE_HEADLESS_CAPABILITIES = [
     "headless_invocation",
     "structured_output",

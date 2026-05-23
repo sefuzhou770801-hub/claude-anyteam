@@ -1,0 +1,1136 @@
+"""Control loop for Antigravity (agy) -backed teammates.
+
+Mirrors the Kimi headless loop at the protocol boundary — same inbox
+poll, claim-and-execute, prose-batch, plan-approval, and shutdown
+handling — but uses one-shot ``agy --print`` invocations instead of
+``kimi --print``.  agy currently has no MCP-config flag and no native
+event stream, so wrapper-tool wiring and live event capture are
+deferred: the loop still completes tasks via the final-JSON contract,
+just without mid-turn tool visibility.
+"""
+from __future__ import annotations
+
+import json
+import os
+import signal
+import time
+from dataclasses import dataclass, field
+from typing import Any
+
+from claude_anyteam import logger, protocol_io as pio
+from claude_anyteam.auth_preflight import AuthPreflightFailure
+from claude_anyteam.capability_manifest import CapabilityManifestCache
+from claude_anyteam.capabilities import (
+    ANTIGRAVITY_HEADLESS_CAPABILITIES,
+    assert_known_capabilities,
+    effective_peer_steer_capabilities,
+    rich_capability_manifest,
+)
+from claude_anyteam.messages import (
+    CapabilityManifestUpdatedIn,
+    PlanApprovalRequestIn,
+    ShutdownRequestIn,
+    SteerIn,
+    parse_protocol_text,
+)
+from claude_anyteam.registration import BackendMetadata, deregister, register
+from claude_anyteam.schema_validation import inline_schema_prompt_fragment, load_schema
+from claude_anyteam.skills_fragment import (
+    compose_project_skills_fragment,
+    task_text_for_skill_match,
+)
+from claude_anyteam.watch_inbox import WatchInbox, adaptive_wait_s
+
+from . import invoke as headless_invoke, prompts
+from .config import AntigravitySettings
+
+# Backwards-compatible alias for tests/extensions that monkeypatch loop.invoke.
+invoke = headless_invoke
+
+
+@dataclass
+class QueuedSteer:
+    steer_id: str
+    message: str
+    task_id: str | None = None
+    priority: str = "normal"
+    expires_after_turns: int = 1
+
+
+@dataclass
+class AntigravityLoopState:
+    settings: AntigravitySettings
+    shutdown_requested: bool = False
+    approved_shutdown: bool = False
+    in_flight_task: str | None = None
+    seen_shutdown_request_ids: set[str] = field(default_factory=set)
+    antigravity_session_id: str | None = None
+    queued_steers: list[QueuedSteer] = field(default_factory=list)
+    peer_manifest_cache: CapabilityManifestCache | None = None
+    self_capability_manifest: dict[str, Any] | None = None
+
+
+def _backend_metadata(settings: AntigravitySettings) -> BackendMetadata:
+    capabilities = assert_known_capabilities(ANTIGRAVITY_HEADLESS_CAPABILITIES)
+    return BackendMetadata(
+        model="antigravity-cli",
+        prompt=(
+            "Antigravity (agy) teammate adapter. Protocol I/O is handled by the "
+            "adapter; coding work is delegated to agy CLI headless mode. No "
+            "Claude LLM is involved."
+        ),
+        capabilities=capabilities,
+        capability_manifest=rich_capability_manifest(
+            capabilities,
+            host_tool_surface="antigravity-native",
+        ),
+        transport="antigravity-headless",
+        host_tool_surface="antigravity-native",
+        coupling_regime="loose",
+    )
+
+
+def run(settings: AntigravitySettings) -> int:
+    state: AntigravityLoopState | None = None
+    exit_code = 0
+    startup_phase = "feature_test"
+    startup_complete = False
+    try:
+        _backend_feature_test(settings)
+        startup_phase = "auth_preflight"
+        _backend_auth_preflight(settings)
+        startup_phase = "registration"
+        register(settings, _backend_metadata(settings))
+        startup_phase = "capability_manifest_load"
+        state = AntigravityLoopState(settings=settings)
+        state.self_capability_manifest = pio.read_agent_manifest(
+            settings.team_name,
+            settings.agent_name,
+        )
+        state.peer_manifest_cache = CapabilityManifestCache(
+            settings.team_name,
+            self_name=settings.agent_name,
+        )
+        state.peer_manifest_cache.load_startup()
+
+        def _sig_handler(signum: int, _frame: Any) -> None:
+            logger.warn("antigravity.signal.received", signum=signum)
+            assert state is not None
+            state.shutdown_requested = True
+
+        startup_phase = "signal_setup"
+        signal.signal(signal.SIGINT, _sig_handler)
+        signal.signal(signal.SIGTERM, _sig_handler)
+
+        startup_complete = True
+        _main_loop(state)
+    except Exception as e:
+        if startup_complete:
+            logger.error("antigravity.loop.crash", error=str(e))
+            error_class = "adapter_crash"
+        else:
+            logger.error("antigravity.startup.crash", phase=startup_phase, error=str(e))
+            if isinstance(e, AuthPreflightFailure):
+                error_class = "auth_failure"
+                try:
+                    pio.emit_auth_preflight_failure(
+                        team=settings.team_name,
+                        agent=settings.agent_name,
+                        backend="antigravity",
+                        error=e,
+                        payload={
+                            "phase": startup_phase,
+                            "transport": settings.backend,
+                            "antigravity_binary": settings.antigravity_binary,
+                            "antigravity_home": (
+                                str(settings.antigravity_home)
+                                if settings.antigravity_home
+                                else None
+                            ),
+                            "cwd": str(settings.cwd),
+                            "model": settings.model,
+                            "effort": settings.effort,
+                            "sandbox": settings.sandbox,
+                        },
+                    )
+                except Exception as emit_exc:
+                    logger.debug(
+                        "antigravity.auth_preflight.visibility_emit_failed",
+                        error=str(emit_exc),
+                    )
+            else:
+                error_class = "adapter_startup_crash"
+                try:
+                    pio.emit_adapter_startup_crash(
+                        team=settings.team_name,
+                        agent=settings.agent_name,
+                        backend="antigravity",
+                        phase=startup_phase,
+                        error=e,
+                        payload={
+                            "transport": settings.backend,
+                            "antigravity_binary": settings.antigravity_binary,
+                            "antigravity_home": (
+                                str(settings.antigravity_home)
+                                if settings.antigravity_home
+                                else None
+                            ),
+                            "cwd": str(settings.cwd),
+                            "model": settings.model,
+                            "effort": settings.effort,
+                            "sandbox": settings.sandbox,
+                        },
+                    )
+                except Exception as emit_exc:
+                    logger.debug(
+                        "antigravity.startup.visibility_emit_failed",
+                        error=str(emit_exc),
+                    )
+        try:
+            from claude_anyteam import diagnostics as _diag
+            _diag.record_incident(
+                team=settings.team_name,
+                agent=settings.agent_name,
+                backend="antigravity",
+                error_class=error_class,
+                summary=str(e),
+            )
+        except Exception:
+            pass
+        exit_code = 1
+    finally:
+        if state is not None and state.approved_shutdown:
+            deregister(settings)
+            logger.info("antigravity.loop.deregistered", name=settings.agent_name)
+        else:
+            logger.warn(
+                "antigravity.loop.exit_without_deregister",
+                in_flight_task=(state.in_flight_task if state is not None else None),
+            )
+    return exit_code
+
+
+def _backend_feature_test(settings: AntigravitySettings) -> None:
+    headless_invoke.feature_test(settings.antigravity_binary)
+
+
+def _backend_auth_preflight(settings: AntigravitySettings) -> None:
+    headless_invoke.credential_preflight(
+        antigravity_binary=settings.antigravity_binary,
+        cwd=settings.cwd,
+        team=settings.team_name,
+        agent_name=settings.agent_name,
+        model=settings.model,
+        effort=settings.effort,
+        antigravity_home=settings.antigravity_home,
+    )
+
+
+def _backend_run(
+    state: AntigravityLoopState,
+    prompt: str,
+    *,
+    schema=None,
+    resume_session_id: str | None = None,
+    ephemeral: bool = False,
+    task_id: str | None = None,
+    event_sink=None,
+):
+    s = state.settings
+    if ephemeral:
+        resume_session_id = None
+    return headless_invoke.run(
+        prompt,
+        cwd=s.cwd,
+        schema=schema,
+        antigravity_binary=s.antigravity_binary,
+        wrapper_identity=(s.team_name, s.agent_name),
+        model=s.model,
+        effort=s.effort,
+        antigravity_home=s.antigravity_home,
+        sandbox=s.sandbox,
+        resume_session_id=resume_session_id,
+        task_id=task_id,
+        event_sink=event_sink,
+    )
+
+
+def _main_loop(state: AntigravityLoopState) -> None:
+    s = state.settings
+    logger.info(
+        "antigravity.loop.start",
+        team=s.team_name,
+        name=s.agent_name,
+        poll_s=s.poll_interval_s,
+    )
+    idle_last_sent_at: float | None = None
+    inbox_watch = WatchInbox.for_team(
+        s.team_name,
+        s.agent_name,
+        fallback_timeout_s=s.poll_interval_s,
+    )
+    try:
+        while not state.approved_shutdown:
+            messages = pio.read_own_inbox(s.team_name, s.agent_name, s.agent_name)
+            saw_messages = bool(messages)
+            for kind, group in _partition_inbox(messages):
+                if kind == "prose":
+                    _handle_prose_batch(state, group)
+                else:
+                    for m in group:
+                        _handle_message(state, m)
+                if state.approved_shutdown:
+                    return
+
+            if not state.shutdown_requested:
+                claimed = _find_and_claim(state)
+                if claimed is not None:
+                    _execute_task(state, claimed)
+                    idle_last_sent_at = None
+                    continue
+
+            if not _has_claimable(state):
+                now = time.monotonic()
+                if idle_last_sent_at is None or (now - idle_last_sent_at) > 60:
+                    try:
+                        pio.send_idle_notification(s.team_name, s.agent_name)
+                        idle_last_sent_at = now
+                        logger.info("antigravity.idle.sent")
+                    except Exception as e:
+                        logger.warn("antigravity.idle.send_fail", error=str(e))
+            inbox_watch.wait_for_change(adaptive_wait_s(saw_messages=saw_messages))
+            if state.shutdown_requested and state.in_flight_task is None:
+                state.antigravity_session_id = None
+                state.approved_shutdown = True
+                return
+    finally:
+        inbox_watch.close()
+
+
+def _handle_message(state: AntigravityLoopState, msg: Any) -> None:
+    payload = parse_protocol_text(msg.text)
+    if payload is None:
+        if _message_kind_requests_plain_prose_steer(msg):
+            _handle_steer(
+                state,
+                SteerIn(message=msg.text, from_=getattr(msg, "from_", None)),
+                msg,
+            )
+        else:
+            _handle_prose(state, msg)
+    elif isinstance(payload, ShutdownRequestIn):
+        _handle_shutdown(state, payload)
+    elif isinstance(payload, PlanApprovalRequestIn):
+        _handle_plan_approval(state, payload)
+    elif isinstance(payload, CapabilityManifestUpdatedIn):
+        if state.peer_manifest_cache is not None:
+            state.peer_manifest_cache.apply_update(payload)
+        logger.info(
+            "antigravity.capability_manifest.update_seen",
+            agent=payload.agent_name,
+            capability_version=payload.capability_version,
+            removed=payload.removed,
+        )
+    elif isinstance(payload, SteerIn):
+        sender = getattr(msg, "from_", None) or payload.from_
+        if sender != "team-lead" and _message_kind(msg) != "steer":
+            logger.info(
+                "antigravity.steer_payload.deferred_as_prose",
+                sender=sender,
+                message_kind=_message_kind(msg),
+            )
+            _handle_prose(state, msg)
+        else:
+            _handle_steer(state, payload, msg)
+    else:
+        logger.debug("antigravity.inbox.protocol_noop", type=payload.__class__.__name__)
+
+
+def _partition_inbox(messages: list[Any]) -> list[tuple[str, list[Any]]]:
+    groups: list[tuple[str, list[Any]]] = []
+    for m in messages:
+        is_prose = (
+            parse_protocol_text(m.text) is None
+            and not _message_kind_requests_plain_prose_steer(m)
+        )
+        if is_prose:
+            if groups and groups[-1][0] == "prose":
+                groups[-1][1].append(m)
+            else:
+                groups.append(("prose", [m]))
+        else:
+            groups.append(("protocol", [m]))
+    return groups
+
+
+def _message_kind(msg: Any) -> str | None:
+    raw = getattr(msg, "message_kind", None)
+    if raw is None:
+        raw = getattr(msg, "messageKind", None)
+    if not isinstance(raw, str):
+        return None
+    kind = raw.strip().lower()
+    if not kind:
+        return None
+    return kind.replace("_", "-")
+
+
+def _message_kind_requests_plain_prose_steer(msg: Any) -> bool:
+    return _message_kind(msg) == "steer"
+
+
+def _peer_prompt_fragments(state: AntigravityLoopState) -> str:
+    if os.environ.get("CLAUDE_ANYTEAM_DISABLE_PEER_PROMPT_FRAGMENTS") == "1":
+        return ""
+    if state.peer_manifest_cache is None:
+        return ""
+    try:
+        return state.peer_manifest_cache.peer_prompt_fragments_for(
+            state.settings.agent_name
+        )
+    except Exception as e:
+        logger.warn(
+            "antigravity.capability_manifest.peer_prompt_fragments_fail", error=str(e)
+        )
+        return ""
+
+
+def _task_prompt_fragments(state: AntigravityLoopState, task: Any) -> str:
+    parts = [_peer_prompt_fragments(state)]
+    if os.environ.get("CLAUDE_ANYTEAM_DISABLE_SKILLS_PROMPT_FRAGMENTS") != "1":
+        try:
+            skill_fragment = compose_project_skills_fragment(
+                task_text_for_skill_match(task),
+                cwd=state.settings.cwd,
+            )
+        except Exception as e:
+            logger.warn("antigravity.skills_fragment.compose_fail", error=str(e))
+            skill_fragment = None
+        if skill_fragment:
+            parts.append(skill_fragment)
+    return "\n\n".join(part.strip() for part in parts if part and part.strip())
+
+
+MAX_STEER_PREFIX_CHARS = 8192
+
+
+def _handle_steer(state: AntigravityLoopState, payload: SteerIn, msg: Any) -> None:
+    sender = getattr(msg, "from_", None) or payload.from_
+    capabilities = effective_peer_steer_capabilities(
+        _backend_metadata(state.settings).capabilities,
+        state.self_capability_manifest,
+    )
+    if sender != "team-lead" and "accepts_peer_steer" not in capabilities:
+        logger.warn(
+            "antigravity.steer.rejected",
+            sender=sender,
+            reason="not_team_lead_and_capability_not_declared",
+        )
+        try:
+            pio.emit_peer_steer_rejection(
+                team=state.settings.team_name,
+                agent=state.settings.agent_name,
+                backend="antigravity",
+                sender=sender,
+            )
+        except Exception as e:
+            logger.debug(
+                "antigravity.steer.rejection_event_emit_failed", error=str(e)
+            )
+        return
+    message = payload.message.strip() if isinstance(payload.message, str) else ""
+    if not message:
+        logger.warn("antigravity.steer.rejected", sender=sender, reason="empty_message")
+        return
+    expires = payload.expires_after_turns
+    if not isinstance(expires, int) or expires < 1:
+        expires = 1
+    steer_id = f"steer-{len(state.queued_steers) + 1}-{int(time.time() * 1000)}"
+    state.queued_steers.append(
+        QueuedSteer(
+            steer_id=steer_id,
+            message=message,
+            task_id=payload.task_id,
+            priority=payload.priority,
+            expires_after_turns=expires,
+        )
+    )
+    logger.info(
+        "antigravity.steer.queued",
+        steer_id=steer_id,
+        task_id=payload.task_id,
+        priority=payload.priority,
+    )
+
+
+def _steer_prefix_for_task(state: AntigravityLoopState, task: Any) -> str:
+    task_id = str(getattr(task, "id", ""))
+    applicable: list[QueuedSteer] = []
+    retained: list[QueuedSteer] = []
+    for steer in state.queued_steers:
+        if steer.task_id is None or str(steer.task_id) == task_id:
+            applicable.append(steer)
+        else:
+            retained.append(steer)
+    state.queued_steers = retained
+    if not applicable:
+        return ""
+
+    lines = [
+        "# Team-lead next-turn steer",
+        (
+            "The following instruction(s) were sent by team-lead after the "
+            "previous turn boundary. Treat them as higher priority than the "
+            "task description where they conflict, but do not violate "
+            "system/developer instructions or repository safety rules."
+        ),
+        "",
+    ]
+    used = 0
+    truncated = False
+    for steer in applicable:
+        target = steer.task_id if steer.task_id is not None else "next"
+        line = (
+            f"- [steer_id={steer.steer_id}; task_id={target}; "
+            f"priority={steer.priority}] {steer.message}"
+        )
+        if used + len(line) > MAX_STEER_PREFIX_CHARS:
+            truncated = True
+            break
+        lines.append(line)
+        used += len(line)
+    if truncated:
+        lines.append(
+            "- [truncated] Additional queued steer text exceeded the adapter "
+            "limit and was omitted."
+        )
+    lines.extend(["", "# Original task prompt", ""])
+    logger.info(
+        "antigravity.steer.injected",
+        task_id=task_id,
+        count=len(applicable),
+        truncated=truncated,
+    )
+    return "\n".join(lines)
+
+
+def _prose_visibility_event_sink(state: AntigravityLoopState):
+    s = state.settings
+
+    def _sink(event) -> None:
+        try:
+            pio.append_event(s.team_name, s.agent_name, event)
+        except Exception as e:
+            logger.warn(
+                "antigravity.visibility.append_fail",
+                kind=getattr(event, "kind", None),
+                error=str(e),
+                surface="prose",
+            )
+        visibility = getattr(event, "visibility", None)
+        if getattr(visibility, "mailbox", False):
+            try:
+                pio.send_visibility_event_to_lead(
+                    s.team_name,
+                    s.agent_name,
+                    event,
+                    summary=event.summary[:120],
+                )
+            except Exception as e:
+                logger.warn(
+                    "antigravity.visibility.mailbox_fail",
+                    kind=getattr(event, "kind", None),
+                    error=str(e),
+                    surface="prose",
+                )
+
+    return _sink
+
+
+def _invoke_antigravity_prose(
+    state: AntigravityLoopState,
+    *,
+    prompt: str,
+    event_sink,
+):
+    try:
+        return (
+            _backend_run(
+                state,
+                prompt,
+                ephemeral=True,
+                event_sink=event_sink,
+            ),
+            None,
+        )
+    except Exception as e:
+        return None, e
+
+
+def _prose_fallback_reply(
+    state: AntigravityLoopState,
+    *,
+    sender: str,
+    result: Any,
+) -> str:
+    from claude_anyteam import diagnostics
+
+    s = state.settings
+    error_class = diagnostics.classify_failure(result)
+    incident_id = diagnostics.record_incident(
+        team=s.team_name,
+        agent=s.agent_name,
+        backend="antigravity",
+        error_class=error_class,
+        summary=(getattr(result, "error", None) or "no reply produced"),
+        sender=sender,
+        payload={
+            "exit_code": (result.exit_code if result is not None else None),
+            "tool_call_events": (
+                getattr(result, "tool_call_events", 0) if result is not None else 0
+            ),
+            "error": (
+                getattr(result, "error", None) if result is not None else None
+            ),
+        },
+    )
+    return diagnostics.fallback_message(
+        backend="antigravity",
+        incident_id=incident_id,
+        error_class=error_class,
+    )
+
+
+def _handle_prose(state: AntigravityLoopState, msg: Any) -> None:
+    s = state.settings
+    sender = getattr(msg, "from_", "unknown")
+    logger.info(
+        "antigravity.inbox.prose",
+        sender=sender,
+        summary=getattr(msg, "summary", None),
+    )
+    prompt = prompts.prose_reply_prompt(
+        sender=sender,
+        body=msg.text,
+        agent_name=s.agent_name,
+        team_name=s.team_name,
+        peer_prompt_fragments=_peer_prompt_fragments(state),
+    )
+    reply: str | None = None
+    result, exc = _invoke_antigravity_prose(
+        state,
+        prompt=prompt,
+        event_sink=_prose_visibility_event_sink(state),
+    )
+    if exc is not None:
+        logger.warn("antigravity.prose.crash", sender=sender, error=str(exc))
+    elif result is not None:
+        if pio.should_skip_prose_fallback(result):
+            logger.info(
+                "antigravity.prose.delivered_via_tool",
+                sender=sender,
+                tool_calls=getattr(result, "tool_call_events", 0),
+            )
+            return
+        if result.exit_code == 0 and result.last_message:
+            reply = result.last_message
+        else:
+            logger.warn(
+                "antigravity.prose.fail",
+                sender=sender,
+                exit_code=result.exit_code,
+                error=getattr(result, "error", None),
+            )
+    if reply is None:
+        reply = _prose_fallback_reply(state, sender=sender, result=result)
+    try:
+        pio.send_prose(s.team_name, s.agent_name, sender, reply, summary="prose_reply")
+        logger.info("antigravity.prose.reply_sent", sender=sender)
+    except Exception as e:
+        logger.warn("antigravity.prose.reply_send_fail", sender=sender, error=str(e))
+
+
+def _handle_prose_batch(state: AntigravityLoopState, messages: list[Any]) -> None:
+    if not messages:
+        return
+    if len(messages) == 1:
+        _handle_prose(state, messages[0])
+        return
+
+    s = state.settings
+    senders = [getattr(m, "from_", "unknown") for m in messages]
+    logger.info(
+        "antigravity.inbox.prose_batch", count=len(messages), senders=senders
+    )
+
+    body_blocks = "\n\n".join(
+        f"[from {getattr(m, 'from_', 'unknown')}]: {m.text}" for m in messages
+    )
+    peer_section = _peer_prompt_fragments(state)
+    peer_tail = f"{peer_section}\n\n" if peer_section else ""
+    prompt = (
+        f"You are {s.agent_name}, an Antigravity (agy) CLI teammate on the "
+        f"{s.team_name} team. You received {len(messages)} direct messages in "
+        f"this drain (senders: {', '.join(sorted(set(senders)))}). Read each "
+        f"below and reply to each sender independently using the send_message "
+        f"MCP tool — call send_message(to=<sender>, body=<your reply>) once "
+        f"per sender. Do not execute code unless explicitly asked.\n\n"
+        f"# Messages\n{body_blocks}\n\n"
+        f"{prompts.TEAM_MESSAGING_BLOCK}\n\n"
+        f"{peer_tail}"
+        f"Do not produce a structured JSON object; address each sender via "
+        f"the send_message tool. Final assistant prose, if any, is "
+        f"informational only — the per-sender deliveries happen via the tool."
+    )
+
+    result, exc = _invoke_antigravity_prose(
+        state,
+        prompt=prompt,
+        event_sink=_prose_visibility_event_sink(state),
+    )
+    if exc is not None:
+        logger.warn(
+            "antigravity.prose_batch.crash", error=str(exc), count=len(messages)
+        )
+    elif result is not None and result.exit_code != 0:
+        logger.warn(
+            "antigravity.prose_batch.fail",
+            exit_code=result.exit_code,
+            error=getattr(result, "error", None),
+            count=len(messages),
+        )
+
+    success = (
+        exc is None
+        and result is not None
+        and result.exit_code == 0
+        and pio.should_skip_prose_fallback(result)
+    )
+    if success:
+        logger.info(
+            "antigravity.prose_batch.delivered_via_tool",
+            count=len(messages),
+            tool_calls=getattr(result, "tool_call_events", 0),
+        )
+        return
+
+    if (
+        exc is None
+        and result is not None
+        and result.exit_code == 0
+        and result.last_message
+    ):
+        text = result.last_message
+        for m in messages:
+            sender = getattr(m, "from_", "unknown")
+            try:
+                pio.send_prose(
+                    s.team_name,
+                    s.agent_name,
+                    sender,
+                    text,
+                    summary="prose_reply",
+                )
+                logger.info("antigravity.prose_batch.reply_sent", sender=sender)
+            except Exception as e:
+                logger.warn(
+                    "antigravity.prose_batch.reply_send_fail",
+                    sender=sender,
+                    error=str(e),
+                )
+        return
+
+    for m in messages:
+        sender = getattr(m, "from_", "unknown")
+        reply = _prose_fallback_reply(state, sender=sender, result=result)
+        try:
+            pio.send_prose(
+                s.team_name, s.agent_name, sender, reply, summary="prose_reply"
+            )
+            logger.info("antigravity.prose_batch.fallback_sent", sender=sender)
+        except Exception as e:
+            logger.warn(
+                "antigravity.prose_batch.fallback_send_fail",
+                sender=sender,
+                error=str(e),
+            )
+
+
+def _handle_shutdown(state: AntigravityLoopState, payload: ShutdownRequestIn) -> None:
+    s = state.settings
+    req_id = payload.effective_request_id() or "shutdown-unknown"
+    if req_id in state.seen_shutdown_request_ids:
+        return
+    state.seen_shutdown_request_ids.add(req_id)
+    if state.in_flight_task is not None:
+        reason = f"in-flight task #{state.in_flight_task}"
+        logger.info(
+            "antigravity.shutdown.reject",
+            request_id=req_id,
+            in_flight=state.in_flight_task,
+        )
+        try:
+            pio.send_shutdown_rejected(
+                s.team_name, s.agent_name, req_id, reason=reason
+            )
+        except Exception as e:
+            logger.warn("antigravity.shutdown.response_fail", error=str(e))
+        state.shutdown_requested = True
+        return
+    logger.info("antigravity.shutdown.approve", request_id=req_id)
+    try:
+        pio.send_shutdown_approved(s.team_name, s.agent_name, req_id)
+    except Exception as e:
+        logger.warn("antigravity.shutdown.response_fail", error=str(e))
+    state.antigravity_session_id = None
+    state.queued_steers.clear()
+    state.approved_shutdown = True
+
+
+def _handle_plan_approval(
+    state: AntigravityLoopState, payload: PlanApprovalRequestIn
+) -> None:
+    s = state.settings
+    if not s.plan_mode_required:
+        logger.warn(
+            "antigravity.plan.unexpected_request", request_id=payload.request_id
+        )
+        return
+    req_id = payload.request_id
+    if req_id is None:
+        logger.warn("antigravity.plan.missing_request_id")
+        return
+
+    target = _target_task_for_plan(state, payload)
+    if target is None:
+        logger.warn("antigravity.plan.no_target_task", request_id=req_id)
+        try:
+            pio.send_prose_to_lead(
+                s.team_name,
+                s.agent_name,
+                json.dumps(
+                    {
+                        "kind": "plan_blocked",
+                        "request_id": req_id,
+                        "reason": (
+                            "no task_id in plan_approval_request and no "
+                            "claimable task in flight"
+                        ),
+                    }
+                ),
+                summary=f"plan_blocked:{req_id}",
+            )
+        except Exception as e:
+            logger.warn("antigravity.plan.block_msg_fail", error=str(e))
+        return
+
+    logger.info(
+        "antigravity.plan.request_received", request_id=req_id, task_id=target.id
+    )
+
+    for attempt in (1, 2):
+        schema = load_schema(headless_invoke.PLAN_SCHEMA)
+        prompt = prompts.plan_prompt(
+            target,
+            tighten=attempt == 2,
+            agent_name=s.agent_name,
+            team_name=s.team_name,
+        )
+        prompt += "\n\n# Output contract\n" + inline_schema_prompt_fragment(schema)
+        try:
+            result = _backend_run(
+                state,
+                prompt,
+                schema=headless_invoke.PLAN_SCHEMA,
+                ephemeral=True,
+            )
+        except Exception as e:
+            logger.error("antigravity.plan.crash", task_id=target.id, error=str(e))
+            result = None
+
+        if (
+            result is not None
+            and result.exit_code == 0
+            and result.structured is not None
+        ):
+            try:
+                pio.send_plan_approval_request(
+                    s.team_name,
+                    s.agent_name,
+                    request_id=req_id,
+                    plan=result.structured,
+                )
+                logger.info(
+                    "antigravity.plan.sent",
+                    request_id=req_id,
+                    task_id=target.id,
+                    steps=len(result.structured.get("steps", [])),
+                )
+            except Exception as e:
+                logger.warn("antigravity.plan.send_fail", error=str(e))
+            return
+
+        if result is None:
+            logger.warn(
+                "antigravity.plan.attempt_failed",
+                attempt=attempt,
+                task_id=target.id,
+            )
+        else:
+            logger.warn(
+                "antigravity.plan.backend_fail",
+                task_id=target.id,
+                exit_code=result.exit_code,
+                error=result.error,
+            )
+            logger.warn(
+                "antigravity.plan.attempt_failed",
+                attempt=attempt,
+                task_id=target.id,
+            )
+
+    _mark_blocked(
+        state,
+        target,
+        "Antigravity plan generation failed schema validation twice",
+    )
+
+
+def _target_task_for_plan(state: AntigravityLoopState, payload: PlanApprovalRequestIn):
+    s = state.settings
+    try:
+        all_tasks = pio.list_tasks(s.team_name)
+    except Exception as e:
+        logger.warn("antigravity.plan.task_list_fail", error=str(e))
+        return None
+    by_id = {t.id: t for t in all_tasks}
+    if payload.task_id and payload.task_id in by_id:
+        return by_id[payload.task_id]
+
+    if state.in_flight_task and state.in_flight_task in by_id:
+        return by_id[state.in_flight_task]
+
+    for t in sorted(
+        (
+            t
+            for t in all_tasks
+            if t.owner == s.agent_name
+            and t.status == "pending"
+            and not _blocked(all_tasks, t)
+        ),
+        key=lambda x: int(x.id),
+    ):
+        return t
+
+    for t in sorted(
+        (
+            t
+            for t in all_tasks
+            if t.owner in (None, "")
+            and t.status == "pending"
+            and not _blocked(all_tasks, t)
+        ),
+        key=lambda x: int(x.id),
+    ):
+        return t
+    return None
+
+
+def _find_and_claim(state: AntigravityLoopState):
+    s = state.settings
+    try:
+        all_tasks = pio.list_tasks(s.team_name)
+    except Exception as e:
+        logger.warn("antigravity.tasks.list_fail", error=str(e))
+        return None
+    candidates = [
+        t
+        for t in all_tasks
+        if t.status == "pending"
+        and not _blocked(all_tasks, t)
+        and t.owner == s.agent_name
+    ]
+    candidates += [
+        t
+        for t in all_tasks
+        if t.status == "pending"
+        and not _blocked(all_tasks, t)
+        and t.owner in (None, "")
+    ]
+    for t in sorted(candidates, key=lambda x: int(x.id)):
+        try:
+            claimed = pio.claim_task(
+                s.team_name,
+                t.id,
+                s.agent_name,
+                active_form=f"Running agy on task #{t.id}",
+            )
+            state.in_flight_task = claimed.id
+            try:
+                pio.emit_coupling_conflict_if_needed(
+                    team=s.team_name,
+                    agent=s.agent_name,
+                    backend="antigravity_headless",
+                    task=claimed,
+                    manifest=state.self_capability_manifest,
+                )
+            except Exception as e:
+                logger.warn(
+                    "antigravity.task.coupling_conflict_visibility_failed",
+                    task_id=claimed.id,
+                    error=str(e),
+                )
+            logger.info(
+                "antigravity.task.claimed",
+                task_id=claimed.id,
+                subject=claimed.subject,
+            )
+            return claimed
+        except ValueError:
+            continue
+    return None
+
+
+def _has_claimable(state: AntigravityLoopState) -> bool:
+    try:
+        all_tasks = pio.list_tasks(state.settings.team_name)
+    except Exception:
+        return False
+    return any(
+        t.status == "pending"
+        and not _blocked(all_tasks, t)
+        and t.owner in (None, "", state.settings.agent_name)
+        for t in all_tasks
+    )
+
+
+def _blocked(all_tasks: list, t) -> bool:
+    if not getattr(t, "blocked_by", None):
+        return False
+    by_id = {x.id: x for x in all_tasks}
+    return any(
+        (
+            by_id.get(bid) is not None
+            and by_id[bid].status not in ("completed", "deleted")
+        )
+        for bid in t.blocked_by
+    )
+
+
+def _execute_task(state: AntigravityLoopState, task) -> None:
+    s = state.settings
+    schema = load_schema(headless_invoke.TASK_COMPLETE_SCHEMA)
+    result = None
+    for attempt in (1, 2):
+        prompt = prompts.task_prompt(
+            task,
+            agent_name=s.agent_name,
+            team_name=s.team_name,
+            peer_prompt_fragments=_task_prompt_fragments(state, task),
+        )
+        steer_prefix = _steer_prefix_for_task(state, task) if attempt == 1 else ""
+        if steer_prefix:
+            prompt = steer_prefix + prompt
+        prompt += "\n\n# Output contract\n" + inline_schema_prompt_fragment(schema)
+        if attempt == 2:
+            prompt += (
+                "\n\nPRIOR ATTEMPT FAILED: return ONLY the JSON object matching "
+                "the schema."
+            )
+        try:
+            result = _backend_run(
+                state,
+                prompt,
+                schema=headless_invoke.TASK_COMPLETE_SCHEMA,
+                resume_session_id=state.antigravity_session_id,
+                ephemeral=False,
+                task_id=str(task.id),
+            )
+        except Exception as exc:
+            logger.warn(
+                "antigravity.task.crash",
+                task_id=task.id,
+                attempt=attempt,
+                error=str(exc),
+            )
+            _mark_blocked(state, task, reason=f"Antigravity invocation crashed: {exc}")
+            state.in_flight_task = None
+            return
+        if result.exit_code == 0 and result.structured is not None:
+            if result.session_id and state.antigravity_session_id is None:
+                logger.info(
+                    "antigravity.task.session_captured",
+                    session_id=result.session_id,
+                )
+            if result.session_id:
+                state.antigravity_session_id = result.session_id
+            break
+        if result.session_id:
+            state.antigravity_session_id = result.session_id
+    if result is None or result.exit_code != 0 or result.structured is None:
+        _mark_blocked(
+            state, task, result.error if result else "Antigravity invocation did not run"
+        )
+        state.in_flight_task = None
+        return
+    files_changed = result.structured.get("files_changed") or []
+    summary_text = result.structured.get("summary") or "(no summary)"
+    try:
+        pio.update_task(s.team_name, task.id, status="completed")
+    except Exception as e:
+        logger.warn("antigravity.task.complete_fail", task_id=task.id, error=str(e))
+        state.in_flight_task = None
+        return
+    try:
+        pio.send_task_complete(
+            s.team_name,
+            s.agent_name,
+            task_id=task.id,
+            files_changed=files_changed,
+            summary_text=summary_text,
+            codex_exit_code=result.exit_code,
+        )
+    except Exception as e:
+        logger.warn(
+            "antigravity.task.complete_msg_fail", task_id=task.id, error=str(e)
+        )
+    logger.info(
+        "antigravity.task.completed", task_id=task.id, files=len(files_changed)
+    )
+    state.in_flight_task = None
+
+
+def _mark_blocked(state: AntigravityLoopState, task, reason: str) -> None:
+    s = state.settings
+    try:
+        current = pio.get_task(s.team_name, task.id)
+        if getattr(current, "status", None) == "completed":
+            logger.info(
+                "antigravity.task.block_skip_already_completed",
+                task_id=task.id,
+                reason_would_have_been=reason[:120],
+            )
+            return
+    except Exception as e:
+        logger.warn(
+            "antigravity.task.block_precheck_fail", task_id=task.id, error=str(e)
+        )
+
+    try:
+        pio.update_task(
+            s.team_name,
+            task.id,
+            active_form=f"blocked: {reason[:80]}",
+            metadata={"blocked_reason": reason, "blocked_by": s.agent_name},
+        )
+    except Exception as e:
+        logger.warn(
+            "antigravity.task.block_update_fail", task_id=task.id, error=str(e)
+        )
+
+    try:
+        pio.send_task_blocked(
+            s.team_name, s.agent_name, task_id=task.id, reason=reason
+        )
+    except Exception as e:
+        logger.warn("antigravity.task.block_msg_fail", task_id=task.id, error=str(e))

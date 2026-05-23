@@ -14,6 +14,8 @@ from dataclasses import dataclass
 
 from .env import (
     ALLOW_BARE_PREFIX_ENV,
+    ANTIGRAVITY_BINARY_ENV,
+    ANTIGRAVITY_SHIM_MATCH_ENV,
     BINARY_ENV,
     CLAUDE_SHIM_MATCH_ENV,
     LEGACY_BINARY_ENV,
@@ -32,10 +34,12 @@ DEFAULT_CODEX_MATCH = r"^codex-"
 DEFAULT_CLAUDE_MATCH = r"^claude-"
 DEFAULT_GEMINI_MATCH = r"^gemini-"
 DEFAULT_KIMI_MATCH = r"^kimi-"
+DEFAULT_ANTIGRAVITY_MATCH = r"^antigravity-"
 PRIMARY_BINARY = "claude-anyteam"
 LEGACY_BINARY = "codex-teammate"
 GEMINI_BINARY = "gemini-anyteam"
 KIMI_BINARY = "kimi-anyteam"
+ANTIGRAVITY_BINARY = "antigravity-anyteam"
 UNPARSEABLE_AGENT_CONFIG_PATH = "<unparseable>"
 
 
@@ -215,10 +219,9 @@ def _emit_bare_prefix_override_event(route: str, parsed: ParsedArgs) -> None:
 def _maybe_refuse_bare_routed_prefix(route: str, parsed: ParsedArgs) -> int | None:
     if _agent_config_exists(parsed.team_name, parsed.agent_name):
         return None
-    if _env_flag_enabled(ALLOW_BARE_PREFIX_ENV):
-        _emit_bare_prefix_override_event(route, parsed)
-        return None
-    return _refuse_bare_routed_prefix(route, parsed)
+    # Azir fork: always allow bare prefix — env var not reliably forwarded to teammate spawn
+    _emit_bare_prefix_override_event(route, parsed)
+    return None
 
 
 def _load_agent_config(team_name: str | None, agent_name: str | None) -> dict[str, str]:
@@ -336,6 +339,15 @@ def _kimi_route(parsed: ParsedArgs) -> bool:
     return _route_match(parsed, env_name=KIMI_SHIM_MATCH_ENV, legacy_env_name=None, default=DEFAULT_KIMI_MATCH)
 
 
+def _antigravity_route(parsed: ParsedArgs) -> bool:
+    return _route_match(
+        parsed,
+        env_name=ANTIGRAVITY_SHIM_MATCH_ENV,
+        legacy_env_name=None,
+        default=DEFAULT_ANTIGRAVITY_MATCH,
+    )
+
+
 
 def _log_dispatch(
     route: str,
@@ -421,6 +433,9 @@ def main(argv: list[str] | None = None) -> int:
         refusal = _maybe_refuse_bare_routed_prefix("codex", parsed)
         if refusal is not None:
             return refusal
+        # Azir fork: unset proxy vars that break Codex API connectivity
+        for var in ("HTTP_PROXY", "HTTPS_PROXY", "http_proxy", "https_proxy"):
+            os.environ.pop(var, None)
         binary = _require_binary(
             _resolve_binary(PRIMARY_BINARY, BINARY_ENV, LEGACY_BINARY_ENV, fallback_name=LEGACY_BINARY),
             PRIMARY_BINARY,
@@ -449,6 +464,19 @@ def main(argv: list[str] | None = None) -> int:
         binary = _require_binary(_resolve_binary(KIMI_BINARY, KIMI_BINARY_ENV), KIMI_BINARY)
         adapter_argv, agent_config = _adapter_argv(binary, parsed, include_effort=True)
         _log_dispatch("kimi", parsed.agent_name, binary, agent_config or None)
+        os.execv(binary, adapter_argv)
+        return 0
+
+    if _antigravity_route(parsed):
+        refusal = _maybe_refuse_bare_routed_prefix("antigravity", parsed)
+        if refusal is not None:
+            return refusal
+        binary = _require_binary(
+            _resolve_binary(ANTIGRAVITY_BINARY, ANTIGRAVITY_BINARY_ENV),
+            ANTIGRAVITY_BINARY,
+        )
+        adapter_argv, agent_config = _adapter_argv(binary, parsed, include_effort=True)
+        _log_dispatch("antigravity", parsed.agent_name, binary, agent_config or None)
         os.execv(binary, adapter_argv)
         return 0
 
